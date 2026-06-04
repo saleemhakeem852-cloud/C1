@@ -788,7 +788,13 @@ def _type_into_field(driver, el, text: str):
     
     # TAB away — this is what triggers CL jQuery Validate to mark field as valid
     el.send_keys(Keys.TAB)
-    time.sleep(0.4)
+    time.sleep(0.6)
+    # Extra: click somewhere neutral so field fully commits
+    try:
+        driver.execute_script("document.body.click();")
+    except Exception:
+        pass
+    time.sleep(0.2)
 
 
 def fill_listing_details(driver, product: dict):
@@ -978,8 +984,35 @@ def fill_listing_details(driver, product: dict):
             )
             driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
             time.sleep(0.3)
-            # Real ActionChains click — moves mouse to button and clicks
-            # This fires proper mouseover/mousedown/mouseup/click sequence
+
+            # Snapshot field values RIGHT before submit
+            snap = driver.execute_script("""
+                return {
+                    title: (document.getElementById('PostingTitle') || {}).value || '',
+                    body:  (document.getElementById('PostingBody')  || {}).value || '',
+                    zip:   (document.getElementById('postal_code')  || {}).value || ''
+                };
+            """)
+            print(f"  [snap] title={len(snap.get('title',''))}ch body={len(snap.get('body',''))}ch zip={snap.get('zip','')}")
+
+            # If ANY field is empty at this point, re-fill it and TAB away
+            from selenium.webdriver.common.keys import Keys
+            if not snap.get('title'):
+                print("  ✗ title empty at submit — re-filling")
+                el = driver.find_element(By.ID, "PostingTitle")
+                _type_into_field(driver, el, title)
+            if not snap.get('body'):
+                print("  ✗ body empty at submit — re-filling")
+                el = driver.find_element(By.ID, "PostingBody")
+                _type_into_field(driver, el, description)
+            if not snap.get('zip'):
+                print("  ✗ zip empty at submit — re-filling")
+                el = driver.find_element(By.ID, "postal_code")
+                _type_into_field(driver, el, zip_code)
+
+            # Click body first to ensure no field has focus, then click button
+            driver.execute_script("document.body.click();")
+            time.sleep(0.3)
             ActionChains(driver).move_to_element(btn).pause(0.3).click().perform()
             print(f"  ✓ Continue clicked via: {sel}")
             clicked = True
