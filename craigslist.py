@@ -530,41 +530,31 @@ def js_fill(driver, field_id: str, value: str):
 
 
 def clipboard_fill(driver, field_id: str, value: str) -> bool:
-    """Use JS to set clipboard then Ctrl+V — bypasses all jQuery event issues."""
+    """Use pyperclip to copy the value and Keys.CONTROL + 'v' to paste into the field, then fire events."""
     from selenium.webdriver.common.keys import Keys
+    import pyperclip
     try:
         el = WebDriverWait(driver, 8).until(
             EC.presence_of_element_located((By.ID, field_id))
         )
         driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+        time.sleep(0.3)
+        el.click()
+        time.sleep(0.4)
+        el.send_keys(Keys.CONTROL + "a")
+        time.sleep(0.1)
+        pyperclip.copy(value)
+        time.sleep(0.1)
+        el.send_keys(Keys.CONTROL + "v")
+        time.sleep(0.3)
         
-        # Set value directly via native prototype (React-safe)
+        # Fire change and blur events via JS
         driver.execute_script("""
-            var el = arguments[0], val = arguments[1];
-            var nativeSetter = Object.getOwnPropertyDescriptor(
-                el.tagName === 'TEXTAREA' 
-                    ? window.HTMLTextAreaElement.prototype 
-                    : window.HTMLInputElement.prototype, 'value').set;
-            nativeSetter.call(el, val);
-            el.dispatchEvent(new Event('focus', {bubbles:true}));
-            el.dispatchEvent(new InputEvent('input', {bubbles:true, data:val}));
+            var el = arguments[0];
             el.dispatchEvent(new Event('change', {bubbles:true}));
             el.dispatchEvent(new Event('blur', {bubbles:true}));
-        """, el, value)
-        
-        time.sleep(0.5)
-        actual = (el.get_attribute("value") or "").strip()
-        if actual == value.strip():
-            return True
-            
-        # If that didn't work, try clicking + select all + type
-        el.click()
+        """, el)
         time.sleep(0.2)
-        el.send_keys(Keys.CONTROL + "a")
-        el.send_keys(value)
-        driver.execute_script(
-            "arguments[0].dispatchEvent(new Event('change',{bubbles:true}));"
-            "arguments[0].dispatchEvent(new Event('blur',{bubbles:true}));", el)
         return True
     except Exception as e:
         print(f"  ⚠ clipboard_fill({field_id}) failed: {e}")
@@ -798,44 +788,71 @@ def fill_listing_details(driver, product: dict):
     except Exception:
         pass
 
-    # Force-fill all three critical fields via JS right before submit
-    driver.execute_script("""
-        ['PostingTitle', 'PostingBody', 'postal_code'].forEach(function(id) {
-            var el = document.getElementById(id);
-            if (!el) return;
-            el.dispatchEvent(new Event('focus', {bubbles:true}));
-            el.dispatchEvent(new InputEvent('input', {bubbles:true, data:el.value}));
-            el.dispatchEvent(new Event('change', {bubbles:true}));
-            el.dispatchEvent(new Event('blur', {bubbles:true}));
-        });
-    """)
-    time.sleep(1.0)
+    # Force-fill all three critical fields via React/Vue native setter right before submit
+    def run_native_setter(d):
+        d.execute_script("""
+            ['PostingTitle', 'PostingBody', 'postal_code'].forEach(function(id) {
+                var el = document.getElementById(id);
+                if (!el) return;
+                var proto = (el.tagName === 'TEXTAREA')
+                    ? window.HTMLTextAreaElement.prototype
+                    : window.HTMLInputElement.prototype;
+                var desc = Object.getOwnPropertyDescriptor(proto, 'value');
+                if (desc && desc.set) {
+                    desc.set.call(el, el.value);
+                }
+                ['input', 'change', 'blur'].forEach(function(e) {
+                    el.dispatchEvent(new Event(e, {bubbles:true}));
+                });
+            });
+        """)
 
-    # 4. Click the continue button
-    driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-    time.sleep(0.5)
+    run_native_setter(driver)
+    time.sleep(2.0)  # let CL's validation debounce settle
 
+    # 4. Click the continue button (with up to 3 retries if still on s=edit)
     url_before = driver.current_url
     clicked = False
 
-    for sel in ["button.go", "button.submit-button", "button[type='submit']", "input[type='submit']"]:
-        try:
-            btn = WebDriverWait(driver, 5).until(
-                EC.element_to_be_clickable((By.CSS_SELECTOR, sel))
-            )
-            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
-            time.sleep(0.3)
-            driver.execute_script("arguments[0].click();", btn)
-            print(f"  ✓ Continue clicked via: {sel}")
-            clicked = True
-            time.sleep(3)
-            break
-        except Exception:
-            continue
+    for attempt in range(4):  # 0 is first attempt, 1,2,3 are retries
+        if attempt > 0:
+            # Check if we already left the edit page
+            if "s=edit" not in driver.current_url:
+                break
+            print(f"  ⚠ Still on edit page (?s=edit) — Validation/Submit retry attempt {attempt}/3...")
+            run_native_setter(driver)
+            time.sleep(2.0)
 
-    if not clicked:
-        print("  ✗ No continue button found")
-        return
+        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+        time.sleep(0.5)
+
+        for sel in ["button.go", "button.submit-button", "button[type='submit']", "input[type='submit']"]:
+            try:
+                btn = WebDriverWait(driver, 5).until(
+                    EC.element_to_be_clickable((By.CSS_SELECTOR, sel))
+                )
+                driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
+                time.sleep(0.3)
+                driver.execute_script("arguments[0].click();", btn)
+                print(f"  ✓ Continue clicked via: {sel} (attempt {attempt + 1})")
+                clicked = True
+                time.sleep(4)
+                break
+            except Exception:
+                continue
+
+        if not clicked:
+            print("  ✗ No continue button found")
+            return
+
+        # Settle a bit after click
+        time.sleep(1.0)
+        # If we successfully left the edit page, we are done
+        if "s=edit" not in driver.current_url:
+            break
+
+    if "s=edit" in driver.current_url:
+        print("  ✗ Still on edit page after 3 retries — giving up")
 
     # 5. Check for validation errors
     try:
