@@ -550,7 +550,11 @@ def selenium_fill(driver, field_id: str, value: str) -> bool:
         time.sleep(0.1)
         for ch in value:
             el.send_keys(ch)
-            time.sleep(random.uniform(0.02, 0.06))
+            driver.execute_script(
+                "arguments[0].dispatchEvent(new InputEvent('input',{bubbles:true,cancelable:true}));",
+                el
+            )
+            time.sleep(random.uniform(0.04, 0.08))
         driver.execute_script(
             "arguments[0].dispatchEvent(new Event('change',{bubbles:true}));"
             "arguments[0].dispatchEvent(new Event('blur',{bubbles:true}));",
