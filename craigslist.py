@@ -556,6 +556,11 @@ def clipboard_fill(driver, field_id: str, value: str) -> bool:
                 });
                 el.dispatchEvent(new Event('change', {bubbles:true}));
                 el.dispatchEvent(new Event('blur',   {bubbles:true}));
+                if (window.jQuery) {
+                    try {
+                        jQuery('#' + arguments[0]).trigger('keyup').trigger('change').trigger('blur');
+                    } catch(e) {}
+                }
             }
         """, field_id, value)
         time.sleep(0.4)
@@ -695,8 +700,8 @@ def fill_listing_details(driver, product: dict):
     time.sleep(0.5)
 
     # city/area fields — js_fill is fine here (not validated)
-    js_fill(driver, "geographic_area", city_name)
-    js_fill(driver, "city", city_name)
+    clipboard_fill(driver, "geographic_area", city_name)
+    clipboard_fill(driver, "city", city_name)
     time.sleep(0.3)
 
     # ZIP
