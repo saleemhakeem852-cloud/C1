@@ -828,6 +828,26 @@ def fill_listing_details(driver, product: dict):
             print(f"  ⚠ Field '{fid}' never appeared — CL may have different IDs")
     time.sleep(3.0)  # wait for CL jQuery Validate to attach to all fields
 
+    # DIAGNOSTIC — dump every form field so we can see exactly what CL expects
+    try:
+        fields = driver.execute_script("""
+            var form = document.getElementById('postingForm');
+            if (!form) return 'NO FORM FOUND';
+            var inputs = form.querySelectorAll('input, textarea, select');
+            var result = [];
+            inputs.forEach(function(el) {
+                result.push(el.tagName + '|id=' + el.id + '|name=' + (el.name||'') +
+                           '|type=' + (el.type||'') + '|value=' + (el.value||'').substring(0,40));
+            });
+            return result.join('||');
+        """)
+        print("  [FORM DUMP]:")
+        for line in (fields or "").split('||'):
+            if line.strip():
+                print(f"    {line}")
+    except Exception as ex:
+        print(f"  [FORM DUMP ERROR]: {ex}")
+
 
 
     # 2. Resolve values
