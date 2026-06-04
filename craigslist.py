@@ -3,6 +3,11 @@ craigslist.py  —  CLBlast automation module for Craigslist
 Anti-detection: selenium webdriver, human typing delays, 2captcha, persistent profile.
 """
 
+import sys
+import io
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+
 import time
 import json
 import os
@@ -242,8 +247,8 @@ def make_driver(headless: bool = False) -> webdriver.Chrome:
     import tempfile
     from selenium.webdriver.chrome.service import Service
 
-    os.environ["SE_MANAGER_PATH"] = ""
-    os.environ["WDM_SKIP_DOWNLOAD"] = "1"
+    # os.environ["SE_MANAGER_PATH"] = ""
+    # os.environ["WDM_SKIP_DOWNLOAD"] = "1"
 
     options = webdriver.ChromeOptions()
     options.set_capability("goog:loggingPrefs", {"browser": "ALL"})  # enables get_log('browser')
@@ -254,25 +259,18 @@ def make_driver(headless: bool = False) -> webdriver.Chrome:
     options.add_argument("--disable-gpu")
     options.add_argument("--disable-software-rasterizer")
     options.add_argument("--headless=new")
-    options.add_argument("--window-size=1280,800")
-    options.add_argument("--single-process")              # critical for low-memory containers
-    options.add_argument("--no-zygote")                   # prevents zygote process crash
+    options.add_argument("--window-size=1366,768")
     options.add_argument("--disable-setuid-sandbox")
     options.add_argument("--disable-extensions")
-    options.add_argument("--disable-plugins")
-    # NOTE: do NOT add --disable-images — CL's jQuery validation can fail to load
-    options.add_argument("--disable-javascript-harmony-shipping")
-    options.add_argument("--disable-background-networking")
-    options.add_argument("--disable-default-apps")
-    options.add_argument("--disable-sync")
-    options.add_argument("--disable-translate")
     options.add_argument("--mute-audio")
     options.add_argument("--no-first-run")
     options.add_argument("--no-default-browser-check")
-    options.add_argument("--shm-size=128m")               # explicit shared memory cap
+    options.add_argument("--shm-size=256m")
 
-    # --- Anti-detection ---
+    # --- Anti-detection (critical) ---
     options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.add_experimental_option("useAutomationExtension", False)
 
     # --- Use a FRESH temp dir every run to avoid stale lock files from prior crashes ---
     fresh_profile = tempfile.mkdtemp(prefix="clblast_chrome_")
@@ -299,27 +297,39 @@ def make_driver(headless: bool = False) -> webdriver.Chrome:
         ["/usr/bin/chromedriver"]
     )
     if not chromedriver_bin:
-        raise RuntimeError("chromedriver not found. Check Dockerfile has: RUN apt-get install -y chromium chromium-driver")
-
-    print(f"  [driver] Using chromedriver: {chromedriver_bin}")
-    service = Service(
-        executable_path=chromedriver_bin,
-        log_output="/tmp/chromedriver.log"
-    )
-    try:
-        driver = webdriver.Chrome(service=service, options=options)
-    except Exception as e:
-        print(f"  [driver] Chrome session failed: {e}")
+        print("  [driver] WARNING: chromedriver not found in path fallback, trying default webdriver.Chrome initiation...")
         try:
-            with open("/tmp/chromedriver.log") as log:
-                print("  [chromedriver log]", log.read()[-2000:])
-        except Exception:
-            pass
-        raise
-    driver.execute_cdp_cmd(
-        "Page.addScriptToEvaluateOnNewDocument",
-        {"source": "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"}
-    )
+            driver = webdriver.Chrome(options=options)
+        except Exception as e:
+            print(f"  [driver] Chrome session failed with default initialization: {e}")
+            raise RuntimeError("chromedriver not found and default initialization failed.")
+    else:
+        print(f"  [driver] Using chromedriver: {chromedriver_bin}")
+        # Use a safe log file path on Windows
+        log_path = "chromedriver.log" if os.name == 'nt' else "/tmp/chromedriver.log"
+        service = Service(
+            executable_path=chromedriver_bin,
+            log_output=log_path
+        )
+        try:
+            driver = webdriver.Chrome(service=service, options=options)
+        except Exception as e:
+            print(f"  [driver] Chrome session failed: {e}")
+            try:
+                with open(log_path) as log:
+                    print("  [chromedriver log]", log.read()[-2000:])
+            except Exception:
+                pass
+            raise
+    driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": """
+        Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+        Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
+        Object.defineProperty(navigator, 'languages', {get: () => ['en-US','en']});
+        window.chrome = {runtime: {}};
+        Object.defineProperty(navigator, 'permissions', {
+            get: () => ({query: () => Promise.resolve({state: 'granted'})})
+        });
+    """})
     return driver
 
 
@@ -817,6 +827,8 @@ def fill_listing_details(driver, product: dict):
         except TimeoutException:
             print(f"  ⚠ Field '{fid}' never appeared — CL may have different IDs")
     time.sleep(3.0)  # wait for CL jQuery Validate to attach to all fields
+
+
 
     # 2. Resolve values
     title = product.get("title") or product.get("name") or "Quality Item For Sale"
@@ -1492,7 +1504,6 @@ def _update_ad_status(ad_name: str):
 # MAIN
 # ─────────────────────────────────────────────────────────────
 def main():
-    global CL_CITY
     # Accept credentials from env vars (set by server.py) or fall back to interactive
     email    = os.environ.get("CL_EMAIL")    or input("Enter Craigslist email: ").strip()
     password = os.environ.get("CL_PASSWORD") or input("Enter Craigslist password: ").strip()
