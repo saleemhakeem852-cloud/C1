@@ -531,49 +531,80 @@ def js_fill(driver, field_id: str, value: str):
 
 def clipboard_fill(driver, field_id: str, value: str) -> bool:
     """
-    Fill a form field using real ActionChains keystrokes so jQuery Validate
-    registers the field as touched and valid. JS event injection does NOT work
-    on Craigslist — only real browser-level input events pass validation.
+    Fill a form field so jQuery Validate accepts it on headless Railway Chromium.
+
+    Two-phase approach:
+      Phase 1 — element.send_keys(): generates real browser key events (works headless,
+                 no ActionChains/display needed).  TAB at end fires jQuery's blur handler.
+      Phase 2 — jQuery .val()+.trigger(): updates jQuery's internal value cache directly,
+                 then calls validator.element() to mark the field valid.
     """
-    from selenium.webdriver.common.action_chains import ActionChains
     from selenium.webdriver.common.keys import Keys
     try:
         el = WebDriverWait(driver, 10).until(
             EC.presence_of_element_located((By.ID, field_id))
         )
         driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
-        time.sleep(0.4)
-
-        # Click to focus — real browser focus event
-        ActionChains(driver).move_to_element(el).click().perform()
         time.sleep(0.3)
 
-        # Select all + delete any existing content
-        ActionChains(driver).key_down(Keys.CONTROL).send_keys('a').key_up(Keys.CONTROL).perform()
-        time.sleep(0.1)
-        ActionChains(driver).send_keys(Keys.DELETE).perform()
-        time.sleep(0.1)
-
-        # Type character by character with human-like delays
+        # Phase 1: real browser keystrokes via send_keys (headless-safe)
+        try:
+            el.click()
+        except Exception:
+            driver.execute_script("arguments[0].focus();", el)
+        time.sleep(0.2)
+        el.send_keys(Keys.CONTROL + "a")
+        time.sleep(0.05)
+        el.send_keys(Keys.DELETE)
+        time.sleep(0.05)
         for ch in value:
-            ActionChains(driver).send_keys(ch).perform()
-            time.sleep(random.uniform(0.04, 0.09))
+            el.send_keys(ch)
+            time.sleep(random.uniform(0.03, 0.07))
+        el.send_keys(Keys.TAB)   # triggers jQuery Validate's blur/focusout handler
+        time.sleep(0.4)
 
-        # Tab out — this is what triggers jQuery Validate's blur handler
-        ActionChains(driver).send_keys(Keys.TAB).perform()
-        time.sleep(0.5)
+        # Phase 2: jQuery val() + trigger + validator.element()
+        driver.execute_script("""
+            var id  = arguments[0];
+            var val = arguments[1];
+            var el  = document.getElementById(id);
+            if (!el) return;
+            if (window.jQuery) {
+                try {
+                    jQuery(el).val(val)
+                              .trigger('input')
+                              .trigger('keyup')
+                              .trigger('change')
+                              .trigger('blur');
+                    var v = jQuery(el).closest('form').data('validator');
+                    if (v) v.element(el);
+                } catch(e) {}
+            }
+            // native setter belt-and-suspenders
+            try {
+                var proto = (el.tagName === 'TEXTAREA')
+                    ? window.HTMLTextAreaElement.prototype
+                    : window.HTMLInputElement.prototype;
+                var setter = Object.getOwnPropertyDescriptor(proto, 'value');
+                if (setter && setter.set) setter.set.call(el, val);
+            } catch(e) { el.value = val; }
+            el.dispatchEvent(new Event('input',  {bubbles:true}));
+            el.dispatchEvent(new Event('change', {bubbles:true}));
+            el.dispatchEvent(new Event('blur',   {bubbles:true}));
+        """, field_id, value)
+        time.sleep(0.3)
 
-        # Verify value landed
+        # Verify
         actual = (driver.find_element(By.ID, field_id).get_attribute("value") or "").strip()
         if actual != value.strip():
-            print(f"  ⚠ clipboard_fill({field_id}): mismatch — got '{actual[:30]}', expected '{value[:30]}'")
-            # Last resort: direct send_keys on element
-            el2 = driver.find_element(By.ID, field_id)
-            el2.click()
-            el2.clear()
-            el2.send_keys(value)
-            ActionChains(driver).send_keys(Keys.TAB).perform()
-            time.sleep(0.3)
+            print(f"  ⚠ clipboard_fill({field_id}): got '{actual[:30]}' — JS direct fallback")
+            driver.execute_script("""
+                var el = document.getElementById(arguments[0]);
+                if (!el) return;
+                if (window.jQuery) jQuery(el).val(arguments[1]).trigger('input').trigger('change').trigger('blur');
+                else { el.value = arguments[1]; el.dispatchEvent(new Event('change',{bubbles:true})); }
+            """, field_id, value)
+            time.sleep(0.2)
 
         return True
     except Exception as e:
@@ -582,35 +613,32 @@ def clipboard_fill(driver, field_id: str, value: str) -> bool:
 
 
 def jquery_validate_fields(driver):
-    """Force jQuery Validate to re-evaluate all critical fields before submit."""
+    """Force jQuery Validate to re-evaluate all critical fields right before submit."""
     driver.execute_script("""
-        var ids = ['PostingTitle', 'PostingBody', 'postal_code'];
-        ids.forEach(function(id) {
+        ['PostingTitle', 'PostingBody', 'postal_code'].forEach(function(id) {
             var el = document.getElementById(id);
             if (!el) return;
-            // 1. Mark field as "visited" so validator won't skip it
-            el.focus();
-            el.blur();
-            // 2. If jQuery Validate is active on the form, call .valid() on the element
             if (window.jQuery) {
                 try {
-                    var $form = jQuery(el).closest('form');
-                    var validator = $form.data('validator');
-                    if (validator) {
-                        validator.element(el);
-                    }
+                    var cur = jQuery(el).val();
+                    jQuery(el).val(cur)
+                              .trigger('input')
+                              .trigger('keyup')
+                              .trigger('change')
+                              .trigger('focusout')
+                              .trigger('blur');
+                    var v = jQuery(el).closest('form').data('validator');
+                    if (v) v.element(el);
                 } catch(e) {}
-                // 3. Also fire the events jQuery listens to for value change detection
-                jQuery(el).trigger('focusin').trigger('keyup').trigger('focusout');
             }
+            el.dispatchEvent(new Event('change', {bubbles:true}));
+            el.dispatchEvent(new Event('blur',   {bubbles:true}));
         });
     """)
-    time.sleep(0.5)
+    time.sleep(0.6)
 
 
-# ─────────────────────────────────────────────────────────────
-# FILL LISTING DETAILS
-# ─────────────────────────────────────────────────────────────
+
 def robust_fill_zip(driver, zip_code):
     """Fill postal_code with every event CL jQuery needs, using native setter."""
     script = """
@@ -719,9 +747,13 @@ def fill_listing_details(driver, product: dict):
     clipboard_fill(driver, "PostingBody", description)
     time.sleep(0.5)
 
-    # city/area fields — js_fill is fine here (not validated)
-    clipboard_fill(driver, "geographic_area", city_name)
-    clipboard_fill(driver, "city", city_name)
+    # city/area fields — optional, not validated; skip silently if absent
+    for _fid in ["geographic_area", "city"]:
+        try:
+            if driver.find_elements(By.ID, _fid):
+                js_fill(driver, _fid, city_name)
+        except Exception:
+            pass
     time.sleep(0.3)
 
     # ZIP
@@ -855,7 +887,7 @@ def fill_listing_details(driver, product: dict):
         """)
 
     run_native_setter(driver)
-    jquery_validate_fields(driver)   # <-- ADD THIS LINE
+    jquery_validate_fields(driver)
     time.sleep(2.0)  # let CL's validation debounce settle
 
     # 4. Click the continue button (with up to 3 retries if still on s=edit)
@@ -869,7 +901,7 @@ def fill_listing_details(driver, product: dict):
                 break
             print(f"  ⚠ Still on edit page (?s=edit) — Validation/Submit retry attempt {attempt}/3...")
             run_native_setter(driver)
-            jquery_validate_fields(driver)   # <-- ADD THIS LINE
+            jquery_validate_fields(driver)
             time.sleep(2.0)
 
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
