@@ -696,8 +696,20 @@ def fill_zip_cl(driver, zip_code: str):
     from selenium.webdriver.common.keys import Keys
     try:
         el = WebDriverWait(driver, 8).until(
-            EC.presence_of_element_located((By.ID, "postal_code"))
+            EC.any_of(
+                EC.presence_of_element_located((By.ID, "postal_code")),
+                EC.presence_of_element_located((By.NAME, "postal")),
+                EC.presence_of_element_located((By.NAME, "postal_code")),
+            )
         )
+        # Re-find with correct selector (id may be empty, use name fallback)
+        try:
+            el = driver.find_element(By.ID, "postal_code")
+        except Exception:
+            try:
+                el = driver.find_element(By.NAME, "postal")
+            except Exception:
+                el = driver.find_element(By.NAME, "postal_code")
         driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
         time.sleep(0.2)
 
@@ -819,7 +831,7 @@ def fill_listing_details(driver, product: dict):
 
     handle_captcha_if_present(driver)
     # Wait for ALL key fields to be present before touching anything.
-    for fid in ["PostingTitle", "PostingBody", "postal_code"]:
+    for fid in ["PostingTitle", "PostingBody"]:
         try:
             WebDriverWait(driver, 10).until(
                 EC.presence_of_element_located((By.ID, fid))
@@ -827,26 +839,6 @@ def fill_listing_details(driver, product: dict):
         except TimeoutException:
             print(f"  ⚠ Field '{fid}' never appeared — CL may have different IDs")
     time.sleep(3.0)  # wait for CL jQuery Validate to attach to all fields
-
-    # DIAGNOSTIC — dump every form field so we can see exactly what CL expects
-    try:
-        fields = driver.execute_script("""
-            var form = document.getElementById('postingForm');
-            if (!form) return 'NO FORM FOUND';
-            var inputs = form.querySelectorAll('input, textarea, select');
-            var result = [];
-            inputs.forEach(function(el) {
-                result.push(el.tagName + '|id=' + el.id + '|name=' + (el.name||'') +
-                           '|type=' + (el.type||'') + '|value=' + (el.value||'').substring(0,40));
-            });
-            return result.join('||');
-        """)
-        print("  [FORM DUMP]:")
-        for line in (fields or "").split('||'):
-            if line.strip():
-                print(f"    {line}")
-    except Exception as ex:
-        print(f"  [FORM DUMP ERROR]: {ex}")
 
 
 
@@ -912,9 +904,15 @@ def fill_listing_details(driver, product: dict):
 
     print("  Filling zip...")
     try:
-        zip_el = WebDriverWait(driver, 8).until(
-            EC.presence_of_element_located((By.ID, "postal_code"))
-        )
+        # CL's zip field has NO id — must find by name="postal"
+        try:
+            zip_el = driver.find_element(By.ID, "postal_code")
+        except Exception:
+            try:
+                zip_el = driver.find_element(By.NAME, "postal")
+            except Exception:
+                zip_el = driver.find_element(By.NAME, "postal_code")
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", zip_el)
         _type_into_field(driver, zip_el, zip_code)
         print(f"  ✓ zip: {zip_code}")
     except Exception as e:
@@ -978,7 +976,14 @@ def fill_listing_details(driver, product: dict):
     try:
         tv = (driver.find_element(By.ID, "PostingTitle").get_attribute("value") or "").strip()
         bv = (driver.find_element(By.ID, "PostingBody").get_attribute("value") or "").strip()
-        zv = (driver.find_element(By.ID, "postal_code").get_attribute("value") or "").strip()
+        try:
+            _zip_el = driver.find_element(By.ID, "postal_code")
+        except Exception:
+            try:
+                _zip_el = driver.find_element(By.NAME, "postal")
+            except Exception:
+                _zip_el = driver.find_element(By.NAME, "postal_code")
+        zv = (_zip_el.get_attribute("value") or "").strip()
         print(f"  ✓ title confirmed: '{tv[:40]}...'")
         print(f"  ✓ description confirmed ({len(bv)} chars)")
         print(f"  ✓ postal_code confirmed: '{zv}'")
@@ -991,7 +996,14 @@ def fill_listing_details(driver, product: dict):
             _type_into_field(driver, driver.find_element(By.ID, "PostingBody"), description)
         if not zv:
             print("  ✗ zip EMPTY — re-filling")
-            _type_into_field(driver, driver.find_element(By.ID, "postal_code"), zip_code)
+            try:
+                _rz = driver.find_element(By.ID, "postal_code")
+            except Exception:
+                try:
+                    _rz = driver.find_element(By.NAME, "postal")
+                except Exception:
+                    _rz = driver.find_element(By.NAME, "postal_code")
+            _type_into_field(driver, _rz, zip_code)
     except Exception as e:
         print(f"  ⚠ pre-submit check error: {e}")
 
@@ -1017,12 +1029,18 @@ def fill_listing_details(driver, product: dict):
             driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
             time.sleep(0.3)
 
+            # Verify cryptedStepCheck token still intact — CL rejects if wiped
+            token_val = driver.execute_script(
+                "var el=document.querySelector('[name=cryptedStepCheck]'); return el ? el.value : 'MISSING';"
+            )
+            print(f"  [token] cryptedStepCheck={'OK('+str(len(token_val))+'ch)' if token_val and token_val!='MISSING' else 'MISSING-CL_WILL_REJECT'}")
+
             # Snapshot field values RIGHT before submit
             snap = driver.execute_script("""
                 return {
                     title: (document.getElementById('PostingTitle') || {}).value || '',
                     body:  (document.getElementById('PostingBody')  || {}).value || '',
-                    zip:   (document.getElementById('postal_code')  || {}).value || ''
+                    zip:   ((document.querySelector('#postal_code,[name=postal],[name=postal_code]') || {}).value || '')
                 };
             """)
             print(f"  [snap] title={len(snap.get('title',''))}ch body={len(snap.get('body',''))}ch zip={snap.get('zip','')}")
