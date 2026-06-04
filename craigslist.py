@@ -474,7 +474,7 @@ def handle_captcha_if_present(driver):
 # LOGIN
 # ─────────────────────────────────────────────────────────────
 def craigslist_login(driver, email: str, password: str) -> bool:
-    print(f"  [login] Email: '{email[:3]}***'")
+    print(f"  [login] Email: '{email[:3]}***', Password length: {len(password)}")
     if not email:
         print("  \u2717 Empty email \u2014 set CL_EMAIL in Railway")
         return False
@@ -490,17 +490,14 @@ def craigslist_login(driver, email: str, password: str) -> bool:
         send_keys_slow(driver, email_field, email)
         human_delay()
 
-        # Only fill password if one is set and it's not a dummy
-        if password and password != "0000":
-            try:
-                pw_field = driver.find_element(By.ID, "inputPassword")
-                send_keys_slow(driver, pw_field, password)
-                human_delay()
-                print(f"  [login] Password filled ({len(password)} chars)")
-            except NoSuchElementException:
-                print("  [login] No password field found \u2014 email-only login")
-        else:
-            print("  [login] Skipping password (not set or dummy)")
+        # Always fill password field — same as the original working code
+        try:
+            pw_field = driver.find_element(By.ID, "inputPassword")
+            send_keys_slow(driver, pw_field, password)
+            human_delay()
+            print(f"  [login] Password filled ({len(password)} chars)")
+        except NoSuchElementException:
+            print("  [login] No password field on page")
 
         # Submit
         btn = driver.find_element(By.CSS_SELECTOR, "button[type='submit']")
@@ -510,7 +507,11 @@ def craigslist_login(driver, email: str, password: str) -> bool:
         print(f"  [login] Post-submit URL: {driver.current_url}")
         print(f"  [login] Post-submit title: {driver.title}")
 
-        if "login" in driver.current_url.lower():
+        cur = driver.current_url.lower()
+        # /login/onetime = CL sent magic link (wrong credentials)
+        # /login         = still on login form (bad password)
+        # anything else  = success
+        if cur.rstrip("/").endswith("/login") or "login/onetime" in cur:
             try:
                 err_els = driver.find_elements(By.CSS_SELECTOR, ".err, .error, .notice, #error")
                 for el in err_els:
@@ -518,7 +519,12 @@ def craigslist_login(driver, email: str, password: str) -> bool:
                         print(f"  [login] CL error: '{el.text.strip()}'")
             except Exception:
                 pass
-            print("  \u2717 Login failed \u2014 still on login page")
+            if "onetime" in cur:
+                print("  \u2717 CL sent a magic-link email \u2014 account has no password set")
+                print("  Fix: go to https://accounts.craigslist.org and set a real password,")
+                print("       then update CL_PASSWORD in Railway to that password.")
+            else:
+                print("  \u2717 Login failed \u2014 wrong password or account blocked")
             return False
 
         handle_captcha_if_present(driver)
