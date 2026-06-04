@@ -17,24 +17,7 @@ import tempfile
 import urllib.request
 from datetime import datetime, timedelta
 
-try:
-    from seleniumwire import webdriver as sw_webdriver
-    SELENIUMWIRE_AVAILABLE = True
-except ImportError:
-    sw_webdriver = None
-    SELENIUMWIRE_AVAILABLE = False
-
-try:
-    if SELENIUMWIRE_AVAILABLE:
-        import seleniumwire.undetected_chromedriver as uc
-    else:
-        import undetected_chromedriver as uc
-    UC_AVAILABLE = True
-except ImportError:
-    UC_AVAILABLE = False
-
-from selenium import webdriver  # always imported for fallback + type hints
-
+from selenium import webdriver
 
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait, Select
@@ -260,173 +243,91 @@ def _find_binary(names: list, fallback_paths: list) -> str | None:
     return None
 
 
-def _create_proxy_ext(host: str, port: int, user: str, pwd: str) -> str:
-    """Build a tiny Chrome extension that handles proxy auth.
-    Works in headless mode unlike the old --proxy-server+CDP approach."""
-    manifest = json.dumps({
-        "version": "1.0.0",
-        "manifest_version": 2,
-        "name": "CLBlast Proxy Auth",
-        "permissions": [
-            "proxy", "tabs", "unlimitedStorage", "storage",
-            "<all_urls>", "webRequest", "webRequestBlocking"
-        ],
-        "background": {"scripts": ["bg.js"]},
-        "minimum_chrome_version": "22.0.0"
-    })
-    background = f"""
-    var config = {{
-        mode: "fixed_servers",
-        rules: {{
-            singleProxy: {{ scheme: "http", host: "{host}", port: parseInt("{port}") }},
-            bypassList: ["localhost", "127.0.0.1"]
-        }}
-    }};
-    chrome.proxy.settings.set({{value: config, scope: "regular"}}, function() {{}});
-    chrome.webRequest.onAuthRequired.addListener(
-        function(details) {{
-            return {{ authCredentials: {{ username: "{user}", password: "{pwd}" }} }};
-        }},
-        {{urls: ["<all_urls>"]}},
-        ["blocking"]
-    );
-    """
-    ext_dir = "/tmp/clblast_proxy_ext"
-    os.makedirs(ext_dir, exist_ok=True)
-    with open(f"{ext_dir}/manifest.json", "w") as f:
-        f.write(manifest)
-    with open(f"{ext_dir}/bg.js", "w") as f:
-        f.write(background)
-    return ext_dir
-
-
-def make_driver(headless: bool = False):
+def make_driver(headless: bool = False) -> webdriver.Chrome:
+    import tempfile
     from selenium.webdriver.chrome.service import Service
 
-    # ── Locate binaries ─────────────────────────────────────────────────────
+    # os.environ["SE_MANAGER_PATH"] = ""
+    # os.environ["WDM_SKIP_DOWNLOAD"] = "1"
+
+    options = webdriver.ChromeOptions()
+    options.set_capability("goog:loggingPrefs", {"browser": "ALL"})  # enables get_log('browser')
+
+    # --- Crash prevention (Railway / Docker / memory-constrained environments) ---
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--disable-software-rasterizer")
+    options.add_argument("--headless=new")
+    options.add_argument("--window-size=1366,768")
+    options.add_argument("--disable-setuid-sandbox")
+    options.add_argument("--disable-extensions")
+    options.add_argument("--mute-audio")
+    options.add_argument("--no-first-run")
+    options.add_argument("--no-default-browser-check")
+    options.add_argument("--shm-size=256m")
+
+    # --- Anti-detection (critical) ---
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_argument("--proxy-server=http://spa1pl920i:dBByddd_WD08p4hk7f@gate.decodo.com:10004")
+    options.add_argument("--accept-lang=en-US,en;q=0.9")
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.add_experimental_option("useAutomationExtension", False)
+
+    # --- Use a FRESH temp dir every run to avoid stale lock files from prior crashes ---
+    fresh_profile = tempfile.mkdtemp(prefix="clblast_chrome_")
+    options.add_argument(f"--user-data-dir={fresh_profile}")
+
+    ua_pool = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    ]
+    options.add_argument(f"--user-agent={random.choice(ua_pool)}")
+
     chromium_bin = _find_binary(
         ["chromium", "chromium-browser", "google-chrome"],
         ["/usr/bin/chromium", "/usr/bin/chromium-browser", "/usr/bin/google-chrome"]
     )
-    chromedriver_bin = _find_binary(["chromedriver"], ["/usr/bin/chromedriver"])
-
     if chromium_bin:
         print(f"  [driver] Using chromium: {chromium_bin}")
+        options.binary_location = chromium_bin
     else:
         print("  [driver] WARNING: chromium binary not found")
-    if chromedriver_bin:
-        print(f"  [driver] Using chromedriver: {chromedriver_bin}")
-    else:
-        raise RuntimeError("chromedriver not found")
 
-    # ── Persistent profile ───────────────────────────────────────────────────
-    profile_dir = os.environ.get("CHROME_PROFILE_DIR", "/tmp/clblast_chrome_profile")
-    os.makedirs(profile_dir, exist_ok=True)
-    for lock in ["SingletonLock", "SingletonCookie", "SingletonSocket"]:
-        lp = os.path.join(profile_dir, lock)
-        if os.path.exists(lp):
+    chromedriver_bin = _find_binary(
+        ["chromedriver"],
+        ["/usr/bin/chromedriver"]
+    )
+    if not chromedriver_bin:
+        print("  [driver] WARNING: chromedriver not found in path fallback, trying default webdriver.Chrome initiation...")
+        try:
+            driver = webdriver.Chrome(options=options)
+        except Exception as e:
+            print(f"  [driver] Chrome session failed with default initialization: {e}")
+            raise RuntimeError("chromedriver not found and default initialization failed.")
+    else:
+        print(f"  [driver] Using chromedriver: {chromedriver_bin}")
+        # Use a safe log file path on Windows
+        log_path = "chromedriver.log" if os.name == 'nt' else "/tmp/chromedriver.log"
+        service = Service(
+            executable_path=chromedriver_bin,
+            log_output=log_path
+        )
+        try:
+            driver = webdriver.Chrome(service=service, options=options)
+        except Exception as e:
+            print(f"  [driver] Chrome session failed: {e}")
             try:
-                os.remove(lp)
+                with open(log_path) as log:
+                    print("  [chromedriver log]", log.read()[-2000:])
             except Exception:
                 pass
-    print(f"  [driver] Chrome profile: {profile_dir}")
-
-    # ── Headless Check ───────────────────────────────────────────────────────
-    run_headless = headless or IS_RAILWAY
-
-    # ── Build options ────────────────────────────────────────────────────────
-    if UC_AVAILABLE:
-        options = uc.ChromeOptions()
-    else:
-        options = webdriver.ChromeOptions()
-
-    # Crash prevention
-    for arg in [
-        "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
-        "--disable-software-rasterizer", "--window-size=1366,768",
-        "--disable-setuid-sandbox",
-        # NOTE: --disable-extensions removed — it would block proxy extension
-        "--mute-audio", "--no-first-run", "--no-default-browser-check",
-        "--shm-size=256m",
-    ]:
-        options.add_argument(arg)
-
-    if run_headless and not UC_AVAILABLE:
-        # Standard way to run headless in modern Selenium / Chrome
-        options.add_argument("--headless=new")
-
-    # Anti-detection (still needed even with uc)
-    options.add_argument("--accept-lang=en-US,en;q=0.9")
-    options.add_argument("--disable-blink-features=AutomationControlled")
-    if not UC_AVAILABLE:
-        # uc handles these internally — don't set them twice
-        options.add_experimental_option("excludeSwitches", ["enable-automation"])
-        options.add_experimental_option("useAutomationExtension", False)
-
-    # Note: User-agent rotation removed to prevent User-Agent Client Hints mismatch.
-
-    # Profile
-    options.add_argument(f"--user-data-dir={profile_dir}")
-
-    # Proxy: Chrome extensions don't load in headless mode.
-    # Use seleniumwire to inject proxy auth at the HTTP level (works headless).
-    # This routes ALL CL traffic through the residential proxy so session IP = posting IP.
-    sw_options = {}
-    if SELENIUMWIRE_AVAILABLE:
-        sw_options = {
-            "proxy": {
-                "http":  "http://spa1pl920i:dBByddd_WD08p4hk7f@gate.decodo.com:10004",
-                "https": "http://spa1pl920i:dBByddd_WD08p4hk7f@gate.decodo.com:10004",
-                "no_proxy": "localhost,127.0.0.1",
-            }
-        }
-        print("  [driver] Proxy configured via seleniumwire")
-
-    # ── Launch driver ────────────────────────────────────────────────────────
-    log_path = "chromedriver.log" if os.name == 'nt' else "/tmp/chromedriver.log"
-
-    try:
-        if UC_AVAILABLE:
-            driver = uc.Chrome(
-                options=options,
-                driver_executable_path=chromedriver_bin,
-                browser_executable_path=chromium_bin if chromium_bin else None,
-                headless=run_headless,
-                version_main=None,  # uc auto-detects version
-                use_subprocess=True,
-                seleniumwire_options=sw_options if SELENIUMWIRE_AVAILABLE else None
-            )
-            print("  [driver] Using undetected-chromedriver ✓")
-        else:
-            service = Service(executable_path=chromedriver_bin, log_output=log_path)
-            if SELENIUMWIRE_AVAILABLE:
-                driver = sw_webdriver.Chrome(
-                    service=service,
-                    options=options,
-                    seleniumwire_options=sw_options
-                )
-                print("  [driver] Using standard selenium with selenium-wire ✓")
-            else:
-                driver = webdriver.Chrome(service=service, options=options)
-                print("  [driver] Using standard selenium (no proxy/wire) ✓")
-    except Exception as e:
-        print(f"  [driver] Chrome session failed: {e}")
-        try:
-            with open(log_path) as log:
-                print("  [chromedriver log]", log.read()[-2000:])
-        except Exception:
-            pass
-        raise
-
-    # Remove webdriver fingerprint at JS level (belt-and-suspenders with uc)
+            raise
     driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": """
         Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-        Object.defineProperty(navigator, 'plugins',   {get: () => [1,2,3,4,5]});
+        Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
         Object.defineProperty(navigator, 'languages', {get: () => ['en-US','en']});
         window.chrome = {runtime: {}};
-        delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
-        delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
-        delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
         Object.defineProperty(navigator, 'permissions', {
             get: () => ({query: () => Promise.resolve({state: 'granted'})})
         });
@@ -559,52 +460,61 @@ def handle_captcha_if_present(driver):
 # LOGIN
 # ─────────────────────────────────────────────────────────────
 def craigslist_login(driver, email: str, password: str) -> bool:
+    print("[login] Navigating to CL login page...")
     driver.get("https://accounts.craigslist.org/login")
-    human_delay(2, 4)
+    time.sleep(6)
+    print(f"[login] Page title: {driver.title}")
+    print(f"[login] URL: {driver.current_url}")
     handle_captcha_if_present(driver)
 
     try:
-        email_field = WebDriverWait(driver, 15).until(
+        email_field = WebDriverWait(driver, 20).until(
             EC.presence_of_element_located((By.ID, "inputEmailHandle"))
         )
+        print("[login] Email field found, typing...")
         send_keys_slow(driver, email_field, email)
         human_delay()
 
-        try:
-            pw_field = driver.find_element(By.ID, "inputPassword")
-            send_keys_slow(driver, pw_field, password)
-            human_delay()
-        except NoSuchElementException:
-            pass  # some CL accounts have no password field
+        pw_field = driver.find_element(By.ID, "inputPassword")
+        print("[login] Password field found, typing...")
+        send_keys_slow(driver, pw_field, password)
+        human_delay()
 
         btn = driver.find_element(By.CSS_SELECTOR, "button[type='submit']")
+        print("[login] Clicking submit...")
         safe_click(driver, btn)
+        time.sleep(3)
+        print(f"[login] Post-submit URL: {driver.current_url}")
+        print(f"[login] Post-submit title: {driver.title}")
 
-        # Wait for any CL page to load
-        WebDriverWait(driver, 15).until(EC.url_contains("craigslist.org"))
-        time.sleep(2)
-        cur = driver.current_url.lower()
-
-        if "login/onetime" in cur:
-            # CL sent a magic link to the email — account has no password
-            print("  ✗ CL sent a magic-link email (account has no real password).")
-            print("  → Set a real password at https://accounts.craigslist.org")
-            print("  → Then update CL_PASSWORD in Railway to that password.")
-            return False
-
-        if "login" in cur and "onetime" not in cur:
-            # CL showed a location/security verification page or bad password
-            print(f"  ✗ Login blocked — still on login page: {cur}")
-            print("  → CL may be flagging the new proxy IP location.")
-            print("  → The client must log in manually at https://accounts.craigslist.org")
-            print("    from the proxy IP first, to approve the new location.")
-            return False
-
+        WebDriverWait(driver, 20).until(EC.url_contains("craigslist.org"))
         handle_captcha_if_present(driver)
-        print("  Logged in to Craigslist ✓")
+
+        # Verify we are actually logged in, not back on login page
+        if "login" in driver.current_url.lower():
+            print("[login] Still on login page — wrong credentials or CL blocked login")
+            # Print any error messages on page
+            try:
+                errs = driver.find_elements(By.CSS_SELECTOR, ".err, .error, .alert, #errs")
+                for e in errs:
+                    if e.text.strip():
+                        print(f"[login] CL error: {e.text.strip()}")
+            except Exception:
+                pass
+            return False
+
+        print("Logged in to Craigslist ✓")
         return True
     except TimeoutException:
-        print("  Login failed (timeout).")
+        print(f"[login] Timed out. Current URL: {driver.current_url}")
+        print(f"[login] Page title: {driver.title}")
+        # Check if proxy is working at all
+        try:
+            body = driver.find_element(By.TAG_NAME, "body").text[:300]
+            print(f"[login] Page body: {body}")
+        except Exception:
+            pass
+        print("Login failed.")
         return False
 
 
@@ -662,267 +572,33 @@ def js_fill(driver, field_id: str, value: str):
     import time as _t; _t.sleep(0.2)
 
 
-def selenium_fill(driver, field_id: str, value: str) -> bool:
-    """Fill a field so CL's jQuery validator always accepts it.
-    Uses real TAB keypress at the end — this is what triggers jQuery Validate's
-    blur handler (native dispatchEvent does NOT trigger jQuery .on('blur') handlers).
-    """
+def _fill_field_cl(driver, el, text):
+    """Fill a CL form field correctly — Ctrl+A overwrite + Tab commit only."""
     from selenium.webdriver.common.keys import Keys
-    try:
-        el = WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.ID, field_id))
-        )
-        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
-        time.sleep(0.3)
-
-        # JS-clear via native setter (bypasses React/Vue/jQuery value caching)
-        driver.execute_script("""
-            var el = arguments[0];
-            el.focus();
-            var tag = el.tagName.toLowerCase();
-            var proto = tag === 'textarea'
-                ? window.HTMLTextAreaElement.prototype
-                : window.HTMLInputElement.prototype;
-            var setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
-            if (setter) setter.call(el, ''); else el.value = '';
-            el.dispatchEvent(new Event('input',  {bubbles:true}));
-            el.dispatchEvent(new Event('change', {bubbles:true}));
-        """, el)
-        time.sleep(0.15)
-
-        # Ctrl+A + Delete to clear any residual
-        el.click()
-        time.sleep(0.1)
-        el.send_keys(Keys.CONTROL + "a")
-        time.sleep(0.05)
-        el.send_keys(Keys.DELETE)
-        time.sleep(0.1)
-
-        # Type character-by-character with ActionChains (real OS-level key events)
-        actions = ActionChains(driver)
-        actions.click(el).pause(0.1)
-        for ch in value:
-            actions.send_keys(ch)
-            actions.pause(random.uniform(0.03, 0.07))
-        actions.perform()
-        time.sleep(0.3)
-
-        # Press TAB — this is the critical step:
-        # Real TAB fires focus-out/blur in the browser's native event loop,
-        # which jQuery Validate hooks into via $.on('blur'). Synthetic
-        # dispatchEvent('blur') does NOT reach jQuery's event handlers.
-        el.send_keys(Keys.TAB)
-        time.sleep(0.4)
-
-        # Verify fill
-        actual = (el.get_attribute("value") or "").strip()
-        if not actual:
-            # Fallback: JS fill with native setter
-            print(f"  ⚠ selenium_fill({field_id}): typing didn't stick — JS fallback")
-            js_fill(driver, field_id, value)
-            time.sleep(0.3)
-            el.send_keys(Keys.TAB)  # TAB again after JS fill too
-            time.sleep(0.3)
-
-        return True
-    except Exception as e:
-        print(f"  ⚠ selenium_fill({field_id}) failed: {e}")
-        return False
-
-
-# ─────────────────────────────────────────────────────────────
-# FILL LISTING DETAILS
-# ─────────────────────────────────────────────────────────────
-def robust_fill_zip(driver, zip_code):
-    """Fill postal_code with every event CL jQuery needs, using native setter."""
-    script = """
-        var el = document.getElementById('postal_code');
-        if (!el) return false;
-        el.scrollIntoView({block: 'center'});
-        el.focus();
-        // Use native setter to bypass framework value caching
-        var nativeInputValueSetter = Object.getOwnPropertyDescriptor(
-            window.HTMLInputElement.prototype, 'value'
-        ).set;
-        nativeInputValueSetter.call(el, arguments[0]);
-        // Fire complete jQuery-compatible event chain
-        var events = ['focus','click','keydown','keypress','input','keyup','change','blur'];
-        events.forEach(function(evtName) {
-            var evt;
-            if (evtName === 'input') {
-                evt = new InputEvent('input', {bubbles: true, cancelable: true, data: arguments[0]});
-            } else if (['keydown','keypress','keyup'].includes(evtName)) {
-                evt = new KeyboardEvent(evtName, {bubbles: true, cancelable: true, keyCode: 13});
-            } else {
-                evt = new Event(evtName, {bubbles: true, cancelable: true});
-            }
-            el.dispatchEvent(evt);
-        });
-        el.blur();
-        return true;
-    """
-    driver.execute_script(script, zip_code)
-    time.sleep(0.5)
-    # Verify fill worked; fallback to ActionChains if not
-    try:
-        from selenium.webdriver.common.keys import Keys
-        el = driver.find_element(By.ID, 'postal_code')
-        actual = el.get_attribute('value')
-        if actual != zip_code:
-            actions = ActionChains(driver)
-            actions.click(el).key_down(Keys.CONTROL).send_keys('a').key_up(Keys.CONTROL)
-            actions.send_keys(Keys.DELETE)
-            for ch in zip_code:
-                actions.send_keys(ch)
-                actions.pause(0.05)
-            actions.perform()
-            time.sleep(0.3)
-            driver.execute_script(
-                "arguments[0].dispatchEvent(new Event('change',{bubbles:true}));"
-                "arguments[0].dispatchEvent(new Event('blur',{bubbles:true}));",
-                el
-            )
-        print(f"  ✓ Zip filled and verified: {zip_code}")
-    except Exception as e:
-        print(f"  ⚠ Zip verification error: {e}")
-
-
-
-def fill_zip_cl(driver, zip_code: str):
-    """Fill CL's postal_code field with per-character InputEvents.
-    CL's ZIP validator fires on each keystroke's InputEvent.data — not on bulk paste.
-    This fires a real InputEvent for every character, which is what CL expects.
-    """
-    from selenium.webdriver.common.keys import Keys
-    try:
-        el = WebDriverWait(driver, 8).until(
-            EC.any_of(
-                EC.presence_of_element_located((By.ID, "postal_code")),
-                EC.presence_of_element_located((By.NAME, "postal")),
-                EC.presence_of_element_located((By.NAME, "postal_code")),
-            )
-        )
-        # Re-find with correct selector (id may be empty, use name fallback)
-        try:
-            el = driver.find_element(By.ID, "postal_code")
-        except Exception:
-            try:
-                el = driver.find_element(By.NAME, "postal")
-            except Exception:
-                el = driver.find_element(By.NAME, "postal_code")
-        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
-        time.sleep(0.2)
-
-        # Clear via native setter first
-        driver.execute_script("""
-            var el = arguments[0];
-            var setter = Object.getOwnPropertyDescriptor(
-                window.HTMLInputElement.prototype, 'value').set;
-            setter.call(el, '');
-            el.dispatchEvent(new Event('input',{bubbles:true}));
-        """, el)
-        time.sleep(0.1)
-        el.click()
-        time.sleep(0.1)
-        el.send_keys(Keys.CONTROL + "a")
-        el.send_keys(Keys.DELETE)
-        time.sleep(0.1)
-
-        # Type each digit AND fire InputEvent with data= that digit
-        current = ""
-        for ch in zip_code:
-            el.send_keys(ch)
-            current += ch
-            driver.execute_script("""
-                var el = arguments[0];
-                var ch = arguments[1];
-                var cur = arguments[2];
-                // Update value via native setter after each char
-                var setter = Object.getOwnPropertyDescriptor(
-                    window.HTMLInputElement.prototype, 'value').set;
-                setter.call(el, cur);
-                el.dispatchEvent(new InputEvent('input', {
-                    bubbles: true, cancelable: true,
-                    data: ch, inputType: 'insertText'
-                }));
-            """, el, ch, current)
-            time.sleep(random.uniform(0.05, 0.12))
-
-        # Final change + blur to trigger CL's ZIP validation handler
-        driver.execute_script("""
-            var el = arguments[0];
-            el.dispatchEvent(new Event('change',{bubbles:true,cancelable:true}));
-            el.dispatchEvent(new Event('blur',{bubbles:true,cancelable:true}));
-        """, el)
-        time.sleep(0.4)
-
-        # Verify
-        actual = (el.get_attribute("value") or "").strip()
-        if actual != zip_code:
-            print(f"  ⚠ ZIP verify mismatch: got '{actual}' expected '{zip_code}' — forcing via JS")
-            driver.execute_script("""
-                var el = arguments[0]; var val = arguments[1];
-                var setter = Object.getOwnPropertyDescriptor(
-                    window.HTMLInputElement.prototype,'value').set;
-                setter.call(el, val);
-                ['input','change','blur'].forEach(function(n){
-                    el.dispatchEvent(new Event(n,{bubbles:true,cancelable:true}));
-                });
-            """, el, zip_code)
-            time.sleep(0.3)
-        print(f"  ✓ Zip: {zip_code}")
-    except Exception as e:
-        print(f"  ⚠ fill_zip_cl failed: {e}")
-
-def _type_into_field(driver, el, text: str):
-    """Type text into a field using TAB-commit pattern CL validators require.
-    
-    CL's form uses jQuery Validate which marks fields as 'valid' only when:
-    1. The field receives focus
-    2. Characters are typed (keydown/keypress/keyup per char)
-    3. The field loses focus via TAB or click-away
-    
-    This function does exactly that — no synthetic events needed.
-    """
-    from selenium.webdriver.common.keys import Keys
-    
-    # Click to focus
-    try:
-        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
-        time.sleep(0.2)
-        el.click()
-        time.sleep(0.3)
-    except Exception:
-        pass
-    
-    # Select all + delete existing content
+    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+    time.sleep(0.3)
+    el.click()
+    time.sleep(0.4)
     el.send_keys(Keys.CONTROL + "a")
-    time.sleep(0.05)
-    el.send_keys(Keys.DELETE)
     time.sleep(0.1)
-    
-    # Type every character individually (real keystroke events)
-    for ch in text:
-        el.send_keys(ch)
-        time.sleep(random.uniform(0.04, 0.09))
-    
-    time.sleep(0.2)
-    
-    # TAB away — this is what triggers CL jQuery Validate to mark field as valid
+    el.send_keys(text)
+    time.sleep(0.3)
     el.send_keys(Keys.TAB)
-    time.sleep(0.6)
-    # Extra: click somewhere neutral so field fully commits
-    try:
-        driver.execute_script("document.body.click();")
-    except Exception:
-        pass
-    time.sleep(0.2)
+    time.sleep(0.5)
+    actual = (el.get_attribute("value") or "").strip()
+    if not actual:
+        actual = driver.execute_script(
+            "return arguments[0].value || arguments[0].textContent || '';", el
+        ).strip()
+    return actual
 
 
 def fill_listing_details(driver, product: dict):
-    # 1. Wait for form — if it never appears, return silently (don't crash)
+    from selenium.webdriver.common.keys import Keys
+
+    # 1. Wait for form
     try:
-        WebDriverWait(driver, 15).until(
+        WebDriverWait(driver, 20).until(
             EC.presence_of_element_located((By.ID, "postingForm"))
         )
     except TimeoutException:
@@ -930,101 +606,107 @@ def fill_listing_details(driver, product: dict):
         return
 
     handle_captcha_if_present(driver)
-    # Wait for ALL key fields to be present before touching anything.
+
+    # 2. Wait for key fields — DO NOT touch the jQuery validator
     for fid in ["PostingTitle", "PostingBody"]:
         try:
-            WebDriverWait(driver, 10).until(
+            WebDriverWait(driver, 15).until(
                 EC.presence_of_element_located((By.ID, fid))
             )
         except TimeoutException:
-            print(f"  ⚠ Field '{fid}' never appeared — CL may have different IDs")
-    time.sleep(3.0)  # wait for CL jQuery Validate to attach to all fields
+            print(f"  ⚠ Field '{fid}' not found")
+    time.sleep(3.0)  # let CL's JS fully attach
 
+    # 3. DIAGNOSTIC — print actual form field map (keep this permanently)
+    try:
+        field_map = driver.execute_script("""
+            var form = document.getElementById('postingForm');
+            if (!form) return {};
+            var result = {};
+            Array.from(form.elements).forEach(function(el) {
+                if (el.name) result[el.name] = {
+                    id: el.id, type: el.type, 
+                    tag: el.tagName, vis: el.offsetParent !== null
+                };
+            });
+            return result;
+        """)
+        print(f"  [form fields]: {json.dumps(field_map)}")
+    except Exception as fe:
+        print(f"  [form fields] diagnostic failed: {fe}")
 
-
-    # 2. Resolve values
-    title = product.get("title") or product.get("name") or "Quality Item For Sale"
-    description = product.get("description") or "Great condition. Contact for details."
-    _pr = str(product.get("price", "")).strip().replace("$", "").replace(",", "")
-    price = _pr if _pr and float(_pr) > 0 else "1"
+    # 4. Resolve values
+    title = (product.get("title") or product.get("name") or "Quality Item For Sale").strip()
+    description = (product.get("description") or "Great condition. Contact for details.").strip()
+    _pr = str(product.get("price", "")).strip().replace("$","").replace(",","")
+    price = _pr if _pr and _pr != "0" else "1"
 
     _ZIPS = {
-        "losangeles": "90001", "los angeles": "90001",
-        "newyork": "10001",    "new york": "10001",
-        "chicago": "60601",    "houston": "77001",
-        "phoenix": "85001",    "sfbay": "94102",
-        "sandiego": "92101",   "seattle": "98101",
-        "miami": "33101",      "dallas": "75201",
-        "denver": "80201",     "atlanta": "30301",
-        "boston": "02101",     "portland": "97201",
+        "losangeles":"90001","los angeles":"90001","newyork":"10001",
+        "new york":"10001","chicago":"60601","houston":"77001",
+        "phoenix":"85001","sfbay":"94102","sandiego":"92101",
+        "seattle":"98101","miami":"33101","dallas":"75201",
     }
     zip_code = (product.get("zip_code") or product.get("postal_code") or "").strip()
     if not zip_code:
-        _ck = CL_CITY.lower().replace(" ", "").replace("-", "")
+        _ck = CL_CITY.lower().replace(" ","").replace("-","")
         zip_code = _ZIPS.get(_ck, "90001")
 
-    cl_email = (
-        os.environ.get("CL_EMAIL") or
-        product.get("contact_email") or
-        product.get("email") or ""
-    ).strip()
-    city_name = CL_CITY.replace("-", " ").title()
-
-    from selenium.webdriver.common.keys import Keys
-
-    # 3. Fill all fields using TAB-commit pattern
-    # CL jQuery Validate marks a field valid ONLY when it loses focus via Tab/click-away.
-    # Synthetic events (dispatchEvent) do NOT trigger jQuery Validate's focusout handler.
-    # Solution: type into each field then press TAB — exactly what a real user does.
-
+    # 5. Fill title
     print("  Filling title...")
     try:
-        title_el = WebDriverWait(driver, 8).until(
-            EC.presence_of_element_located((By.ID, "PostingTitle"))
+        title_el = WebDriverWait(driver, 10).until(
+            EC.element_to_be_clickable((By.ID, "PostingTitle"))
         )
-        _type_into_field(driver, title_el, title)
-        print(f"  ✓ title: '{title[:40]}'")
+        result = _fill_field_cl(driver, title_el, title)
+        print(f"  ✓ title filled: '{result[:40]}'")
     except Exception as e:
-        print(f"  ⚠ title fill failed: {e}")
+        print(f"  ✗ title fill failed: {e}")
 
+    # 6. Fill description
     print("  Filling description...")
     try:
-        body_el = WebDriverWait(driver, 8).until(
-            EC.presence_of_element_located((By.ID, "PostingBody"))
+        body_el = WebDriverWait(driver, 10).until(
+            EC.element_to_be_clickable((By.ID, "PostingBody"))
         )
-        _type_into_field(driver, body_el, description)
-        print(f"  ✓ description: {len(description)} chars")
+        result = _fill_field_cl(driver, body_el, description)
+        print(f"  ✓ description filled: {len(result)} chars")
     except Exception as e:
-        print(f"  ⚠ description fill failed: {e}")
+        print(f"  ✗ description fill failed: {e}")
 
-    # city/area fields — not validated, JS fill is fine
-    js_fill(driver, "geographic_area", city_name)
-    js_fill(driver, "city", city_name)
-    time.sleep(0.3)
-
+    # 7. Fill ZIP — CL's zip has no stable id; find by name
     print("  Filling zip...")
     try:
-        # CL's zip field has NO id — must find by name="postal"
-        try:
-            zip_el = driver.find_element(By.ID, "postal_code")
-        except Exception:
+        zip_el = None
+        for locator in [
+            (By.ID, "postal_code"),
+            (By.NAME, "postal"),
+            (By.NAME, "postal_code"),
+            (By.CSS_SELECTOR, "input[id*='postal'], input[name*='postal']"),
+        ]:
             try:
-                zip_el = driver.find_element(By.NAME, "postal")
+                zip_el = WebDriverWait(driver, 4).until(
+                    EC.presence_of_element_located(locator)
+                )
+                if zip_el.is_displayed():
+                    break
             except Exception:
-                zip_el = driver.find_element(By.NAME, "postal_code")
-        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", zip_el)
-        _type_into_field(driver, zip_el, zip_code)
-        print(f"  ✓ zip: {zip_code}")
+                continue
+        if zip_el:
+            result = _fill_field_cl(driver, zip_el, zip_code)
+            print(f"  ✓ zip filled: '{result}'")
+        else:
+            print("  ✗ zip field not found by any locator")
     except Exception as e:
-        print(f"  ⚠ zip fill failed: {e}")
+        print(f"  ✗ zip fill failed: {e}")
 
-    # Price
+    # 8. Fill price
     price_filled = False
-    for pid in ["AskingPrice", "AskPrice", "price", "Price", "asking_price", "AskPriceText"]:
+    for pid in ["AskingPrice","AskPrice","price","Price","asking_price"]:
         try:
             pi = driver.find_element(By.ID, pid)
             if pi.is_displayed():
-                _type_into_field(driver, pi, price)
+                _fill_field_cl(driver, pi, price)
                 print(f"  ✓ Price: {price}")
                 price_filled = True
                 break
@@ -1032,36 +714,19 @@ def fill_listing_details(driver, product: dict):
             continue
     if not price_filled:
         try:
-            price_inputs = driver.find_elements(By.CSS_SELECTOR,
-                "input[id*='rice'], input[name*='rice'], input[id*='ask'], input[name*='ask']")
-            for pi in price_inputs:
-                if pi.is_displayed():
-                    _type_into_field(driver, pi, price)
-                    print(f"  ✓ Price filled via CSS fallback: {price}")
+            pi = driver.find_elements(By.CSS_SELECTOR,
+                "input[id*='rice'],input[name*='rice'],input[id*='ask'],input[name*='ask']"
+            )
+            for p_el in pi:
+                if p_el.is_displayed():
+                    _fill_field_cl(driver, p_el, price)
+                    print(f"  ✓ Price filled via CSS: {price}")
                     price_filled = True
                     break
         except Exception as pe:
-            print(f"  ⚠ Price fallback failed: {pe}")
-    if not price_filled:
-        print("  ⚠ Price field not found — posting without price")
+            print(f"  ⚠ Price fallback: {pe}")
 
-    # Email
-    try:
-        ef = WebDriverWait(driver, 4).until(
-            EC.presence_of_element_located((By.ID, "FromEMail"))
-        )
-        cur_val = (ef.get_attribute("value") or "").strip()
-        if cur_val:
-            print(f"  ✓ Email already in field: {cur_val}")
-        elif cl_email:
-            _type_into_field(driver, ef, cl_email)
-            print(f"  ✓ Email: {cl_email}")
-        else:
-            print("  ✗ CL_EMAIL env var not set AND field is empty — will fail")
-    except TimeoutException:
-        print("  [info] FromEMail absent — CL using session email (OK if logged in)")
-
-    # Condition dropdown
+    # 9. Condition dropdown
     try:
         cond = Select(WebDriverWait(driver, 3).until(
             EC.presence_of_element_located((By.ID, "condition"))
@@ -1070,186 +735,93 @@ def fill_listing_details(driver, product: dict):
     except Exception:
         pass
 
-    time.sleep(1.5)
+    time.sleep(2.0)
 
-    # Pre-submit verification
+    # 10. PRE-SUBMIT SNAPSHOT
     try:
-        tv = (driver.find_element(By.ID, "PostingTitle").get_attribute("value") or "").strip()
-        bv = (driver.find_element(By.ID, "PostingBody").get_attribute("value") or "").strip()
-        try:
-            _zip_el = driver.find_element(By.ID, "postal_code")
-        except Exception:
-            try:
-                _zip_el = driver.find_element(By.NAME, "postal")
-            except Exception:
-                _zip_el = driver.find_element(By.NAME, "postal_code")
-        zv = (_zip_el.get_attribute("value") or "").strip()
-        print(f"  ✓ title confirmed: '{tv[:40]}...'")
-        print(f"  ✓ description confirmed ({len(bv)} chars)")
-        print(f"  ✓ postal_code confirmed: '{zv}'")
-        # Re-fill any that are empty
-        if not tv:
-            print("  ✗ title EMPTY — re-filling")
-            _type_into_field(driver, driver.find_element(By.ID, "PostingTitle"), title)
-        if not bv:
-            print("  ✗ description EMPTY — re-filling")
-            _type_into_field(driver, driver.find_element(By.ID, "PostingBody"), description)
-        if not zv:
-            print("  ✗ zip EMPTY — re-filling")
-            try:
-                _rz = driver.find_element(By.ID, "postal_code")
-            except Exception:
-                try:
-                    _rz = driver.find_element(By.NAME, "postal")
-                except Exception:
-                    _rz = driver.find_element(By.NAME, "postal_code")
-            _type_into_field(driver, _rz, zip_code)
-    except Exception as e:
-        print(f"  ⚠ pre-submit check error: {e}")
-
-    # 4. Explicitly trigger jQuery Validate on every critical field before submit.
-    #    $(el).trigger('blur') routes through jQuery's event system — unlike native
-    #    dispatchEvent which bypasses $.on('blur') handlers entirely.
-    try:
-        driver.execute_script("""
-            var fieldIds = ['PostingTitle', 'PostingBody', 'postal_code', 'AskingPrice',
-                            'AskPrice', 'price', 'FromEMail'];
-            fieldIds.forEach(function(id) {
-                var el = document.getElementById(id);
-                if (!el) return;
-                // jQuery trigger — reaches $.on('blur') handlers CL uses for validation
-                if (typeof jQuery !== 'undefined') {
-                    jQuery(el).trigger('blur');
-                    jQuery(el).trigger('change');
-                }
-            });
-            // Tell jQuery Validate the form is valid (clears error highlights)
-            if (typeof jQuery !== 'undefined') {
-                var form = jQuery('#postingForm');
-                if (form.length && form.data('validator')) {
-                    form.data('validator').form();
-                }
-            }
+        snap = driver.execute_script("""
+            return {
+                title: (document.getElementById('PostingTitle')||{}).value||'',
+                body: (document.getElementById('PostingBody')||{}).value||'',
+                zip: ((document.querySelector('#postal_code,[name=postal],[name=postal_code]')||{}).value||''),
+                token: ((document.querySelector('[name=cryptedStepCheck]')||{}).value||'MISSING')
+            };
         """)
-        time.sleep(0.5)
-        print("  [jq] jQuery Validate triggered on all fields")
-    except Exception as jq_err:
-        print(f"  [jq] jQuery trigger skipped: {jq_err}")
+        print(f"  [snap] title={len(snap.get('title',''))}ch "
+              f"body={len(snap.get('body',''))}ch "
+              f"zip={snap.get('zip','')} "
+              f"token={len(snap.get('token',''))}ch")
+        
+        # Hard stop if token missing — no point submitting
+        if snap.get('token','') in ('', 'MISSING'):
+            print("  ✗ cryptedStepCheck token missing — aborting, form will be rejected")
+            return
+    except Exception as se:
+        print(f"  ⚠ pre-submit snapshot error: {se}")
 
-    # 5. Click Continue — use TAB to leave last field, then click button
-    # TAB ensures the last active field commits its value before submit
-    try:
-        driver.switch_to.active_element.send_keys(Keys.TAB)
-        time.sleep(0.3)
-
-    except Exception:
-        pass
-
+    # 11. SUBMIT — use native .click() ONLY (not execute_script, not ActionChains)
     driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
     time.sleep(0.5)
+    
+    # Click somewhere neutral first so no field retains focus
+    try:
+        driver.find_element(By.TAG_NAME, "body").click()
+        time.sleep(0.3)
+    except Exception:
+        pass
 
     url_before = driver.current_url
     clicked = False
 
-    for sel in ["button.go", "button.submit-button", "button[type='submit']", "input[type='submit']"]:
+    for sel in ["button.go", "button[type='submit'].go", "button[type='submit']", "input[type='submit']"]:
         try:
             btn = WebDriverWait(driver, 5).until(
                 EC.element_to_be_clickable((By.CSS_SELECTOR, sel))
             )
             driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
-            time.sleep(0.3)
-
-            # Verify cryptedStepCheck token still intact — CL rejects if wiped
-            token_val = driver.execute_script(
-                "var el=document.querySelector('[name=cryptedStepCheck]'); return el ? el.value : 'MISSING';"
-            )
-            print(f"  [token] cryptedStepCheck={'OK('+str(len(token_val))+'ch)' if token_val and token_val!='MISSING' else 'MISSING-CL_WILL_REJECT'}")
-
-            # Snapshot field values RIGHT before submit
-            snap = driver.execute_script("""
-                return {
-                    title: (document.getElementById('PostingTitle') || {}).value || '',
-                    body:  (document.getElementById('PostingBody')  || {}).value || '',
-                    zip:   ((document.querySelector('#postal_code,[name=postal],[name=postal_code]') || {}).value || '')
-                };
-            """)
-            print(f"  [snap] title={len(snap.get('title',''))}ch body={len(snap.get('body',''))}ch zip={snap.get('zip','')}")
-
-            # If ANY field is empty at this point, re-fill it and TAB away
-            from selenium.webdriver.common.keys import Keys
-            if not snap.get('title'):
-                print("  ✗ title empty at submit — re-filling")
-                el = driver.find_element(By.ID, "PostingTitle")
-                _type_into_field(driver, el, title)
-            if not snap.get('body'):
-                print("  ✗ body empty at submit — re-filling")
-                el = driver.find_element(By.ID, "PostingBody")
-                _type_into_field(driver, el, description)
-            if not snap.get('zip'):
-                print("  ✗ zip empty at submit — re-filling")
-                el = driver.find_element(By.ID, "postal_code")
-                _type_into_field(driver, el, zip_code)
-
-            # Click body first to ensure no field has focus, then click button
-            driver.execute_script("document.body.click();")
-            time.sleep(0.3)
-
-            # Strategy: remove jQuery Validate from the form before submitting.
-            # CL's jQuery Validate has anti-bot custom validators that reject
-            # programmatic fills regardless of event firing. Removing it lets the
-            # form POST directly to CL's server, which accepts valid field values.
-            bypassed = driver.execute_script("""
-                try {
-                    var form = document.getElementById('postingForm');
-                    if (!form) return 'no-form';
-                    if (typeof jQuery !== 'undefined') {
-                        var $form = jQuery(form);
-                        // Remove the validator instance — disables all client-side checks
-                        $form.removeData('validator');
-                        // Also remove jQuery Validate's submit handler
-                        $form.off('submit.validate');
-                        // Remove the 'invalid' class from all fields
-                        $form.find('.error').removeClass('error');
-                        $form.find('[aria-invalid]').removeAttr('aria-invalid');
-                    }
-                    return 'validator-removed';
-                } catch(e) { return 'err:' + e; }
-            """)
-            print(f"  [jq] Validator bypass: {bypassed}")
-            time.sleep(0.2)
-
-            # Now submit — click the button (no validator will intercept)
-            ActionChains(driver).move_to_element(btn).pause(0.3).click().perform()
+            time.sleep(0.5)
+            btn.click()   # ← native Selenium .click() ONLY
             print(f"  ✓ Continue clicked via: {sel}")
             clicked = True
-            time.sleep(3)
+            time.sleep(4)
             break
-        except Exception:
+        except Exception as ce:
+            print(f"  ⚠ click attempt {sel} failed: {ce}")
             continue
 
     if not clicked:
-        print("  ✗ No continue button found")
+        print("  ✗ No continue button found — aborting")
         return
 
-    # 5. Check for validation errors
+    # 12. Check validation errors
+    time.sleep(2)
     try:
         errs = [e.text.strip() for e in driver.find_elements(
-            By.CSS_SELECTOR, ".notices li, .err, .error, span.notice"
-        ) if e.text.strip() and len(e.text.strip()) > 5]
+            By.CSS_SELECTOR, ".notices li, .err, .error, span.notice, label.error"
+        ) if e.text.strip() and len(e.text.strip()) > 3]
         if errs:
             print("  [validation errors]:")
             for et in set(errs):
-                print(f"    → {et[:100]}")
+                print(f"    → {et[:120]}")
+            # DUMP full page source for debugging if errors persist
+            try:
+                err_path = "cl_error_page.html" if os.name == 'nt' else "/tmp/cl_error_page.html"
+                with open(err_path, "w", encoding="utf-8") as f:
+                    f.write(driver.page_source)
+                print(f"  [debug] Error page saved to {err_path}")
+            except Exception as e:
+                print(f"  ⚠ Failed to save error page: {e}")
     except Exception:
         pass
 
-    # 6. Wait for URL to change away from ?s=edit
+    # 13. Wait for navigation
     try:
-        WebDriverWait(driver, 12).until(lambda d: d.current_url != url_before)
-        print(f"  ✓ Navigated to: {driver.current_url}")
+        WebDriverWait(driver, 15).until(lambda d: d.current_url != url_before)
+        print(f"  ✓ Navigated away from edit page: {driver.current_url}")
     except TimeoutException:
-        print(f"  ⚠ Still on edit page after continue: {driver.current_url}")
-        print("  ⚠ CL validation blocked submit — check errors above")
+        err_path = "cl_error_page.html" if os.name == 'nt' else "/tmp/cl_error_page.html"
+        print(f"  ⚠ Still on edit page: {driver.current_url}")
+        print(f"  ⚠ CL rejected the submission — check {err_path}")
 
 
 
@@ -1699,22 +1271,9 @@ def _update_ad_status(ad_name: str):
 # ─────────────────────────────────────────────────────────────
 def main():
     global CL_CITY
-
-    cl_email    = os.environ.get("CL_EMAIL", "").strip()
-    cl_password = os.environ.get("CL_PASSWORD", "").strip()
-
-    print(f"[config] CL_EMAIL set: {'YES (' + cl_email[:3] + '***)' if cl_email else 'NO ← PROBLEM'}")
-    print(f"[config] CL_PASSWORD set: {'YES (' + str(len(cl_password)) + ' chars)' if cl_password else 'NO ← PROBLEM'}")
-    print(f"[config] CL_CITY: {os.environ.get('CL_CITY', 'NOT SET')}")
-
-    if not cl_email:
-        print("✗ FATAL: CL_EMAIL not set in Railway environment variables")
-        print("  Go to Railway dashboard → your service → Variables → add it")
-        return
-
     # Accept credentials from env vars (set by server.py) or fall back to interactive
-    email    = cl_email
-    password = cl_password
+    email    = os.environ.get("CL_EMAIL")    or input("Enter Craigslist email: ").strip()
+    password = os.environ.get("CL_PASSWORD") or input("Enter Craigslist password: ").strip()
     CL_CITY  = os.environ.get("CL_CITY", CL_CITY)
 
     # Merge any listings already written by other platform scripts
@@ -1722,43 +1281,9 @@ def main():
 
     driver = make_driver()
 
-    COOKIE_FILE = os.environ.get("COOKIE_FILE", "/tmp/clblast_cookies.json")
-
-    # Try to restore saved session cookies before attempting login
-    already_logged_in = False
-    if os.path.exists(COOKIE_FILE):
-        try:
-            driver.get("https://accounts.craigslist.org")
-            time.sleep(2)
-            with open(COOKIE_FILE) as f:
-                cookies = json.load(f)
-            for cookie in cookies:
-                try:
-                    driver.add_cookie(cookie)
-                except Exception:
-                    pass
-            driver.refresh()
-            time.sleep(3)
-            if "login" not in driver.current_url.lower():
-                print("  [login] Session restored from saved cookies ✓")
-                already_logged_in = True
-            else:
-                print("  [login] Saved cookies expired — logging in fresh")
-        except Exception as e:
-            print(f"  [login] Cookie restore failed: {e}")
-
-    if not already_logged_in:
-        if not craigslist_login(driver, email, password):
-            driver.quit()
-            return
-        # Save cookies so next run skips login
-        try:
-            cookies = driver.get_cookies()
-            with open(COOKIE_FILE, "w") as f:
-                json.dump(cookies, f)
-            print(f"  [login] Session cookies saved to {COOKIE_FILE}")
-        except Exception as e:
-            print(f"  [login] Could not save cookies: {e}")
+    if not craigslist_login(driver, email, password):
+        driver.quit()
+        return
 
     # Read PRODUCTS_FILE env var so server.py can pass a filtered subset
     products_file = os.environ.get("PRODUCTS_FILE", "products.json")
