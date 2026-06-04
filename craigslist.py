@@ -530,64 +530,50 @@ def js_fill(driver, field_id: str, value: str):
 
 
 def clipboard_fill(driver, field_id: str, value: str) -> bool:
-    """Fill a field using synthetic character-by-character JS KeyboardEvent injection."""
+    """
+    Fill a form field using real ActionChains keystrokes so jQuery Validate
+    registers the field as touched and valid. JS event injection does NOT work
+    on Craigslist — only real browser-level input events pass validation.
+    """
+    from selenium.webdriver.common.action_chains import ActionChains
+    from selenium.webdriver.common.keys import Keys
     try:
-        el = WebDriverWait(driver, 8).until(
+        el = WebDriverWait(driver, 10).until(
             EC.presence_of_element_located((By.ID, field_id))
         )
         driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
-        time.sleep(0.3)
-
-        # Run JS keyboard event simulation
-        driver.execute_script("""
-            var el = document.getElementById(arguments[0]);
-            if (el) {
-                el.focus();
-                el.value = '';
-                var val = arguments[1];
-                var chars = val.split('');
-                chars.forEach(function(ch) {
-                    var code = ch.charCodeAt(0);
-                    el.dispatchEvent(new KeyboardEvent('keydown',  {bubbles:true, cancelable:true, key:ch, keyCode:code, charCode:code, which:code}));
-                    el.dispatchEvent(new KeyboardEvent('keypress', {bubbles:true, cancelable:true, key:ch, keyCode:code, charCode:code, which:code}));
-                    el.value += ch;
-                    el.dispatchEvent(new InputEvent('input',       {bubbles:true, cancelable:true, data:ch, inputType:'insertText'}));
-                    el.dispatchEvent(new KeyboardEvent('keyup',    {bubbles:true, cancelable:true, key:ch, keyCode:code, charCode:code, which:code}));
-                });
-                el.dispatchEvent(new Event('change', {bubbles:true}));
-                el.dispatchEvent(new Event('blur', {bubbles:true}));
-                if (window.jQuery) {
-                    try {
-                        var $form = jQuery(el).closest('form');
-                        var v = $form.data('validator');
-                        if (v) { v.element(el); }
-                    } catch(e) {}
-                }
-                if (window.jQuery) {
-                    try {
-                        jQuery('#' + arguments[0]).trigger('keyup').trigger('change').trigger('blur');
-                    } catch(e) {}
-                }
-            }
-        """, field_id, value)
         time.sleep(0.4)
 
-        # VERIFY: check the value actually landed
-        actual = el.get_attribute("value")
-        if actual != value:
-            # Fallback: Selenium send_keys character by character with 0.03s delay
-            el.click()
-            time.sleep(0.1)
-            el.clear()
-            for ch in value:
-                el.send_keys(ch)
-                time.sleep(0.03)
-            driver.execute_script("""
-                var el = arguments[0];
-                el.dispatchEvent(new Event('change', {bubbles:true}));
-                el.dispatchEvent(new Event('blur',   {bubbles:true}));
-            """, el)
-            time.sleep(0.2)
+        # Click to focus — real browser focus event
+        ActionChains(driver).move_to_element(el).click().perform()
+        time.sleep(0.3)
+
+        # Select all + delete any existing content
+        ActionChains(driver).key_down(Keys.CONTROL).send_keys('a').key_up(Keys.CONTROL).perform()
+        time.sleep(0.1)
+        ActionChains(driver).send_keys(Keys.DELETE).perform()
+        time.sleep(0.1)
+
+        # Type character by character with human-like delays
+        for ch in value:
+            ActionChains(driver).send_keys(ch).perform()
+            time.sleep(random.uniform(0.04, 0.09))
+
+        # Tab out — this is what triggers jQuery Validate's blur handler
+        ActionChains(driver).send_keys(Keys.TAB).perform()
+        time.sleep(0.5)
+
+        # Verify value landed
+        actual = (driver.find_element(By.ID, field_id).get_attribute("value") or "").strip()
+        if actual != value.strip():
+            print(f"  ⚠ clipboard_fill({field_id}): mismatch — got '{actual[:30]}', expected '{value[:30]}'")
+            # Last resort: direct send_keys on element
+            el2 = driver.find_element(By.ID, field_id)
+            el2.click()
+            el2.clear()
+            el2.send_keys(value)
+            ActionChains(driver).send_keys(Keys.TAB).perform()
+            time.sleep(0.3)
 
         return True
     except Exception as e:
