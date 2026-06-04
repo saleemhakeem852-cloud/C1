@@ -562,8 +562,6 @@ def selenium_fill(driver, field_id: str, value: str) -> bool:
                     window.HTMLInputElement.prototype, 'value').set;
                 setter.call(el, '');
             }
-            el.textContent = '';
-            el.innerHTML = '';
             el.dispatchEvent(new Event('input',  {bubbles:true}));
             el.dispatchEvent(new Event('change', {bubbles:true}));
         """, el)
@@ -969,7 +967,24 @@ def fill_listing_details(driver, product: dict):
             )
             driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
             time.sleep(0.3)
-            driver.execute_script("arguments[0].click();", btn)
+            # CRITICAL: blur ALL fields first so CL validators fire before submit
+            driver.execute_script("""
+                ['PostingTitle','PostingBody','postal_code'].forEach(function(fid){
+                    var el = document.getElementById(fid);
+                    if (!el) return;
+                    el.blur();
+                    el.dispatchEvent(new Event('blur',{bubbles:true,cancelable:true}));
+                    el.dispatchEvent(new Event('change',{bubbles:true,cancelable:true}));
+                });
+                // Move focus away from all fields before clicking submit
+                document.activeElement && document.activeElement.blur();
+            """)
+            time.sleep(0.5)
+            # Use ActionChains real click — not JS click — so browser fires proper events
+            try:
+                ActionChains(driver).move_to_element(btn).pause(0.2).click().perform()
+            except Exception:
+                driver.execute_script("arguments[0].click();", btn)
             print(f"  ✓ Continue clicked via: {sel}")
             clicked = True
             time.sleep(3)
