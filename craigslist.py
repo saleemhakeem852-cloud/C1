@@ -18,11 +18,23 @@ import urllib.request
 from datetime import datetime, timedelta
 
 try:
-    from seleniumwire import webdriver          # pip install selenium-wire
+    from seleniumwire import webdriver as sw_webdriver
     SELENIUMWIRE_AVAILABLE = True
 except ImportError:
-    from selenium import webdriver              # fallback — no proxy auth
+    sw_webdriver = None
     SELENIUMWIRE_AVAILABLE = False
+
+try:
+    if SELENIUMWIRE_AVAILABLE:
+        import seleniumwire.undetected_chromedriver as uc
+    else:
+        import undetected_chromedriver as uc
+    UC_AVAILABLE = True
+except ImportError:
+    UC_AVAILABLE = False
+
+from selenium import webdriver  # always imported for fallback + type hints
+
 
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait, Select
@@ -248,112 +260,173 @@ def _find_binary(names: list, fallback_paths: list) -> str | None:
     return None
 
 
-def make_driver(headless: bool = False) -> webdriver.Chrome:
-    import tempfile
+def _create_proxy_ext(host: str, port: int, user: str, pwd: str) -> str:
+    """Build a tiny Chrome extension that handles proxy auth.
+    Works in headless mode unlike the old --proxy-server+CDP approach."""
+    manifest = json.dumps({
+        "version": "1.0.0",
+        "manifest_version": 2,
+        "name": "CLBlast Proxy Auth",
+        "permissions": [
+            "proxy", "tabs", "unlimitedStorage", "storage",
+            "<all_urls>", "webRequest", "webRequestBlocking"
+        ],
+        "background": {"scripts": ["bg.js"]},
+        "minimum_chrome_version": "22.0.0"
+    })
+    background = f"""
+    var config = {{
+        mode: "fixed_servers",
+        rules: {{
+            singleProxy: {{ scheme: "http", host: "{host}", port: parseInt("{port}") }},
+            bypassList: ["localhost", "127.0.0.1"]
+        }}
+    }};
+    chrome.proxy.settings.set({{value: config, scope: "regular"}}, function() {{}});
+    chrome.webRequest.onAuthRequired.addListener(
+        function(details) {{
+            return {{ authCredentials: {{ username: "{user}", password: "{pwd}" }} }};
+        }},
+        {{urls: ["<all_urls>"]}},
+        ["blocking"]
+    );
+    """
+    ext_dir = "/tmp/clblast_proxy_ext"
+    os.makedirs(ext_dir, exist_ok=True)
+    with open(f"{ext_dir}/manifest.json", "w") as f:
+        f.write(manifest)
+    with open(f"{ext_dir}/bg.js", "w") as f:
+        f.write(background)
+    return ext_dir
+
+
+def make_driver(headless: bool = False):
     from selenium.webdriver.chrome.service import Service
 
-    # os.environ["SE_MANAGER_PATH"] = ""
-    # os.environ["WDM_SKIP_DOWNLOAD"] = "1"
-
-    options = webdriver.ChromeOptions()
-    options.set_capability("goog:loggingPrefs", {"browser": "ALL"})  # enables get_log('browser')
-
-    # --- Crash prevention (Railway / Docker / memory-constrained environments) ---
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--disable-software-rasterizer")
-    options.add_argument("--headless=new")
-    options.add_argument("--window-size=1366,768")
-    options.add_argument("--disable-setuid-sandbox")
-    options.add_argument("--disable-extensions")
-    options.add_argument("--mute-audio")
-    options.add_argument("--no-first-run")
-    options.add_argument("--no-default-browser-check")
-    options.add_argument("--shm-size=256m")
-
-    # --- Anti-detection (critical) ---
-    options.add_argument("--disable-blink-features=AutomationControlled")
-    options.add_argument("--accept-lang=en-US,en;q=0.9")
-    options.add_experimental_option("excludeSwitches", ["enable-automation"])
-    options.add_experimental_option("useAutomationExtension", False)
-
-    # --- Residential proxy for ALL CL traffic (login + posting same IP) ---
-    # Railway's datacenter IP is blocked by CL for posting.
-    # MUST route everything (login AND form submit) through the same proxy so
-    # CL's session IP matches the posting IP — any mismatch causes server rejection.
-    sw_options = {
-        "proxy": {
-            "http":  "http://spa1pl920i:dBByddd_WD08p4hk7f@gate.decodo.com:10004",
-            "https": "http://spa1pl920i:dBByddd_WD08p4hk7f@gate.decodo.com:10004",
-            "no_proxy": "localhost,127.0.0.1",   # only skip proxy for localhost
-        }
-    } if SELENIUMWIRE_AVAILABLE else {}
-
-    # --- Persistent profile (reuse between runs so CL session cookies survive) ---
-    profile_dir = os.environ.get("CHROME_PROFILE_DIR", "/tmp/clblast_chrome_profile")
-    os.makedirs(profile_dir, exist_ok=True)
-    # Remove stale lock file left by a previously crashed Chrome instance
-    lock_file = os.path.join(profile_dir, "SingletonLock")
-    if os.path.exists(lock_file):
-        try:
-            os.remove(lock_file)
-            print(f"  [driver] Removed stale lock file: {lock_file}")
-        except Exception:
-            pass
-    options.add_argument(f"--user-data-dir={profile_dir}")
-    print(f"  [driver] Chrome profile: {profile_dir}")
-
-    ua_pool = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-    ]
-    options.add_argument(f"--user-agent={random.choice(ua_pool)}")
-
+    # ── Locate binaries ─────────────────────────────────────────────────────
     chromium_bin = _find_binary(
         ["chromium", "chromium-browser", "google-chrome"],
         ["/usr/bin/chromium", "/usr/bin/chromium-browser", "/usr/bin/google-chrome"]
     )
+    chromedriver_bin = _find_binary(["chromedriver"], ["/usr/bin/chromedriver"])
+
     if chromium_bin:
         print(f"  [driver] Using chromium: {chromium_bin}")
-        options.binary_location = chromium_bin
     else:
         print("  [driver] WARNING: chromium binary not found")
-
-    chromedriver_bin = _find_binary(
-        ["chromedriver"],
-        ["/usr/bin/chromedriver"]
-    )
-    if not chromedriver_bin:
-        print("  [driver] WARNING: chromedriver not found in path fallback, trying default webdriver.Chrome initiation...")
-        try:
-            driver = webdriver.Chrome(options=options, seleniumwire_options=sw_options) if SELENIUMWIRE_AVAILABLE else webdriver.Chrome(options=options)
-        except Exception as e:
-            print(f"  [driver] Chrome session failed with default initialization: {e}")
-            raise RuntimeError("chromedriver not found and default initialization failed.")
-    else:
+    if chromedriver_bin:
         print(f"  [driver] Using chromedriver: {chromedriver_bin}")
-        # Use a safe log file path on Windows
-        log_path = "chromedriver.log" if os.name == 'nt' else "/tmp/chromedriver.log"
-        service = Service(
-            executable_path=chromedriver_bin,
-            log_output=log_path
-        )
-        try:
-            driver = webdriver.Chrome(service=service, options=options, seleniumwire_options=sw_options) if SELENIUMWIRE_AVAILABLE else webdriver.Chrome(service=service, options=options)
-        except Exception as e:
-            print(f"  [driver] Chrome session failed: {e}")
+    else:
+        raise RuntimeError("chromedriver not found")
+
+    # ── Persistent profile ───────────────────────────────────────────────────
+    profile_dir = os.environ.get("CHROME_PROFILE_DIR", "/tmp/clblast_chrome_profile")
+    os.makedirs(profile_dir, exist_ok=True)
+    for lock in ["SingletonLock", "SingletonCookie", "SingletonSocket"]:
+        lp = os.path.join(profile_dir, lock)
+        if os.path.exists(lp):
             try:
-                with open(log_path) as log:
-                    print("  [chromedriver log]", log.read()[-2000:])
+                os.remove(lp)
             except Exception:
                 pass
-            raise
+    print(f"  [driver] Chrome profile: {profile_dir}")
+
+    # ── Headless Check ───────────────────────────────────────────────────────
+    run_headless = headless or IS_RAILWAY
+
+    # ── Build options ────────────────────────────────────────────────────────
+    if UC_AVAILABLE:
+        options = uc.ChromeOptions()
+    else:
+        options = webdriver.ChromeOptions()
+
+    # Crash prevention
+    for arg in [
+        "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
+        "--disable-software-rasterizer", "--window-size=1366,768",
+        "--disable-setuid-sandbox",
+        # NOTE: --disable-extensions removed — it would block proxy extension
+        "--mute-audio", "--no-first-run", "--no-default-browser-check",
+        "--shm-size=256m",
+    ]:
+        options.add_argument(arg)
+
+    if run_headless and not UC_AVAILABLE:
+        # Standard way to run headless in modern Selenium / Chrome
+        options.add_argument("--headless=new")
+
+    # Anti-detection (still needed even with uc)
+    options.add_argument("--accept-lang=en-US,en;q=0.9")
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    if not UC_AVAILABLE:
+        # uc handles these internally — don't set them twice
+        options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        options.add_experimental_option("useAutomationExtension", False)
+
+    # Note: User-agent rotation removed to prevent User-Agent Client Hints mismatch.
+
+    # Profile
+    options.add_argument(f"--user-data-dir={profile_dir}")
+
+    # Proxy: Chrome extensions don't load in headless mode.
+    # Use seleniumwire to inject proxy auth at the HTTP level (works headless).
+    # This routes ALL CL traffic through the residential proxy so session IP = posting IP.
+    sw_options = {}
+    if SELENIUMWIRE_AVAILABLE:
+        sw_options = {
+            "proxy": {
+                "http":  "http://spa1pl920i:dBByddd_WD08p4hk7f@gate.decodo.com:10004",
+                "https": "http://spa1pl920i:dBByddd_WD08p4hk7f@gate.decodo.com:10004",
+                "no_proxy": "localhost,127.0.0.1",
+            }
+        }
+        print("  [driver] Proxy configured via seleniumwire")
+
+    # ── Launch driver ────────────────────────────────────────────────────────
+    log_path = "chromedriver.log" if os.name == 'nt' else "/tmp/chromedriver.log"
+
+    try:
+        if UC_AVAILABLE:
+            driver = uc.Chrome(
+                options=options,
+                driver_executable_path=chromedriver_bin,
+                browser_executable_path=chromium_bin if chromium_bin else None,
+                headless=run_headless,
+                version_main=None,  # uc auto-detects version
+                use_subprocess=True,
+                seleniumwire_options=sw_options if SELENIUMWIRE_AVAILABLE else None
+            )
+            print("  [driver] Using undetected-chromedriver ✓")
+        else:
+            service = Service(executable_path=chromedriver_bin, log_output=log_path)
+            if SELENIUMWIRE_AVAILABLE:
+                driver = sw_webdriver.Chrome(
+                    service=service,
+                    options=options,
+                    seleniumwire_options=sw_options
+                )
+                print("  [driver] Using standard selenium with selenium-wire ✓")
+            else:
+                driver = webdriver.Chrome(service=service, options=options)
+                print("  [driver] Using standard selenium (no proxy/wire) ✓")
+    except Exception as e:
+        print(f"  [driver] Chrome session failed: {e}")
+        try:
+            with open(log_path) as log:
+                print("  [chromedriver log]", log.read()[-2000:])
+        except Exception:
+            pass
+        raise
+
+    # Remove webdriver fingerprint at JS level (belt-and-suspenders with uc)
     driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": """
         Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-        Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
+        Object.defineProperty(navigator, 'plugins',   {get: () => [1,2,3,4,5]});
         Object.defineProperty(navigator, 'languages', {get: () => ['en-US','en']});
         window.chrome = {runtime: {}};
+        delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
+        delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
+        delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
         Object.defineProperty(navigator, 'permissions', {
             get: () => ({query: () => Promise.resolve({state: 'granted'})})
         });
