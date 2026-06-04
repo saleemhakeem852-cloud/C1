@@ -693,6 +693,42 @@ def robust_fill_zip(driver, zip_code):
         print(f"  ⚠ Zip verification error: {e}")
 
 
+def _type_into(driver, field_id, value):
+    """Find field by ID, clear it, send_keys directly. No JS. No events. Just works."""
+    from selenium.webdriver.common.keys import Keys
+    el = WebDriverWait(driver, 10).until(
+        EC.element_to_be_clickable((By.ID, field_id))
+    )
+    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+    time.sleep(0.2)
+    el.click()
+    time.sleep(0.15)
+    # Clear via select-all + delete (works for both input and textarea)
+    el.send_keys(Keys.CONTROL + "a")
+    time.sleep(0.05)
+    el.send_keys(Keys.DELETE)
+    time.sleep(0.05)
+    el.clear()
+    time.sleep(0.05)
+    # Type the value
+    for ch in value:
+        el.send_keys(ch)
+        time.sleep(random.uniform(0.03, 0.06))
+    # Tab away to trigger blur/validation
+    el.send_keys(Keys.TAB)
+    time.sleep(0.3)
+    # Verify
+    actual = (el.get_attribute("value") or "").strip()
+    if not actual:
+        # Retry once with direct send_keys (no char loop)
+        el.click()
+        el.clear()
+        el.send_keys(value)
+        el.send_keys(Keys.TAB)
+        time.sleep(0.2)
+    return el
+
+
 def fill_listing_details(driver, product: dict):
     # 1. Wait for form — if it never appears, return silently (don't crash)
     try:
@@ -738,28 +774,27 @@ def fill_listing_details(driver, product: dict):
     ).strip()
     city_name = CL_CITY.replace("-", " ").title()
 
-    # 3. Use clipboard_fill for ALL validated fields
+    # 3. Fill all validated fields with plain send_keys (same as working bots)
     print("  Filling title...")
-    clipboard_fill(driver, "PostingTitle", title)
-    time.sleep(0.5)
+    try:
+        _type_into(driver, "PostingTitle", title)
+        time.sleep(0.3)
+    except Exception as e:
+        print(f"  ⚠ title fill failed: {e}")
 
     print("  Filling description...")
-    clipboard_fill(driver, "PostingBody", description)
-    time.sleep(0.5)
+    try:
+        _type_into(driver, "PostingBody", description)
+        time.sleep(0.3)
+    except Exception as e:
+        print(f"  ⚠ description fill failed: {e}")
 
-    # city/area fields — optional, not validated; skip silently if absent
-    for _fid in ["geographic_area", "city"]:
-        try:
-            if driver.find_elements(By.ID, _fid):
-                js_fill(driver, _fid, city_name)
-        except Exception:
-            pass
-    time.sleep(0.3)
-
-    # ZIP
     print("  Filling zip...")
-    clipboard_fill(driver, "postal_code", zip_code)
-    time.sleep(1.0)
+    try:
+        _type_into(driver, "postal_code", zip_code)
+        time.sleep(0.5)
+    except Exception as e:
+        print(f"  ⚠ zip fill failed: {e}")
 
     # Price — try by ID, then CSS fallback
     price_filled = False
@@ -890,84 +925,67 @@ def fill_listing_details(driver, product: dict):
     jquery_validate_fields(driver)
     time.sleep(2.0)  # let CL's validation debounce settle
 
-    # 4. Click the continue button
-    # CRITICAL: re-fill fields AND click in the same JS execution block so
-    # CL's validator cannot run between fill and submit.
+    # 4. Submit — use REAL browser click on the actual form button element
+    # (JS execute_script click bypasses native form submission; don't use it)
     url_before = driver.current_url
 
     for attempt in range(4):
         if attempt > 0:
             if "s=edit" not in driver.current_url:
                 break
-            print(f"  ⚠ Still on edit page (?s=edit) — retry attempt {attempt}/3...")
+            print(f"  ⚠ Still on edit page — retry {attempt}/3, re-filling fields...")
             time.sleep(1.0)
+            # Re-fill any empty fields
+            try:
+                if not (driver.find_element(By.ID, "PostingTitle").get_attribute("value") or "").strip():
+                    _type_into(driver, "PostingTitle", title)
+                    time.sleep(0.3)
+            except Exception: pass
+            try:
+                if not (driver.find_element(By.ID, "PostingBody").get_attribute("value") or "").strip():
+                    _type_into(driver, "PostingBody", description)
+                    time.sleep(0.3)
+            except Exception: pass
+            try:
+                if not (driver.find_element(By.ID, "postal_code").get_attribute("value") or "").strip():
+                    _type_into(driver, "postal_code", zip_code)
+                    time.sleep(0.3)
+            except Exception: pass
 
-        # Re-confirm values are still in DOM right before submit
-        try:
-            t_val = (driver.find_element(By.ID, "PostingTitle").get_attribute("value") or "").strip()
-            b_val = (driver.find_element(By.ID, "PostingBody").get_attribute("value") or "").strip()
-            z_val = (driver.find_element(By.ID, "postal_code").get_attribute("value") or "").strip()
-            if not t_val:
-                clipboard_fill(driver, "PostingTitle", title)
+        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+        time.sleep(0.5)
+
+        clicked = False
+        # Try submitting via the form's own submit button — real .click(), NOT JS click
+        for sel in [
+            (By.XPATH, '//*[@id="postingForm"]/button'),
+            (By.XPATH, '//form[@id="postingForm"]//button[@type="submit"]'),
+            (By.XPATH, '//button[contains(@class,"go")]'),
+            (By.CSS_SELECTOR, "button.go"),
+            (By.CSS_SELECTOR, "button[type='submit']"),
+            (By.CSS_SELECTOR, "input[type='submit']"),
+        ]:
+            try:
+                btn = WebDriverWait(driver, 5).until(EC.element_to_be_clickable(sel))
+                driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
                 time.sleep(0.3)
-            if not b_val:
-                clipboard_fill(driver, "PostingBody", description)
-                time.sleep(0.3)
-            if not z_val:
-                clipboard_fill(driver, "postal_code", zip_code)
-                time.sleep(0.3)
-        except Exception:
-            pass
+                btn.click()   # REAL browser click — not JS
+                print(f"  ✓ Submit clicked (attempt {attempt + 1})")
+                clicked = True
+                time.sleep(5)
+                break
+            except Exception:
+                continue
 
-        # Fill fields + submit in ONE atomic JS call so validator sees filled values
-        submitted = driver.execute_script("""
-            var title   = arguments[0];
-            var body    = arguments[1];
-            var zipcode = arguments[2];
-
-            function jqSet(id, val) {
-                var el = document.getElementById(id);
-                if (!el) return;
-                // native setter
-                try {
-                    var proto = (el.tagName === 'TEXTAREA')
-                        ? window.HTMLTextAreaElement.prototype
-                        : window.HTMLInputElement.prototype;
-                    var s = Object.getOwnPropertyDescriptor(proto, 'value');
-                    if (s && s.set) s.set.call(el, val); else el.value = val;
-                } catch(e) { el.value = val; }
-                // jQuery val + trigger
-                if (window.jQuery) {
-                    try {
-                        jQuery(el).val(val)
-                                  .trigger('input').trigger('change').trigger('blur');
-                        var v = jQuery(el).closest('form').data('validator');
-                        if (v) v.element(el);
-                    } catch(e) {}
-                }
-            }
-
-            jqSet('PostingTitle', title);
-            jqSet('PostingBody',  body);
-            jqSet('postal_code',  zipcode);
-
-            // Now click the submit button immediately in the same call
-            var btn = document.querySelector('button.go') ||
-                      document.querySelector('button[type="submit"]') ||
-                      document.querySelector('input[type="submit"]');
-            if (!btn) return false;
-            btn.click();
-            return true;
-        """, title, description, zip_code)
-
-        print(f"  ✓ Atomic fill+submit fired (attempt {attempt + 1}), submitted={submitted}")
-        time.sleep(5)
+        if not clicked:
+            print("  ✗ No submit button found")
+            return
 
         if "s=edit" not in driver.current_url:
             break
 
     if "s=edit" in driver.current_url:
-        print("  ✗ Still on edit page after 3 retries — giving up")
+        print("  ✗ Still on edit page after retries — giving up")
 
     # 5. Check for validation errors
     try:
