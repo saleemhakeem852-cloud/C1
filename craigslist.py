@@ -278,11 +278,17 @@ def make_driver(headless: bool = False) -> webdriver.Chrome:
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option("useAutomationExtension", False)
 
-    # --- No proxy: all CL requests use Railway's direct IP ---
-    # Proxy caused session IP mismatch: login used direct IP (no_proxy bypass),
-    # but form submission used proxy IP → CL server rejected all fields as security.
-    # jQuery Validate is now bypassed client-side, so proxy is no longer needed.
-    sw_options = {}
+    # --- Residential proxy for ALL CL traffic (login + posting same IP) ---
+    # Railway's datacenter IP is blocked by CL for posting.
+    # MUST route everything (login AND form submit) through the same proxy so
+    # CL's session IP matches the posting IP — any mismatch causes server rejection.
+    sw_options = {
+        "proxy": {
+            "http":  "http://spa1pl920i:dBByddd_WD08p4hk7f@gate.decodo.com:10004",
+            "https": "http://spa1pl920i:dBByddd_WD08p4hk7f@gate.decodo.com:10004",
+            "no_proxy": "localhost,127.0.0.1",   # only skip proxy for localhost
+        }
+    } if SELENIUMWIRE_AVAILABLE else {}
 
     # --- Persistent profile (reuse between runs so CL session cookies survive) ---
     profile_dir = os.environ.get("CHROME_PROFILE_DIR", "/tmp/clblast_chrome_profile")
@@ -501,12 +507,31 @@ def craigslist_login(driver, email: str, password: str) -> bool:
         btn = driver.find_element(By.CSS_SELECTOR, "button[type='submit']")
         safe_click(driver, btn)
 
+        # Wait for any CL page to load
         WebDriverWait(driver, 15).until(EC.url_contains("craigslist.org"))
+        time.sleep(2)
+        cur = driver.current_url.lower()
+
+        if "login/onetime" in cur:
+            # CL sent a magic link to the email — account has no password
+            print("  ✗ CL sent a magic-link email (account has no real password).")
+            print("  → Set a real password at https://accounts.craigslist.org")
+            print("  → Then update CL_PASSWORD in Railway to that password.")
+            return False
+
+        if "login" in cur and "onetime" not in cur:
+            # CL showed a location/security verification page or bad password
+            print(f"  ✗ Login blocked — still on login page: {cur}")
+            print("  → CL may be flagging the new proxy IP location.")
+            print("  → The client must log in manually at https://accounts.craigslist.org")
+            print("    from the proxy IP first, to approve the new location.")
+            return False
+
         handle_captcha_if_present(driver)
         print("  Logged in to Craigslist ✓")
         return True
     except TimeoutException:
-        print("  Login failed.")
+        print("  Login failed (timeout).")
         return False
 
 
