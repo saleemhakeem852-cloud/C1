@@ -267,23 +267,18 @@ def get_selenium_cookies_as_requests_session(driver):
         "Accept-Encoding": "gzip, deflate, br",
         "Connection": "keep-alive",
     })
-    # Visit each CL domain to ensure all cookies are collected
-    for cl_domain in [
-        "https://accounts.craigslist.org",
-        "https://post.craigslist.org",
-        "https://www.craigslist.org",
-    ]:
-        try:
-            driver.get(cl_domain)
-            time.sleep(1.5)
-        except Exception:
-            pass
-        for cookie in driver.get_cookies():
-            session.cookies.set(
-                cookie["name"], cookie["value"],
-                domain=cookie.get("domain", "").lstrip("."),
-                path=cookie.get("path", "/"))
-    print(f"  ✓ Transferred {len(list(session.cookies))} cookies to requests session")
+    # Grab all cookies from current page without navigating away
+    all_cookies = driver.get_cookies()
+    for cookie in all_cookies:
+        domain = cookie.get("domain", "").lstrip(".")
+        session.cookies.set(
+            cookie["name"], cookie["value"],
+            domain=domain,
+            path=cookie.get("path", "/"))
+        # Also set without domain restriction so requests sends them everywhere
+        session.cookies.set(cookie["name"], cookie["value"])
+    print(f"  ✓ Transferred {len(all_cookies)} cookies to requests session")
+    print(f"  Cookie names: {[c['name'] for c in all_cookies]}")
     return session
 
 def click_relocation_if_needed(driver, ad_name):
@@ -396,11 +391,15 @@ def submit_form_via_requests(driver, session, product, zip_code, city_name, cl_e
     # Add step marker so CL's server knows which step we're submitting
     form_dict["s"] = "edit"
 
+    # Log ALL fields we're sending for debugging
     print(f"  [direct-post] Posting to: {form_action}")
     print(f"  [direct-post] Title={form_dict.get('PostingTitle','')[:30]}")
     print(f"  [direct-post] postal={form_dict.get('postal','')}")
+    print(f"  [direct-post] postal_code={form_dict.get('postal_code','')}")
     print(f"  [direct-post] email={form_dict.get('FromEMail','')}")
+    print(f"  [direct-post] geo={form_dict.get('geographic_area','')}")
     print(f"  [direct-post] cryptedStepCheck={form_dict.get('cryptedStepCheck','')[:20]}...")
+    print(f"  [direct-post] ALL field names: {sorted(form_dict.keys())}")
 
     try:
         resp = session.post(
@@ -416,8 +415,22 @@ def submit_form_via_requests(driver, session, product, zip_code, city_name, cl_e
         )
         print(f"  [direct-post] Response: {resp.status_code}, final URL: {resp.url}")
 
+        # Sniff the response for error clues before loading into Selenium
+        resp_text = resp.text
+        if "ZIP" in resp_text or "postal" in resp_text.lower() or "zip" in resp_text.lower():
+            # Extract the specific ZIP error context from the HTML
+            import re
+            zip_snippets = re.findall(r'.{0,80}(?:zip|postal|ZIP).{0,80}', resp_text, re.IGNORECASE)
+            for s in zip_snippets[:5]:
+                print(f"  [direct-post] ZIP hint: {s.strip()}")
+        
+        # Also check what field names CL's error page mentions
+        field_errors = re.findall(r"""name=["']([^"']+)["']""", resp_text)
+        zip_fields = [f for f in field_errors if 'post' in f.lower() or 'zip' in f.lower() or 'code' in f.lower()]
+        if zip_fields:
+            print(f"  [direct-post] ZIP-related field names in response: {zip_fields[:10]}")
+
         # Load the response page into Selenium so we can continue normally
-        # (photo upload, publish button etc.)
         driver.get(resp.url)
         time.sleep(3)
         return resp.url
