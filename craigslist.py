@@ -267,18 +267,36 @@ def get_selenium_cookies_as_requests_session(driver):
         "Accept-Encoding": "gzip, deflate, br",
         "Connection": "keep-alive",
     })
-    # Grab all cookies from current page without navigating away
-    all_cookies = driver.get_cookies()
-    for cookie in all_cookies:
-        domain = cookie.get("domain", "").lstrip(".")
-        session.cookies.set(
-            cookie["name"], cookie["value"],
-            domain=domain,
-            path=cookie.get("path", "/"))
-        # Also set without domain restriction so requests sends them everywhere
-        session.cookies.set(cookie["name"], cookie["value"])
-    print(f"  ✓ Transferred {len(all_cookies)} cookies to requests session")
-    print(f"  Cookie names: {[c['name'] for c in all_cookies]}")
+    # Must collect cookies from EACH domain separately —
+    # Selenium only returns cookies for the currently loaded domain.
+    # Save current URL so we can return after collecting.
+    original_url = driver.current_url
+    all_cookie_names = set()
+
+    for cl_domain in [
+        "https://accounts.craigslist.org",
+        "https://post.craigslist.org",
+        "https://www.craigslist.org",
+        "https://losangeles.craigslist.org",
+    ]:
+        try:
+            driver.get(cl_domain)
+            time.sleep(2)
+            for cookie in driver.get_cookies():
+                all_cookie_names.add(cookie["name"])
+                session.cookies.set(cookie["name"], cookie["value"])
+        except Exception as e:
+            print(f"  [cookies] Could not visit {cl_domain}: {e}")
+
+    # Return to original page
+    try:
+        driver.get(original_url)
+        time.sleep(1)
+    except Exception:
+        pass
+
+    print(f"  ✓ Transferred {len(all_cookie_names)} cookies to requests session")
+    print(f"  Cookie names: {sorted(all_cookie_names)}")
     return session
 
 def click_relocation_if_needed(driver, ad_name):
@@ -738,11 +756,24 @@ def post_product(driver, session, ad_name, product):
 
     click_relocation_if_needed(driver, ad_name)
 
-    # Refresh session cookies right before submission (they may have updated)
-    for cookie in driver.get_cookies():
-        session.cookies.set(cookie["name"], cookie["value"],
-                            domain=cookie.get("domain", ""),
-                            path=cookie.get("path", "/"))
+    # Refresh session cookies right before submission from all CL domains
+    original_url = driver.current_url
+    for cl_domain in [
+        "https://accounts.craigslist.org",
+        "https://post.craigslist.org",
+        "https://www.craigslist.org",
+    ]:
+        try:
+            driver.get(cl_domain)
+            time.sleep(1.5)
+            for cookie in driver.get_cookies():
+                session.cookies.set(cookie["name"], cookie["value"])
+        except Exception:
+            pass
+    driver.get(original_url)
+    time.sleep(2)
+    fresh_names = [c.name for c in session.cookies]
+    print(f"  [cookies] Fresh session has {len(fresh_names)} cookies: {sorted(fresh_names)}")
 
     try:
         success = fill_listing_details(driver, session, product)
