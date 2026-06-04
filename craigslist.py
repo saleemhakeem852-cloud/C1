@@ -254,8 +254,8 @@ def craigslist_login(driver, email, password):
 
 def get_selenium_cookies_as_requests_session(driver):
     """
-    Transfer Selenium browser cookies into a requests.Session so we can
-    make direct HTTP POST requests authenticated as the logged-in user.
+    Transfer Selenium browser cookies into a requests.Session.
+    Visits all CL domains to collect every cookie before transferring.
     """
     session = requests.Session()
     session.headers.update({
@@ -267,11 +267,23 @@ def get_selenium_cookies_as_requests_session(driver):
         "Accept-Encoding": "gzip, deflate, br",
         "Connection": "keep-alive",
     })
-    for cookie in driver.get_cookies():
-        session.cookies.set(cookie["name"], cookie["value"],
-                            domain=cookie.get("domain", ""),
-                            path=cookie.get("path", "/"))
-    print(f"  ✓ Transferred {len(driver.get_cookies())} cookies to requests session")
+    # Visit each CL domain to ensure all cookies are collected
+    for cl_domain in [
+        "https://accounts.craigslist.org",
+        "https://post.craigslist.org",
+        "https://www.craigslist.org",
+    ]:
+        try:
+            driver.get(cl_domain)
+            time.sleep(1.5)
+        except Exception:
+            pass
+        for cookie in driver.get_cookies():
+            session.cookies.set(
+                cookie["name"], cookie["value"],
+                domain=cookie.get("domain", "").lstrip("."),
+                path=cookie.get("path", "/"))
+    print(f"  ✓ Transferred {len(list(session.cookies))} cookies to requests session")
     return session
 
 def click_relocation_if_needed(driver, ad_name):
@@ -360,7 +372,10 @@ def submit_form_via_requests(driver, session, product, zip_code, city_name, cl_e
     # Override with our values
     form_dict["PostingTitle"] = title
     form_dict["PostingBody"] = description
+    # CL accepts BOTH field names for zip — send both to be safe
     form_dict["postal"] = zip_code
+    form_dict["postal_code"] = zip_code
+    form_dict["zip"] = zip_code
     form_dict["geographic_area"] = city_name
     if cl_email:
         form_dict["FromEMail"] = cl_email
@@ -377,6 +392,9 @@ def submit_form_via_requests(driver, session, product, zip_code, city_name, cl_e
                "show_address_ok", "save_contact_preferences"]:
         if cb not in form_dict:
             form_dict[cb] = "1"
+
+    # Add step marker so CL's server knows which step we're submitting
+    form_dict["s"] = "edit"
 
     print(f"  [direct-post] Posting to: {form_action}")
     print(f"  [direct-post] Title={form_dict.get('PostingTitle','')[:30]}")
