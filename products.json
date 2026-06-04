@@ -1,0 +1,592 @@
+[
+  {
+    "title": "Men's Hanes Premium Cotton T-Shirt",
+    "description": "A soft premium cotton tee made for everyday comfort.",
+    "price": 9.99,
+    "category": "men",
+    "condition": "new",
+    "zip_code": "90210",
+    "delivery_available": true,
+    "photo_paths": ["https://www.uberprints.com/content/products/flat/800x800/ha5180_1_wht.jpg"]
+  },
+  {
+    "title": "Women's Abercrombie & Fitch Sweater",
+    "description": "A new collection that celebrates our one hundred year history—inspired by our vintage archives and redesigned for today. This comfortable popover hoodie is in our softAF Max fleece fabric and classic Sunday silhouette.",
+    "price": 79.99,
+    "category": "women",
+    "condition": "new",
+    "zip_code": "90210",
+    "delivery_available": true,
+    "photo_paths": ["https://img.abercrombie.com/is/image/anf/KIC_152-6225-00640-112_model3?policy=product-medium"]
+  },
+  {
+    "title": "Women's Dolce & Gabbana Crossbody Bag",
+    "description": "A sleek crossbody bag designed for day-to-night style.",
+    "price": 1129.99,
+    "category": "accessories",
+    "condition": "new",
+    "zip_code": "90210",
+    "delivery_available": true,
+    "photo_paths": ["https://marissacollections.com/cdn/shop/files/dolce-gabbana-handbagshoulder-nero-os-3_5-crossbody-bag-nero-3.jpg?v=1732570457&width=713"]
+  },
+  {
+    "title": "Men's Levi Jeans",
+    "description": "Close your eyes. Think jeans. Now open. They were 501 Originals, right? With a classic straight leg and iconic styling, they're literally the blueprint for every pair of modern jeans in existence.",
+    "price": 39.99,
+    "category": "men",
+    "condition": "new",
+    "zip_code": "90210",
+    "delivery_available": true,
+    "photo_paths": ["https://lscoglobal.scene7.com/is/image/lscoglobal/MB_00501-3673_GLO_CM_SV?fmt=webp&qlt=80&resMode=sharp2&fit=crop,1&op_usm=1.25,0.6,8&wid=2000&hei=2500"]
+  },
+  {
+    "title": "Patio Furniture Set",
+    "description": "A versatile patio set built for outdoor relaxation.",
+    "price": 79.99,
+    "category": "homeandappliances",
+    "condition": "new",
+    "zip_code": "90210",
+    "delivery_available": true,
+    "photo_paths": ["https://assets.wfcdn.com/im/65157649/resize-h800-w800%5Ecompr-r85/3083/308338247/7+Pieces+Outdoor+Conversation+Sets+Patio+Sectional+Furniture+Set+Clearance-1144849090-1158748572.jpg"]
+  },
+  {
+    "title": "Women's Necklace & Bracelet Set",
+    "description": "A matching jewelry set that adds a polished finish.",
+    "price": 49.99,
+    "category": "jewelry",
+    "condition": "new",
+    "zip_code": "90210",
+    "delivery_available": true,
+    "photo_paths": ["https://m.media-amazon.com/images/I/61qOG0oAmSL._AC_SY675_.jpg"]
+  },
+  {
+    "title": "Men's Dolce & Gabbana Sweater",
+    "description": "A luxury-inspired sweater with rich texture and warmth.",
+    "price": 119.99,
+    "category": "men",
+    "condition": "new",
+    "zip_code": "90210",
+    "delivery_available": true,
+    "photo_paths": ["https://www.dolcegabbana.com/dw/image/v2/BKDB_PRD/on/demandware.static/-/Sites-15/default/dwf324185d/images/zoom/GXZBJZJBCJC_A4567_0.jpg?sw=912.5&sh=1160&sm=fit"]
+  },
+  {
+    "title": "Women's PINK Campus Fleece Full-Zip Hoodie",
+    "description": "Cozy Victoria's Secret PINK Ivy Fleece Campus full-zip hoodie in classic black. Soft fleece interior with a relaxed, comfortable fit.",
+    "price": 39.99,
+    "category": "women",
+    "condition": "new",
+    "zip_code": "90210",
+    "delivery_available": true,
+    "photo_paths": ["https://media-photos.depop.com/b1/261082783/3513130316_c3bf7ad439e04861b8f5d1f0d37d634d/P0.jpg"]
+  },
+  {
+    "title": "Dior Sunglasses",
+    "description": "Statement sunglasses with UV protection and style.",
+    "price": 79.99,
+    "category": "accessories",
+    "condition": "new",
+    "zip_code": "90210",
+    "delivery_available": true,
+    "photo_paths": ["https://images.unsplash.com/photo-1572635196237-14b3f281503f?ixlib=rb-4.0.3&auto=format&fit=crop&w=500&q=80"]
+  },
+  {
+    "title": "Men's Ralph Lauren Casual Polo Shirt",
+    "description": "A timeless polo shirt with breathable fabric.",
+    "price": 69.99,
+    "category": "men",
+    "condition": "new",
+    "zip_code": "90210",
+    "delivery_available": true,
+    "photo_paths": ["https://dtcralphlauren.scene7.com/is/image/PoloGSI/s7-AI790977725004_alternate10?$rl_4x5_pdp$"]
+  },
+  {
+    "title": "Women's Louis Vuitton Sweater",
+    "description": "An elevated designer knit for standout looks.",
+    "price": 599.99,
+    "category": "women",
+    "condition": "new",
+    "zip_code": "90210",
+    "delivery_available": true,
+    "photo_paths": ["https://eu.louisvuitton.com/images/is/image/lv/1/PP_VP_L/louis-vuitton-floral-detail-cardigan--FUKG70B5A534_PM1_Worn%20view.png?wid=490&hei=490"]
+  },
+  {
+    "title": "Modern King Size Bed Set",
+    "description": "A sleek king-size bedroom centerpiece with modern lines.",
+    "price": 199.99,
+    "category": "homeandappliances",
+    "condition": "new",
+    "zip_code": "90210",
+    "delivery_available": true,
+    "photo_paths": ["https://m.media-amazon.com/images/I/71GyAwvod-L._AC_SX679_.jpg"]
+  },
+  {
+    "title": "Columbia Whirlibird Watch Cap",
+    "description": "Have a bit of fun with a custom embroidery Columbia Men's Black Whirlibird Watch Cap. Made of 100% soft acrylic yarn which is cashmere like in feel.",
+    "price": 199.99,
+    "category": "accessories",
+    "condition": "new",
+    "zip_code": "90210",
+    "delivery_available": true,
+    "photo_paths": ["https://www.merchology.com/cdn/shop/products/118518-Black-1_1024x1024.jpg?v=1756303666"]
+  },
+  {
+    "title": "Apple iMac Pro 27 in Retina 5K (2020) 512 GB",
+    "description": "The 2020 27-inch iMac offers up to 10-core 10th Gen Intel Core i9 processors, faster AMD Radeon Pro 5000 series graphics, and standard SSD storage. Features a 5K Retina display.",
+    "price": 299.99,
+    "category": "electronics",
+    "condition": "used",
+    "zip_code": "90210",
+    "delivery_available": true,
+    "photo_paths": ["https://macpro-la.com/cdn/shop/products/1596546059_IMG_1397377.jpg?v=1755385804"]
+  },
+  {
+    "title": "Men's Ferrari Jacket",
+    "description": "A racing-inspired jacket with bold premium styling.",
+    "price": 199.99,
+    "category": "men",
+    "condition": "new",
+    "zip_code": "90210",
+    "delivery_available": true,
+    "photo_paths": ["https://jackets4racing.com/cdn/shop/files/ferrari-f1-vintage-racing-jacket-classic-edition-6945007_720x.png?v=1759659711"]
+  },
+  {
+    "title": "Women's Yves Saint Laurent Lavalliere Blouse In Silk Georgette And Lace",
+    "description": "A cropped lavalliere blouse made with certified silk, featuring a lace yoke insert, elasticized hem, and bishop sleeves.",
+    "price": 3479.99,
+    "category": "women",
+    "condition": "new",
+    "zip_code": "90210",
+    "delivery_available": true,
+    "photo_paths": ["https://saint-laurent.dam.kering.com/asset/2ae46e85-18af-4408-8ea2-aed00051d7df/Medium/853054Y059R7060_A.jpg?v=2"]
+  },
+  {
+    "title": "Gucci Hat & Scarf Set",
+    "description": "A coordinated winter set with signature detailing.",
+    "price": 249.99,
+    "category": "accessories",
+    "condition": "new",
+    "zip_code": "90210",
+    "delivery_available": true,
+    "photo_paths": ["https://di2ponv0v5otw.cloudfront.net/posts/2023/09/24/6510ab99253a8c8f5bdf1f97/m_6510ad733b982a2570ecf0a4.jpg"]
+  },
+  {
+    "title": "Men's Bathing Apes Hoodie",
+    "description": "Streetwear hoodie with warm fleece comfort.",
+    "price": 199.99,
+    "category": "men",
+    "condition": "new",
+    "zip_code": "90210",
+    "delivery_available": true,
+    "photo_paths": ["https://cdn-images.farfetch-contents.com/32/20/25/66/32202566_62150086_1000.jpg"]
+  },
+  {
+    "title": "Women's Chanel Handbag",
+    "description": "Iconic handbag crafted with timeless silhouette.",
+    "price": 2499.99,
+    "category": "accessories",
+    "condition": "new",
+    "zip_code": "90210",
+    "delivery_available": true,
+    "photo_paths": ["https://atlantaluxurybags.com/cdn/shop/files/Chanel_18160-001.jpg?v=1764948624&width=1080"]
+  },
+  {
+    "title": "Ralph Lauren Wallet",
+    "description": "Slim wallet with practical card and cash storage.",
+    "price": 14.99,
+    "category": "accessories",
+    "condition": "new",
+    "zip_code": "90210",
+    "delivery_available": true,
+    "photo_paths": ["https://slimages.macysassets.com/is/image/MCY/products/2/optimized/35420612_fpx.tif?op_sharpen=1&wid=500&fit=fit,1&fmt=webp"]
+  },
+  {
+    "title": "Men's Marc Jacob Watch",
+    "description": "A modern watch design with precision movement.",
+    "price": 399.99,
+    "category": "jewelry",
+    "condition": "new",
+    "zip_code": "90210",
+    "delivery_available": true,
+    "photo_paths": ["https://images-bucket.bonanzastatic.com/afu/images/e00d/0bea/a1cd_7897527511/1.jpg"]
+  },
+  {
+    "title": "GE Smart Refrigerator",
+    "description": "Large-capacity smart fridge with efficient cooling.",
+    "price": 599.99,
+    "category": "homeandappliances",
+    "condition": "new",
+    "zip_code": "90210",
+    "delivery_available": true,
+    "photo_paths": ["https://encrypted-tbn0.gstatic.com/shopping?q=tbn:ANd9GcRoby_42NL_9PUFVO4y2gjlTlNWXmnqT2yql0GDb7wlqM4Q5-UpQDiG5-WNeS-4hb7CC25AFOZ3uLrbfbjxIBSNk5BMiyCul-JZzCqaLkj8A1mlLXSAuxRNBg"]
+  },
+  {
+    "title": "Apple Macbook Pro 15 Inch Screen With Retina Display (2018) 512 GB",
+    "description": "Excellent condition MacBook Pro with 512GB SSD, macOS Big Sur, and stunning Retina display. Perfect for business use.",
+    "price": 299.99,
+    "category": "electronics",
+    "condition": "used",
+    "zip_code": "90210",
+    "delivery_available": true,
+    "photo_paths": ["https://www.backmarket.com/cdn-cgi/image/format%3Dauto%2Cquality%3D75%2Cwidth%3D750/https://d2e6ccujb3mkqf.cloudfront.net/83242086-ce9d-4a13-9772-2e2ad9361fbb-6_cd7d6208-a023-4a5e-ac51-4a906b3b6ac4.jpg"]
+  },
+  {
+    "title": "XBOX Series X",
+    "description": "Experience 4K gaming and up to 120 FPS. Features Quick Resume, backward compatibility, and lightning-fast load times.",
+    "price": 299.99,
+    "category": "entertainment",
+    "condition": "new",
+    "zip_code": "90210",
+    "delivery_available": true,
+    "photo_paths": ["https://pisces.bbystatic.com/image2/BestBuy_US/images/products/17330070-8f7d-41f5-a20e-b02c1dbaee09.jpg;maxHeight=1920;maxWidth=900?format=webp"]
+  },
+  {
+    "title": "Benjamin Franklin Bust",
+    "description": "A collectible bust honoring a historic icon.",
+    "price": 199.99,
+    "category": "artandcollectibles",
+    "condition": "new",
+    "zip_code": "90210",
+    "delivery_available": true,
+    "photo_paths": ["https://www.nationalarchivesstore.org/cdn/shop/products/Mackenzie_Fisher_-_105506_BUST_6_FRANKLIN_6_1024x1024.jpg?v=1542388876"]
+  },
+  {
+    "title": "2021 American Liberty Bronco 1 OZ Gold $100 Coin",
+    "description": "The 2021 American Liberty High Relief Gold Coin is the fifth coin in the American Liberty series, featuring modern depictions of allegorical Liberty.",
+    "price": 5999.99,
+    "category": "artandcollectibles",
+    "condition": "new",
+    "zip_code": "90210",
+    "delivery_available": true,
+    "photo_paths": ["https://www.usmint.gov/learn/coins-and-medals/collectible-coins/american-liberty/2021-high-relief-gold-coin/_jcr_content/root/container_1426747781/imagegallerypdp/item_1746477808267.coreimg.jpeg/1746477874968/2021-american-liberty-high-relief-gold-coin-reverse.jpeg"]
+  },
+  {
+    "title": "2026 American Buffalo 1 OZ Gold $50 Coin",
+    "description": "The iconic Buffalo Nickel design on a spectacular $50 Gold Buffalo coin. A must have for collectors who love the romance of the Wild West.",
+    "price": 3999.99,
+    "category": "artandcollectibles",
+    "condition": "new",
+    "zip_code": "90210",
+    "delivery_available": true,
+    "photo_paths": ["https://www.govmint.com/media/catalog/product/4/5/456064_2.png?optimize=high&fit=bounds&height=186&width=186&canvas=186:186&format=jpeg"]
+  },
+  {
+    "title": "2026 American Eagle 1 OZ Gold $50 Coin",
+    "description": "The 2026 American Eagle Gold Proof Coin celebrates the 250th anniversary of the Nation's founding. Limited edition with anti-counterfeit variable reeding.",
+    "price": 3749.99,
+    "category": "artandcollectibles",
+    "condition": "new",
+    "zip_code": "90210",
+    "delivery_available": true,
+    "photo_paths": ["https://www.usmint.gov/dw/image/v2/AARB_PRD/on/demandware.static/-/Sites-usm-master-catalog-us/default/dw9db3e08e/images/hi-res/coin-programs/American-Eagle/26eb_b.jpg?sw=1200&sh=1200&sm=fit"]
+  },
+  {
+    "title": "Wall Art Set",
+    "description": "A coordinated wall art set to refresh interiors.",
+    "price": 49.99,
+    "category": "artandcollectibles",
+    "condition": "new",
+    "zip_code": "90210",
+    "delivery_available": true,
+    "photo_paths": ["https://encrypted-tbn2.gstatic.com/shopping?q=tbn:ANd9GcSKgjXsEf-PQBIY5oQdNGIUhUQcnL9F3RvD1oYbKvZYC5N7PRXskbD800lFnYuxoY1sbeWUJI26kUVBpk9JUR3FIK2PN587K0_ZstaHzD5G"]
+  },
+  {
+    "title": "Men's Cuban Link Bracelet Set",
+    "description": "A bold bracelet set with polished finish.",
+    "price": 49.99,
+    "category": "jewelry",
+    "condition": "new",
+    "zip_code": "90210",
+    "delivery_available": true,
+    "photo_paths": ["https://imperiumjewelry.com/cdn/shop/files/Untitleddesign_12_700x.png?v=1766788654"]
+  },
+  {
+    "title": "Men's Nike Sports Outfit",
+    "description": "A breathable sport outfit for training days.",
+    "price": 59.99,
+    "category": "men",
+    "condition": "new",
+    "zip_code": "90210",
+    "delivery_available": true,
+    "photo_paths": ["https://encrypted-tbn2.gstatic.com/shopping?q=tbn:ANd9GcTNO0pJpIDMUQAt3_neCb7xnqsfEW7qSpsr_CRaqzHM2fIvVA1f539sUCpW-AlXMxZfm3o44RJHifpbQ1V5RZaMiTsmcV3lRw"]
+  },
+  {
+    "title": "Women's Adidas Sweater",
+    "description": "A lightweight sweater with athletic styling.",
+    "price": 29.99,
+    "category": "women",
+    "condition": "new",
+    "zip_code": "90210",
+    "delivery_available": true,
+    "photo_paths": ["https://encrypted-tbn1.gstatic.com/shopping?q=tbn:ANd9GcRHakCWty8aWRjBoF4r6cqx3EGfEubh8qcOuLcmUN6SpDeJYj4gvieNg5kike5L5uGuVyeJ8oTqF5FhxUTejI_9RmvdPVs4YEsvHhfO0c7Y1hyOD1izvQJ4JJM"]
+  },
+  {
+    "title": "Men's Gucci Travel Bag",
+    "description": "A premium travel companion with elegant structure.",
+    "price": 1089.99,
+    "category": "accessories",
+    "condition": "new",
+    "zip_code": "90210",
+    "delivery_available": true,
+    "photo_paths": ["https://www.mytheresa.com/media/1094/1238/100/2f/P01139856.jpg"]
+  },
+  {
+    "title": "Men's Ferrari Coat",
+    "description": "A winter coat built for warmth and signature style.",
+    "price": 79.99,
+    "category": "men",
+    "condition": "new",
+    "zip_code": "90210",
+    "delivery_available": true,
+    "photo_paths": ["https://www.vintagedrip.in/cdn/shop/files/Photoroom-20240907_195051.png?v=1725721569"]
+  },
+  {
+    "title": "Dining Table Set",
+    "description": "A modern dining set to anchor your space.",
+    "price": 149.99,
+    "category": "homeandappliances",
+    "condition": "new",
+    "zip_code": "90210",
+    "delivery_available": true,
+    "photo_paths": ["https://assets.wfcdn.com/im/30949317/resize-h800-w800%5Ecompr-r85/3516/351661152/Aveline+Extendable+Dining+Table+47%22+To+63%22+-+Expandable+Table+With+X-Brace+Metal+Legs%2C+Smooth+Glide+Mechanism%2C+Seats+6-8%2C+Space+Saving+For+Small+Areas-283322098.jpg"]
+  },
+  {
+    "title": "LED Light Wall Art Set",
+    "description": "Decorative light art that adds ambient character.",
+    "price": 29.99,
+    "category": "artandcollectibles",
+    "condition": "new",
+    "zip_code": "90210",
+    "delivery_available": true,
+    "photo_paths": ["https://www.thedecorvilla.com/cdn/shop/files/WhatsApp_Image_2025-10-14_at_12.19.02_3956751c.jpg?v=1760429104&width=990"]
+  },
+  {
+    "title": "Flying Drone With 8K Ultra HD Video Camera",
+    "description": "Capture aerial shots with high-resolution clarity.",
+    "price": 99.99,
+    "category": "electronics",
+    "condition": "new",
+    "zip_code": "90210",
+    "delivery_available": true,
+    "photo_paths": ["https://www.provideocoalition.com/wp-content/uploads/antigravity1drone002.jpg"]
+  },
+  {
+    "title": "Albert Einstein Sculpture",
+    "description": "A creative sculpture piece for shelf display.",
+    "price": 29.99,
+    "category": "artandcollectibles",
+    "condition": "new",
+    "zip_code": "90210",
+    "delivery_available": true,
+    "photo_paths": ["https://i.etsystatic.com/43097437/r/il/3aff9e/6760090084/il_794xN.6760090084_cl2i.jpg"]
+  },
+  {
+    "title": "Men's The Northface Jacket",
+    "description": "An insulated jacket for cold-weather layering.",
+    "price": 199.99,
+    "category": "men",
+    "condition": "new",
+    "zip_code": "90210",
+    "delivery_available": true,
+    "photo_paths": ["https://assets.thenorthface.com/images/t_img/f_auto,h_400,e_unsharp_mask:100,w_344/dpr_2.0/v1723253109/NF0A883RKX8-HERO2/Mens-Yumiori-FullZip-Jacket-TNF-HERO2.png"]
+  },
+  {
+    "title": "Women's Nike Joggers",
+    "description": "Relaxed joggers with soft stretch comfort.",
+    "price": 29.99,
+    "category": "women",
+    "condition": "new",
+    "zip_code": "90210",
+    "delivery_available": true,
+    "photo_paths": ["https://jcpenney.scene7.com/is/image/JCPenney/DP0407202507094094M?hei=550&wid=550&op_usm=.4%2C.8%2C0%2C0&resmode=sharp2&op_sharpen=1"]
+  },
+  {
+    "title": "Men's Hermes Belt",
+    "description": "A polished belt that sharpens formal looks.",
+    "price": 199.99,
+    "category": "accessories",
+    "condition": "new",
+    "zip_code": "90210",
+    "delivery_available": true,
+    "photo_paths": ["https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcRWBUbkH9uWDGC227Yu9oQ02eSSiS3JUbNwNA&s"]
+  },
+  {
+    "title": "Men's Gucci Sweater",
+    "description": "A premium knit with luxury finish and feel.",
+    "price": 1099.99,
+    "category": "men",
+    "condition": "new",
+    "zip_code": "90210",
+    "delivery_available": true,
+    "photo_paths": ["https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcSwHj0TR7IPCqvJIHJLbLj938kBKS02a0BncQ&s"]
+  },
+  {
+    "title": "Women's Prada Handbag",
+    "description": "A structured handbag with refined detailing.",
+    "price": 1999.99,
+    "category": "accessories",
+    "condition": "new",
+    "zip_code": "90210",
+    "delivery_available": true,
+    "photo_paths": ["https://assets.levelshoes.com/cdn-cgi/image/width=720,height=1008,quality=85,format=webp/media/catalog/product/1/b/1ba906eomnzvf0002v_1.jpg?ts=20241102035016"]
+  },
+  {
+    "title": "Men's Louis Vuitton Travel Bag",
+    "description": "Spacious travel bag with premium material blend.",
+    "price": 1499.99,
+    "category": "accessories",
+    "condition": "new",
+    "zip_code": "90210",
+    "delivery_available": true,
+    "photo_paths": ["https://me.louisvuitton.com/images/is/image/lv/1/PP_VP_L/louis-vuitton-keepall-bandouliere-55--M56714_PM2_Front%20view.jpg"]
+  },
+  {
+    "title": "Men's Michael Kors Watch",
+    "description": "A statement timepiece with classic profile.",
+    "price": 599.99,
+    "category": "jewelry",
+    "condition": "new",
+    "zip_code": "90210",
+    "delivery_available": true,
+    "photo_paths": ["https://dreamspakistan.com/cdn/shop/files/77093_ae11af48-c101-4490-a16c-acf0932feadd.png?v=1756807097&width=600"]
+  },
+  {
+    "title": "LG Smart Refrigerator",
+    "description": "A connected appliance for modern kitchens.",
+    "price": 499.99,
+    "category": "homeandappliances",
+    "condition": "new",
+    "zip_code": "90210",
+    "delivery_available": true,
+    "photo_paths": ["https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcQwaB13Lpqd_aB9KvTHFvJc9wX4X02rYJhmdQ&s"]
+  },
+  {
+    "title": "Apple Macbook Air 13 in Retina Display (2020) M1 Series - 512 GB",
+    "description": "The 2020 MacBook Air M1 with 13.3-inch Retina display, Magic Keyboard, and 2.8 lb weight. Highly capable for modern day tasks.",
+    "price": 199.99,
+    "category": "electronics",
+    "condition": "used",
+    "zip_code": "90210",
+    "delivery_available": true,
+    "photo_paths": ["https://www.backmarket.com/cdn-cgi/image/format%3Dauto%2Cquality%3D75%2Cwidth%3D260/https://d2e6ccujb3mkqf.cloudfront.net/7048c924-9e7b-45bc-93bf-112104c1f293-2_d1177492-33a7-45a5-a894-23324f1b8246.jpg"]
+  },
+  {
+    "title": "Sony Playstation 5 (Disc Version)",
+    "description": "Experience lightning fast loading with an ultra-high speed SSD, deeper immersion with haptic feedback, adaptive triggers, and 3D Audio.",
+    "price": 299.99,
+    "category": "entertainment",
+    "condition": "new",
+    "zip_code": "90210",
+    "delivery_available": true,
+    "photo_paths": ["https://gameforce.pk/wp-content/uploads/2024/02/Sony-PlayStation-5-Standard-Disk-Edition-3.jpg"]
+  },
+  {
+    "title": "Abraham Lincoln Sculpture",
+    "description": "A collectible sculpture for history enthusiasts.",
+    "price": 59.99,
+    "category": "artandcollectibles",
+    "condition": "new",
+    "zip_code": "90210",
+    "delivery_available": true,
+    "photo_paths": ["https://www.capronicollection.com/cdn/shop/files/IMG_6289_copy.jpg?v=1750789948&width=1220"]
+  },
+  {
+    "title": "Nintendo Switch 2",
+    "description": "Features a larger 7.9 LCD touch screen with HDR, 4K dock support, 256GB internal storage, and Joy-Con 2 controllers with mouse control.",
+    "price": 249.99,
+    "category": "entertainment",
+    "condition": "new",
+    "zip_code": "90210",
+    "delivery_available": true,
+    "photo_paths": ["https://i5.walmartimages.com/seo/Nintendo-Switch-2-Mario-Kart-World-Bundle_527bef2f-a6d3-4a7d-a7c6-8cc12d2a1def.048bb537cf3e6d24898c86f2fcbe49aa.png?odnHeight=768&odnWidth=768&odnBg=FFFFFF"]
+  },
+  {
+    "title": "Women's Nike Jacket",
+    "description": "A sporty jacket with lightweight warmth.",
+    "price": 29.99,
+    "category": "women",
+    "condition": "new",
+    "zip_code": "90210",
+    "delivery_available": true,
+    "photo_paths": ["https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcTDAVXbt7Q4QgHkL2x8sEHYkVppcsVGUmDYCA&s"]
+  },
+  {
+    "title": "Men's Hermes Wallet",
+    "description": "A compact wallet with premium finish and feel.",
+    "price": 99.99,
+    "category": "accessories",
+    "condition": "new",
+    "zip_code": "90210",
+    "delivery_available": true,
+    "photo_paths": ["https://shoppoint.pk/cdn/shop/files/Hermes_Black_Leather_Wallet_For_Men.webp?v=1761111583"]
+  },
+  {
+    "title": "Men's Fendi Sweater",
+    "description": "A designer sweater with statement branding.",
+    "price": 1099.99,
+    "category": "men",
+    "condition": "new",
+    "zip_code": "90210",
+    "delivery_available": true,
+    "photo_paths": ["https://cdn.shopify.com/s/files/1/0603/3031/1875/products/main-square_5eba8382-336e-4a82-ba24-d76dd0377d04.jpg?v=1694768841"]
+  },
+  {
+    "title": "Women's Fendi Sweater",
+    "description": "A luxury knit built for standout layering.",
+    "price": 1999.99,
+    "category": "women",
+    "condition": "new",
+    "zip_code": "90210",
+    "delivery_available": true,
+    "photo_paths": ["https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcS5N3RqKqEBiqLC7ugfmmExb1Y__qvqhCl5nw&s"]
+  },
+  {
+    "title": "Gucci Glasses",
+    "description": "Premium designer eyewear with signature Gucci styling.",
+    "price": 1499.99,
+    "category": "accessories",
+    "condition": "new",
+    "zip_code": "90210",
+    "delivery_available": true,
+    "photo_paths": ["https://www.eye-oo.com/cdn/shop/files/307177cb3c9392f078ad775d0875800e.jpg?v=1771632379"]
+  },
+  {
+    "title": "Women's Michael Kors Watch",
+    "description": "An elegant watch designed for everyday glam.",
+    "price": 599.99,
+    "category": "jewelry",
+    "condition": "new",
+    "zip_code": "90210",
+    "delivery_available": true,
+    "photo_paths": ["https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcSmdp2ZE0Ax625HywcY-h6GxvueiaZZ4NTb5w&s"]
+  },
+  {
+    "title": "Hamilton Beach Coffee Maker",
+    "description": "A compact coffee maker for quick morning brews.",
+    "price": 49.99,
+    "category": "homeandappliances",
+    "condition": "new",
+    "zip_code": "90210",
+    "delivery_available": true,
+    "photo_paths": ["https://target.scene7.com/is/image/Target/GUEST_57e2d054-fd81-4dac-84d7-3a1fffaa0582?wid=800&hei=800&qlt=80"]
+  },
+  {
+    "title": "Samsung Laptop",
+    "description": "A dependable laptop for work and study needs.",
+    "price": 199.99,
+    "category": "electronics",
+    "condition": "new",
+    "zip_code": "90210",
+    "delivery_available": true,
+    "photo_paths": ["https://pisces.bbystatic.com/image2/BestBuy_US/images/products/8e09ff69-4142-48ff-938b-75232dd5da79.jpg;maxHeight=1920;maxWidth=900?format=webp"]
+  },
+  {
+    "title": "Sony Playstation 5 (Digital Version)",
+    "description": "The PS5 Digital Edition with ultra-high speed SSD, haptic feedback, adaptive triggers, and 3D Audio. All-digital version with no disc drive.",
+    "price": 299.99,
+    "category": "entertainment",
+    "condition": "new",
+    "zip_code": "90210",
+    "delivery_available": true,
+    "photo_paths": ["https://media.gamestop.com/i/gamestop/11108141/Sony-PlayStation-5-Digital-Edition-Console?w=320&h=320&fmt=auto"]
+  }
+]

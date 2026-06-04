@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>2× Zoom Microscope</title>
+<style>
+  body {
+    display: flex;
+    justify-content: center;
+    margin-top: 50px;
+  }
+
+  #image-container {
+    position: relative;
+    display: inline-block;
+  }
+
+  #zoom-lens {
+    position: absolute;
+    border-radius: 50%;
+    border: 3px solid #333;
+    width: 150px;
+    height: 150px;
+    overflow: hidden;
+    pointer-events: none;
+    box-shadow: 0 0 8px rgba(0,0,0,0.5);
+    opacity: 0;
+    transition: opacity 0.3s ease;
+    background-repeat: no-repeat;
+    background-size: 200% 200%; /* 2x zoom */
+    z-index: 10;
+  }
+</style>
+</head>
+<body>
+  <div id="image-container" style="position:relative; overflow:hidden;">
+    <img id="zoom-image" src="https://images.unsplash.com/photo-1506744038136-46273834b3fb?auto=format&fit=crop&w=600&q=80" data-src="https://images.unsplash.com/photo-1506744038136-46273834b3fb?auto=format&fit=crop&w=600&q=80" alt="Zoomable" width="600" height="400" />
+    <div id="zoom-lens"></div>
+  </div>
+
+<script src="productdisplayzoom.js"></script>
+</body>
+</html>
+
