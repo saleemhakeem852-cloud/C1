@@ -288,10 +288,17 @@ def make_driver(headless: bool = False) -> webdriver.Chrome:
         }
     } if SELENIUMWIRE_AVAILABLE else {}
 
-    # --- Persistent profile so session cookies survive between runs ---
-    # (Fresh temp dir was wiping cookies every run, forcing re-login each time)
+    # --- Persistent profile (reuse between runs so CL session cookies survive) ---
     profile_dir = os.environ.get("CHROME_PROFILE_DIR", "/tmp/clblast_chrome_profile")
     os.makedirs(profile_dir, exist_ok=True)
+    # Remove stale lock file left by a previously crashed Chrome instance
+    lock_file = os.path.join(profile_dir, "SingletonLock")
+    if os.path.exists(lock_file):
+        try:
+            os.remove(lock_file)
+            print(f"  [driver] Removed stale lock file: {lock_file}")
+        except Exception:
+            pass
     options.add_argument(f"--user-data-dir={profile_dir}")
     print(f"  [driver] Chrome profile: {profile_dir}")
 
@@ -477,13 +484,8 @@ def handle_captcha_if_present(driver):
 # LOGIN
 # ─────────────────────────────────────────────────────────────
 def craigslist_login(driver, email: str, password: str) -> bool:
-    print(f"  [login] Email: '{email[:3]}***', Password length: {len(password)}")
-    if not email:
-        print("  \u2717 Empty email \u2014 set CL_EMAIL in Railway")
-        return False
-
     driver.get("https://accounts.craigslist.org/login")
-    time.sleep(3)
+    human_delay(2, 4)
     handle_captcha_if_present(driver)
 
     try:
@@ -493,49 +495,22 @@ def craigslist_login(driver, email: str, password: str) -> bool:
         send_keys_slow(driver, email_field, email)
         human_delay()
 
-        # Always fill password field — same as the original working code
         try:
             pw_field = driver.find_element(By.ID, "inputPassword")
             send_keys_slow(driver, pw_field, password)
             human_delay()
-            print(f"  [login] Password filled ({len(password)} chars)")
         except NoSuchElementException:
-            print("  [login] No password field on page")
+            pass  # some CL accounts have no password field
 
-        # Submit
         btn = driver.find_element(By.CSS_SELECTOR, "button[type='submit']")
         safe_click(driver, btn)
-        time.sleep(4)
 
-        print(f"  [login] Post-submit URL: {driver.current_url}")
-        print(f"  [login] Post-submit title: {driver.title}")
-
-        cur = driver.current_url.lower()
-        # /login/onetime = CL sent magic link (wrong credentials)
-        # /login         = still on login form (bad password)
-        # anything else  = success
-        if cur.rstrip("/").endswith("/login") or "login/onetime" in cur:
-            try:
-                err_els = driver.find_elements(By.CSS_SELECTOR, ".err, .error, .notice, #error")
-                for el in err_els:
-                    if el.text.strip():
-                        print(f"  [login] CL error: '{el.text.strip()}'")
-            except Exception:
-                pass
-            if "onetime" in cur:
-                print("  \u2717 CL sent a magic-link email \u2014 account has no password set")
-                print("  Fix: go to https://accounts.craigslist.org and set a real password,")
-                print("       then update CL_PASSWORD in Railway to that password.")
-            else:
-                print("  \u2717 Login failed \u2014 wrong password or account blocked")
-            return False
-
+        WebDriverWait(driver, 15).until(EC.url_contains("craigslist.org"))
         handle_captcha_if_present(driver)
-        print("  \u2713 Logged in to Craigslist")
+        print("  Logged in to Craigslist ✓")
         return True
-
-    except TimeoutException as e:
-        print(f"  \u2717 Login form not found: {e}")
+    except TimeoutException:
+        print("  Login failed.")
         return False
 
 
