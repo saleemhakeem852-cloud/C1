@@ -530,38 +530,92 @@ def js_fill(driver, field_id: str, value: str):
 
 
 def selenium_fill(driver, field_id: str, value: str) -> bool:
-    """Fill a field using REAL Selenium keystrokes — CL jQuery always sees this.
-    Use this for all validated fields (title, body, zip, price)."""
+    """Fill a field so CL's jQuery validator always accepts it.
+
+    Strategy (in order):
+    1. JS-clear the field completely (no race between .clear() and typing).
+    2. Type character-by-character with ActionChains (real OS-level input events).
+    3. Fire change + blur so jQuery marks the field valid.
+    4. Verify via both .value attribute AND .textContent (covers <textarea>).
+    5. If still empty, fall back to js_fill + re-fire events.
+    """
     from selenium.webdriver.common.keys import Keys
     try:
-        el = WebDriverWait(driver, 6).until(
+        el = WebDriverWait(driver, 10).until(
             EC.presence_of_element_located((By.ID, field_id))
         )
         driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
-        driver.execute_script("arguments[0].focus();", el)
+        time.sleep(0.3)
+
+        # Step 1 — JS-clear: wipes value AND textContent so nothing lingers
+        driver.execute_script("""
+            var el = arguments[0];
+            el.focus();
+            // Clear via native setter (bypasses React/Vue/jQuery caching)
+            var tag = el.tagName.toLowerCase();
+            if (tag === 'textarea') {
+                var setter = Object.getOwnPropertyDescriptor(
+                    window.HTMLTextAreaElement.prototype, 'value').set;
+                setter.call(el, '');
+            } else {
+                var setter = Object.getOwnPropertyDescriptor(
+                    window.HTMLInputElement.prototype, 'value').set;
+                setter.call(el, '');
+            }
+            el.textContent = '';
+            el.innerHTML = '';
+            el.dispatchEvent(new Event('input',  {bubbles:true}));
+            el.dispatchEvent(new Event('change', {bubbles:true}));
+        """, el)
         time.sleep(0.2)
+
+        # Also Ctrl+A + Delete via Selenium to make sure
         el.click()
         time.sleep(0.1)
         el.send_keys(Keys.CONTROL + "a")
         time.sleep(0.05)
         el.send_keys(Keys.DELETE)
-        time.sleep(0.1)
-        el.clear()
-        time.sleep(0.1)
+        time.sleep(0.15)
+
+        # Step 2 — type with ActionChains (fires real keydown/keypress/keyup)
+        actions = ActionChains(driver)
+        actions.click(el)
+        actions.pause(0.1)
         for ch in value:
-            el.send_keys(ch)
-            time.sleep(random.uniform(0.02, 0.06))
-        driver.execute_script(
-            "arguments[0].dispatchEvent(new Event('change',{bubbles:true}));"
-            "arguments[0].dispatchEvent(new Event('blur',{bubbles:true}));",
-            el
-        )
+            actions.send_keys(ch)
+            actions.pause(random.uniform(0.03, 0.07))
+        actions.perform()
+        time.sleep(0.4)
+
+        # Step 3 — fire jQuery-compatible event chain after typing
+        driver.execute_script("""
+            var el = arguments[0];
+            ['input','change','blur'].forEach(function(name) {
+                el.dispatchEvent(new Event(name, {bubbles:true, cancelable:true}));
+            });
+        """, el)
         time.sleep(0.3)
-        actual = (el.get_attribute("value") or "").strip()
-        if actual != value.strip():
-            # JS fallback if typing didn't stick
+
+        # Step 4 — verify: check BOTH .value and .textContent
+        actual_value = (el.get_attribute("value") or "").strip()
+        actual_text  = (driver.execute_script(
+            "return arguments[0].textContent || '';", el) or "").strip()
+        filled_ok = bool(actual_value) or bool(actual_text)
+
+        if not filled_ok:
+            # Step 5 — last resort: pure JS fill + full event chain
+            print(f"  ⚠ selenium_fill({field_id}): typing didn't stick — JS fallback")
             js_fill(driver, field_id, value)
+            time.sleep(0.4)
+            # Re-fire change/blur after js_fill too
+            driver.execute_script("""
+                var el = arguments[0];
+                ['input','change','blur'].forEach(function(name) {
+                    el.dispatchEvent(new Event(name, {bubbles:true, cancelable:true}));
+                });
+            """, el)
             time.sleep(0.3)
+
         return True
     except Exception as e:
         print(f"  ⚠ selenium_fill({field_id}) failed: {e}")
@@ -625,6 +679,81 @@ def robust_fill_zip(driver, zip_code):
         print(f"  ⚠ Zip verification error: {e}")
 
 
+
+def fill_zip_cl(driver, zip_code: str):
+    """Fill CL's postal_code field with per-character InputEvents.
+    CL's ZIP validator fires on each keystroke's InputEvent.data — not on bulk paste.
+    This fires a real InputEvent for every character, which is what CL expects.
+    """
+    from selenium.webdriver.common.keys import Keys
+    try:
+        el = WebDriverWait(driver, 8).until(
+            EC.presence_of_element_located((By.ID, "postal_code"))
+        )
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+        time.sleep(0.2)
+
+        # Clear via native setter first
+        driver.execute_script("""
+            var el = arguments[0];
+            var setter = Object.getOwnPropertyDescriptor(
+                window.HTMLInputElement.prototype, 'value').set;
+            setter.call(el, '');
+            el.dispatchEvent(new Event('input',{bubbles:true}));
+        """, el)
+        time.sleep(0.1)
+        el.click()
+        time.sleep(0.1)
+        el.send_keys(Keys.CONTROL + "a")
+        el.send_keys(Keys.DELETE)
+        time.sleep(0.1)
+
+        # Type each digit AND fire InputEvent with data= that digit
+        current = ""
+        for ch in zip_code:
+            el.send_keys(ch)
+            current += ch
+            driver.execute_script("""
+                var el = arguments[0];
+                var ch = arguments[1];
+                var cur = arguments[2];
+                // Update value via native setter after each char
+                var setter = Object.getOwnPropertyDescriptor(
+                    window.HTMLInputElement.prototype, 'value').set;
+                setter.call(el, cur);
+                el.dispatchEvent(new InputEvent('input', {
+                    bubbles: true, cancelable: true,
+                    data: ch, inputType: 'insertText'
+                }));
+            """, el, ch, current)
+            time.sleep(random.uniform(0.05, 0.12))
+
+        # Final change + blur to trigger CL's ZIP validation handler
+        driver.execute_script("""
+            var el = arguments[0];
+            el.dispatchEvent(new Event('change',{bubbles:true,cancelable:true}));
+            el.dispatchEvent(new Event('blur',{bubbles:true,cancelable:true}));
+        """, el)
+        time.sleep(0.4)
+
+        # Verify
+        actual = (el.get_attribute("value") or "").strip()
+        if actual != zip_code:
+            print(f"  ⚠ ZIP verify mismatch: got '{actual}' expected '{zip_code}' — forcing via JS")
+            driver.execute_script("""
+                var el = arguments[0]; var val = arguments[1];
+                var setter = Object.getOwnPropertyDescriptor(
+                    window.HTMLInputElement.prototype,'value').set;
+                setter.call(el, val);
+                ['input','change','blur'].forEach(function(n){
+                    el.dispatchEvent(new Event(n,{bubbles:true,cancelable:true}));
+                });
+            """, el, zip_code)
+            time.sleep(0.3)
+        print(f"  ✓ Zip: {zip_code}")
+    except Exception as e:
+        print(f"  ⚠ fill_zip_cl failed: {e}")
+
 def fill_listing_details(driver, product: dict):
     # 1. Wait for form — if it never appears, return silently (don't crash)
     try:
@@ -636,7 +765,16 @@ def fill_listing_details(driver, product: dict):
         return
 
     handle_captcha_if_present(driver)
-    time.sleep(2)  # let CL's JS finish rendering all fields
+    # Wait for ALL key fields to be present before touching anything.
+    # CL dynamically injects fields via JS — touching them too early = silent loss.
+    for fid in ["PostingTitle", "PostingBody", "postal_code"]:
+        try:
+            WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located((By.ID, fid))
+            )
+        except TimeoutException:
+            print(f"  ⚠ Field '{fid}' never appeared — CL may have different IDs")
+    time.sleep(2.5)  # extra settle for CL jQuery to attach all validators
 
     # 2. Resolve values
     title = product.get("title") or product.get("name") or "Quality Item For Sale"
@@ -683,8 +821,7 @@ def fill_listing_details(driver, product: dict):
 
     # ZIP — real keystrokes required for CL validation
     print("  Filling zip...")
-    selenium_fill(driver, "postal_code", zip_code)
-    time.sleep(1.0)
+    fill_zip_cl(driver, zip_code)
 
     # Price — try by ID with real keystrokes, then CSS fallback
     price_filled = False
@@ -757,21 +894,31 @@ def fill_listing_details(driver, product: dict):
     time.sleep(1)
 
     # Pre-submit verification — confirm all critical fields have values
-    time.sleep(0.5)
+    # IMPORTANT: PostingBody is a <textarea> — must check BOTH .value and textContent
+    time.sleep(0.8)
+
+    def _get_field_value(el):
+        """Return whichever of .value or .textContent is non-empty."""
+        v = (el.get_attribute("value") or "").strip()
+        if v:
+            return v
+        return (driver.execute_script(
+            "return arguments[0].textContent || '';", el) or "").strip()
+
     try:
         zip_el = driver.find_element(By.ID, "postal_code")
-        zip_val = (zip_el.get_attribute("value") or "").strip()
+        zip_val = _get_field_value(zip_el)
         if not zip_val or zip_val != zip_code:
             print(f"  ✗ postal_code mismatch (got '{zip_val}', expected '{zip_code}') — re-filling")
-            selenium_fill(driver, "postal_code", zip_code)
-            time.sleep(0.8)
+            fill_zip_cl(driver, zip_code)
         else:
             print(f"  ✓ postal_code confirmed: '{zip_val}'")
     except Exception:
         pass
+
     try:
         title_el = driver.find_element(By.ID, "PostingTitle")
-        title_val = (title_el.get_attribute("value") or "").strip()
+        title_val = _get_field_value(title_el)
         if not title_val:
             print(f"  ✗ PostingTitle is EMPTY — re-filling")
             selenium_fill(driver, "PostingTitle", title)
@@ -780,9 +927,10 @@ def fill_listing_details(driver, product: dict):
             print(f"  ✓ title confirmed: '{title_val[:40]}...'")
     except Exception:
         pass
+
     try:
         body_el = driver.find_element(By.ID, "PostingBody")
-        body_val = (body_el.get_attribute("value") or "").strip()
+        body_val = _get_field_value(body_el)
         if not body_val:
             print(f"  ✗ PostingBody is EMPTY — re-filling")
             selenium_fill(driver, "PostingBody", description)
@@ -791,6 +939,21 @@ def fill_listing_details(driver, product: dict):
             print(f"  ✓ description confirmed ({len(body_val)} chars)")
     except Exception:
         pass
+
+    # Re-fire jQuery validation on ALL fields right before clicking Continue.
+    # This is the key fix: CL's validator runs on blur/change; we force it here.
+    time.sleep(0.5)
+    driver.execute_script("""
+        ['PostingTitle', 'PostingBody', 'postal_code'].forEach(function(fid) {
+            var el = document.getElementById(fid);
+            if (!el) return;
+            el.focus();
+            el.dispatchEvent(new Event('input',  {bubbles:true, cancelable:true}));
+            el.dispatchEvent(new Event('change', {bubbles:true, cancelable:true}));
+            el.dispatchEvent(new Event('blur',   {bubbles:true, cancelable:true}));
+        });
+    """)
+    time.sleep(0.5)
 
     # 4. Click the continue button
     driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
