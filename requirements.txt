@@ -2,5 +2,6 @@ flask
 flask-cors
 requests
 selenium
+selenium-wire
 undetected-chromedriver
 2captcha-python

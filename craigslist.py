@@ -17,7 +17,12 @@ import tempfile
 import urllib.request
 from datetime import datetime, timedelta
 
-from selenium import webdriver
+try:
+    from seleniumwire import webdriver          # pip install selenium-wire
+    SELENIUMWIRE_AVAILABLE = True
+except ImportError:
+    from selenium import webdriver              # fallback — no proxy auth
+    SELENIUMWIRE_AVAILABLE = False
 
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait, Select
@@ -269,10 +274,18 @@ def make_driver(headless: bool = False) -> webdriver.Chrome:
 
     # --- Anti-detection (critical) ---
     options.add_argument("--disable-blink-features=AutomationControlled")
-    options.add_argument("--proxy-server=http://gate.decodo.com:10004")
     options.add_argument("--accept-lang=en-US,en;q=0.9")
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option("useAutomationExtension", False)
+
+    # --- Proxy via seleniumwire (handles auth natively on headless Linux) ---
+    sw_options = {
+        "proxy": {
+            "http":  "http://spa1pl920i:dBByddd_WD08p4hk7f@gate.decodo.com:10004",
+            "https": "http://spa1pl920i:dBByddd_WD08p4hk7f@gate.decodo.com:10004",
+            "no_proxy": "localhost,127.0.0.1",
+        }
+    } if SELENIUMWIRE_AVAILABLE else {}
 
     # --- Use a FRESH temp dir every run to avoid stale lock files from prior crashes ---
     fresh_profile = tempfile.mkdtemp(prefix="clblast_chrome_")
@@ -301,7 +314,7 @@ def make_driver(headless: bool = False) -> webdriver.Chrome:
     if not chromedriver_bin:
         print("  [driver] WARNING: chromedriver not found in path fallback, trying default webdriver.Chrome initiation...")
         try:
-            driver = webdriver.Chrome(options=options)
+            driver = webdriver.Chrome(options=options, seleniumwire_options=sw_options) if SELENIUMWIRE_AVAILABLE else webdriver.Chrome(options=options)
         except Exception as e:
             print(f"  [driver] Chrome session failed with default initialization: {e}")
             raise RuntimeError("chromedriver not found and default initialization failed.")
@@ -314,7 +327,7 @@ def make_driver(headless: bool = False) -> webdriver.Chrome:
             log_output=log_path
         )
         try:
-            driver = webdriver.Chrome(service=service, options=options)
+            driver = webdriver.Chrome(service=service, options=options, seleniumwire_options=sw_options) if SELENIUMWIRE_AVAILABLE else webdriver.Chrome(service=service, options=options)
         except Exception as e:
             print(f"  [driver] Chrome session failed: {e}")
             try:
@@ -323,15 +336,6 @@ def make_driver(headless: bool = False) -> webdriver.Chrome:
             except Exception:
                 pass
             raise
-    # --- Proxy authentication via CDP (credentials in URL not supported on Linux Chromium) ---
-    driver.execute_cdp_cmd("Network.enable", {})
-    driver.execute_cdp_cmd("Network.setExtraHTTPHeaders", {
-        "headers": {
-            "Proxy-Authorization": "Basic " + __import__('base64').b64encode(
-                b"spa1pl920i:dBByddd_WD08p4hk7f"
-            ).decode()
-        }
-    })
     driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": """
         Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
         Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
