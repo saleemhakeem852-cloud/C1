@@ -1,9 +1,15 @@
 """
 craigslist.py  —  CLBlast automation module for Craigslist
-KEY CHANGE: fill_listing_details now dumps page HTML on failure for diagnosis,
-and uses a triple-strategy submit: direct form submit, JS form submit, button click.
-Also removes 'required' attribute from fields before submit so browser-native
-validation cannot block the post.
+
+FIXES applied based on form dump diagnostics:
+  1. postal (name=postal) is CLEARED by CL's JS after TAB/blur events
+     → Fill via JS setValue trick + dispatch 'input'+'change' events, fill LAST before submit
+  2. FromEMail has no ID, no session auto-fill → must set via JS + CL_EMAIL env var
+  3. geographic_area field exists and is required → fill with city name
+  4. Price is type=number → send as plain string without TAB to avoid truncation
+  5. Fill order: title → body → price → email → geographic_area → postal (LAST)
+  6. Submit: click button only (no form.submit() — that bypasses CL's JS validators)
+  7. Never send TAB after postal — TAB triggers CL's blur handler that clears the field
 """
 
 import time
@@ -13,7 +19,7 @@ import random
 import threading
 import tempfile
 import urllib.request
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -30,29 +36,26 @@ except ImportError:
     CAPTCHA_SOLVER_AVAILABLE = False
 
 TWO_CAPTCHA_API_KEY = os.environ.get("TWO_CAPTCHA_KEY", "YOUR_2CAPTCHA_API_KEY")
-CHROME_PROFILE_DIR  = os.path.join(os.path.expanduser("~"), ".clblast_chrome_cl")
 LISTINGS_JSON       = "posted_listings.json"
 CL_CITY             = os.environ.get("CL_CITY", "losangeles")
 IS_FAST_MODE        = os.environ.get("FAST_MODE", "1") == "1"
 IS_RAILWAY          = any(os.path.exists(p) for p in [
-    "/usr/bin/chromium", "/usr/bin/chromium-browser", "/run/current-system/sw/bin/chromium"
+    "/usr/bin/chromium", "/usr/bin/chromium-browser",
 ])
 
 CATEGORY_MAPPING = {
     "antiques": (1, "antiques"), "appliances": (2, "appliances"),
     "art": (3, "arts & crafts"), "paintings": (3, "arts & crafts"),
-    "art supplies": (3, "arts & crafts"), "atvs": (4, None),
-    "automotive": (5, "auto parts"), "auto parts": (5, "auto parts"),
+    "atvs": (4, None), "automotive": (5, "auto parts"), "auto parts": (5, "auto parts"),
     "tires": (6, "auto wheels & tires"), "boats": (13, "boats"),
-    "books": (14, "books & magazines"), "novels": (14, "books & magazines"),
-    "business": (15, "business/commercial"),
+    "books": (14, "books & magazines"), "business": (15, "business/commercial"),
     "cars": (16, "cars & trucks"), "trucks": (16, "cars & trucks"),
     "phones": (18, "cell phones"), "cell phones": (18, "cell phones"),
     "fashion": (19, "clothing & accessories"),
     "collectibles": (20, "collectibles"), "coins": (20, "collectibles"),
     "computers": (22, "computers"), "laptops": (22, "computers"),
     "electronics": (23, "electronics"), "cameras": (23, "electronics"),
-    "furniture": (26, "furniture"), "sofas": (26, "furniture"),
+    "furniture": (26, "furniture"),
     "miscellaneous": (28, "general for sale"),
     "health": (29, "health and beauty"), "beauty": (29, "health and beauty"),
     "household": (31, "household items"),
@@ -71,7 +74,7 @@ CATEGORY_MAPPING = {
     "entertainment": (17, "cds / dvds / vhs"),
 }
 
-def get_category_ul_value(category_name: str):
+def get_category_ul_value(category_name):
     key = category_name.lower().strip().replace(" ", "")
     for k in CATEGORY_MAPPING:
         if k.replace(" ", "") == key:
@@ -181,15 +184,15 @@ def human_delay(lo=0.8, hi=2.5):
 def human_scroll(driver):
     try:
         driver.execute_script(f"window.scrollBy(0, {random.randint(100, 400)});")
-        time.sleep(random.uniform(0.5, 1.5))
+        time.sleep(random.uniform(0.3, 0.8))
     except Exception:
         pass
 
 def human_mouse_movement(driver, element):
     try:
         ActionChains(driver).move_to_element_with_offset(
-            element, random.randint(-10,10), random.randint(-10,10)
-        ).pause(random.uniform(0.2, 0.5)).perform()
+            element, random.randint(-5, 5), random.randint(-5, 5)
+        ).pause(random.uniform(0.1, 0.3)).perform()
     except Exception:
         pass
 
@@ -199,12 +202,11 @@ def send_keys_slow(driver, element, text):
     except Exception:
         try: element.click()
         except Exception: pass
-    time.sleep(random.uniform(0.5, 1.2))
-    element.clear()
     time.sleep(random.uniform(0.3, 0.7))
+    element.clear()
     for ch in text:
         element.send_keys(ch)
-        time.sleep(random.uniform(0.05, 0.22))
+        time.sleep(random.uniform(0.05, 0.15))
 
 def safe_click(driver, element):
     human_delay(2.0, 5.0)
@@ -230,8 +232,8 @@ def solve_recaptcha_v2(driver):
         sitekey = [p.split("=")[1] for p in iframe.get_attribute("src").split("&") if "k=" in p][0]
         solver = TwoCaptcha(TWO_CAPTCHA_API_KEY)
         result = solver.recaptcha(sitekey=sitekey, url=driver.current_url)
-        token = result["code"]
-        driver.execute_script("document.getElementById('g-recaptcha-response').innerHTML=arguments[0];", token)
+        driver.execute_script(
+            "document.getElementById('g-recaptcha-response').innerHTML=arguments[0];", result["code"])
         print("  CAPTCHA solved ✓")
         return True
     except Exception as e:
@@ -284,61 +286,90 @@ def click_relocation_if_needed(driver, ad_name):
         pass
 
 
-# ─────────────────────────────────────────────────────────────
-# THE FIELD FILLER — simple, correct, headless-safe
-# ─────────────────────────────────────────────────────────────
-def _fill_field(driver, field_id: str, value: str) -> bool:
+# ─────────────────────────────────────────────────────────────────────────────
+# JS-BASED FIELD SETTER
+# The ONLY reliable way to set a field value when CL's JS clears it on blur.
+# Sets .value via JS, then dispatches 'input' and 'change' events so CL's
+# internal state gets updated — WITHOUT triggering the blur handler that
+# wipes postal.
+# ─────────────────────────────────────────────────────────────────────────────
+def _js_set(driver, selector: str, value: str, label: str = "field") -> bool:
     """
-    Fill a field. No ActionChains. No key combos. No JS injection.
-    Just: click, clear, send_keys char by char, TAB.
+    Set a field's value using JavaScript + dispatch input/change events.
+    This bypasses Selenium's send_keys blur side-effects that cause CL to
+    clear the postal field.
+    """
+    js = """
+    var sel = arguments[0];
+    var val = arguments[1];
+    var el = document.querySelector(sel);
+    if (!el) return 'NOT_FOUND';
+    el.focus();
+    el.value = val;
+    el.dispatchEvent(new Event('input',  {bubbles: true}));
+    el.dispatchEvent(new Event('change', {bubbles: true}));
+    return el.value;
     """
     try:
-        el = WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.ID, field_id)))
+        result = driver.execute_script(js, selector, str(value))
+        if result == "NOT_FOUND":
+            print(f"  ✗ {label}: element not found via '{selector}'")
+            return False
+        if str(result).strip():
+            print(f"  ✓ {label} = '{str(result)[:60]}'")
+            return True
+        print(f"  ✗ {label} empty after JS set")
+        return False
+    except Exception as e:
+        print(f"  ⚠ _js_set({label}) error: {e}")
+        return False
+
+
+def _fill_by_keys(driver, selector: str, value: str, label: str = "field",
+                  send_tab: bool = True) -> bool:
+    """
+    Fill a field using real key events (char-by-char).
+    send_tab=False for postal — TAB triggers CL's blur that clears the field.
+    """
+    try:
+        el = WebDriverWait(driver, 8).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, selector)))
         driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
-        time.sleep(0.3)
+        time.sleep(0.2)
         try:
             el.click()
         except Exception:
             driver.execute_script("arguments[0].focus();", el)
-        time.sleep(0.2)
-        el.clear()
         time.sleep(0.15)
-        for ch in value:
+        el.clear()
+        time.sleep(0.1)
+        for ch in str(value):
             el.send_keys(ch)
-            time.sleep(random.uniform(0.03, 0.06))
-        el.send_keys(Keys.TAB)
-        time.sleep(0.4)
-        actual = (el.get_attribute("value") or "").strip()
-        if not actual:
-            # Retry without char loop
-            el.click()
-            time.sleep(0.1)
-            el.clear()
-            el.send_keys(value)
+            time.sleep(random.uniform(0.03, 0.07))
+        if send_tab:
             el.send_keys(Keys.TAB)
             time.sleep(0.3)
-        actual = (driver.find_element(By.ID, field_id).get_attribute("value") or "").strip()
+        actual = (el.get_attribute("value") or "").strip()
         if actual:
-            print(f"  ✓ {field_id} = '{actual[:50]}'")
+            print(f"  ✓ {label} = '{actual[:60]}'")
             return True
-        else:
-            print(f"  ✗ {field_id} still empty after fill")
-            return False
+        print(f"  ✗ {label} empty after key fill")
+        return False
     except Exception as e:
-        print(f"  ⚠ _fill_field({field_id}) failed: {e}")
+        print(f"  ⚠ _fill_by_keys({label}) error: {e}")
         return False
 
-def clipboard_fill(driver, field_id, value):
-    return _fill_field(driver, field_id, value)
 
-def robust_fill_zip(driver, zip_code):
-    _fill_field(driver, "postal_code", zip_code)
-
-
-# ─────────────────────────────────────────────────────────────
-# FILL LISTING DETAILS
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# FILL LISTING DETAILS  (THE FIXED VERSION)
+# Fill order matters:
+#   1. PostingTitle  — safe, TAB ok
+#   2. PostingBody   — safe, TAB ok
+#   3. price         — type=number, no TAB (avoids side-effects)
+#   4. FromEMail     — JS set (no ID, session doesn't populate it)
+#   5. geographic_area — required field we were missing entirely
+#   6. postal        — MUST be LAST, JS set only, NO TAB
+# ─────────────────────────────────────────────────────────────────────────────
 def fill_listing_details(driver, product: dict):
     try:
         WebDriverWait(driver, 15).until(
@@ -348,16 +379,21 @@ def fill_listing_details(driver, product: dict):
         return
 
     handle_captcha_if_present(driver)
-    time.sleep(2)
+    time.sleep(2)   # let all CL JS finish rendering
 
-    title = product.get("title") or product.get("name") or "Quality Item For Sale"
-    description = product.get("description") or (
+    # ── Resolve values ───────────────────────────────────────────────────────
+    title = (product.get("title") or product.get("name") or "Quality Item For Sale").strip()
+    description = (product.get("description") or (
         f"{title} in excellent condition. A unique piece perfect for collectors and enthusiasts. "
         f"Well maintained and ready for a new home. Priced to sell. Local pickup preferred. "
-        f"Message for more details or to arrange viewing.")
+        f"Message for more details or to arrange viewing.")).strip()
+
     _pr = str(product.get("price", "")).strip().replace("$", "").replace(",", "")
     try:
-        price = _pr if _pr and float(_pr) > 0 else "1"
+        price = str(float(_pr)) if _pr and float(_pr) > 0 else "1"
+        # CL type=number field: send as integer string if .0
+        if price.endswith(".0"):
+            price = price[:-2]
     except Exception:
         price = "1"
 
@@ -381,171 +417,180 @@ def fill_listing_details(driver, product: dict):
         _ck = CL_CITY.lower().replace(" ", "").replace("-", "")
         zip_code = _ZIPS.get(_ck, "90001")
 
+    # city name for geographic_area field
+    _CITY_NAMES = {
+        "losangeles": "Los Angeles", "newyork": "New York", "chicago": "Chicago",
+        "houston": "Houston", "phoenix": "Phoenix", "sfbay": "San Francisco",
+        "sandiego": "San Diego", "seattle": "Seattle", "miami": "Miami",
+        "dallas": "Dallas", "denver": "Denver", "atlanta": "Atlanta",
+        "boston": "Boston", "portland": "Portland",
+    }
+    _ck = CL_CITY.lower().replace(" ", "").replace("-", "")
+    city_name = _CITY_NAMES.get(_ck, CL_CITY.title())
+
     cl_email = (os.environ.get("CL_EMAIL") or
                 product.get("contact_email") or product.get("email") or "").strip()
 
-    # ── Fill fields ──────────────────────────────────────────
+    # ── 1. PostingTitle ──────────────────────────────────────────────────────
     print("  Filling title...")
-    _fill_field(driver, "PostingTitle", title)
+    _fill_by_keys(driver, "[name='PostingTitle']", title, label="PostingTitle", send_tab=True)
 
+    # ── 2. PostingBody ───────────────────────────────────────────────────────
     print("  Filling description...")
-    _fill_field(driver, "PostingBody", description)
+    _fill_by_keys(driver, "[name='PostingBody']", description, label="PostingBody", send_tab=True)
 
-    print("  Filling zip...")
-    _fill_field(driver, "postal_code", zip_code)
-
-    # Price
+    # ── 3. Price ─────────────────────────────────────────────────────────────
+    print("  Filling price...")
     price_filled = False
-    for pid in ["AskingPrice", "AskPrice", "price", "Price", "asking_price"]:
+    for price_sel in ["[name='price']", "[name='AskingPrice']", "[name='AskPrice']",
+                      "#AskingPrice", "#AskPrice", "#price"]:
         try:
-            driver.find_element(By.ID, pid)
-            _fill_field(driver, pid, price)
-            print(f"  ✓ Price: {price}")
-            price_filled = True
-            break
+            driver.find_element(By.CSS_SELECTOR, price_sel)
+            # Use JS set for price — type=number fields can behave oddly with send_keys
+            if _js_set(driver, price_sel, price, label="price"):
+                price_filled = True
+                break
         except Exception:
             continue
     if not price_filled:
         try:
             price_inputs = driver.find_elements(By.CSS_SELECTOR,
-                "input[id*='rice'], input[name*='rice'], input[id*='ask'], input[name*='ask']")
+                "input[type='number'], input[id*='rice'], input[name*='rice']")
             for pi in price_inputs:
                 if pi.is_displayed():
-                    pi.click()
-                    time.sleep(0.1)
-                    pi.clear()
-                    for ch in price:
-                        pi.send_keys(ch)
-                        time.sleep(0.04)
-                    pi.send_keys(Keys.TAB)
-                    print(f"  ✓ Price filled via CSS fallback: {price}")
+                    driver.execute_script("arguments[0].focus(); arguments[0].value = arguments[1];", pi, price)
+                    driver.execute_script(
+                        "arguments[0].dispatchEvent(new Event('input',{bubbles:true}));"
+                        "arguments[0].dispatchEvent(new Event('change',{bubbles:true}));", pi)
+                    print(f"  ✓ Price filled via fallback: {price}")
                     price_filled = True
                     break
         except Exception as pe:
-            print(f"  ⚠ Price CSS fallback failed: {pe}")
+            print(f"  ⚠ Price fallback failed: {pe}")
 
-    # Email
+    # ── 4. FromEMail — NO ID, must use name selector + JS ───────────────────
+    print("  Filling email...")
+    email_filled = False
     try:
-        ef = WebDriverWait(driver, 4).until(
-            EC.presence_of_element_located((By.ID, "FromEMail")))
+        ef = driver.find_element(By.CSS_SELECTOR, "[name='FromEMail']")
         cur_val = (ef.get_attribute("value") or "").strip()
         if cur_val:
-            print(f"  ✓ Email already in field: {cur_val}")
+            print(f"  ✓ FromEMail already populated: {cur_val}")
+            email_filled = True
         elif cl_email:
-            _fill_field(driver, "FromEMail", cl_email)
-    except TimeoutException:
-        print("  [info] FromEMail absent — CL using session email (OK if logged in)")
+            # JS set — bypasses any CL event handler interference
+            _js_set(driver, "[name='FromEMail']", cl_email, label="FromEMail")
+            email_filled = True
+        else:
+            # CL requires this field even when logged in for some categories
+            # Grab the email from the env at login time if possible
+            print("  ⚠ FromEMail empty and CL_EMAIL not set — validation may fail")
+            print("  ⚠ Set CL_EMAIL environment variable to fix this")
+    except NoSuchElementException:
+        print("  [info] FromEMail field not present — session auth")
+        email_filled = True
 
-    # Condition
+    # ── 5. geographic_area — required field, was completely missed before ────
+    print("  Filling geographic_area...")
     try:
-        cond = Select(WebDriverWait(driver, 3).until(
-            EC.presence_of_element_located((By.ID, "condition"))))
-        cond.select_by_visible_text(product.get("condition", "new"))
+        ga = driver.find_element(By.CSS_SELECTOR, "[name='geographic_area']")
+        cur = (ga.get_attribute("value") or "").strip()
+        if not cur:
+            _js_set(driver, "[name='geographic_area']", city_name, label="geographic_area")
+        else:
+            print(f"  ✓ geographic_area already set: {cur}")
+    except NoSuchElementException:
+        print("  [info] geographic_area field not present on this form")
+
+    # ── 6. Condition dropdown (optional) ────────────────────────────────────
+    try:
+        cond_el = driver.find_element(By.NAME, "condition")
+        cond = Select(cond_el)
+        cond_val = product.get("condition", "")
+        if cond_val:
+            try:
+                cond.select_by_visible_text(cond_val)
+            except Exception:
+                pass
     except Exception:
         pass
 
-    time.sleep(1.5)
+    # ── Small pause before postal fill ──────────────────────────────────────
+    time.sleep(0.8)
 
-    # ── DIAGNOSTIC: dump field states + page errors before submit ──
-    print("  [diag] Pre-submit field states:")
-    for fid in ["PostingTitle", "PostingBody", "postal_code"]:
+    # ── 7. postal — MUST BE LAST, JS only, NO TAB ───────────────────────────
+    # The postal field (name="postal", id="postal_code") is wiped by CL's JS
+    # whenever blur events fire from other fields. By filling it dead-last
+    # with pure JS (no TAB, no blur), it stays set when we click submit.
+    print("  Filling postal (LAST, JS-only, no TAB)...")
+    _js_set(driver, "[name='postal']", zip_code, label="postal")
+    time.sleep(0.3)
+
+    # ── Verify all critical fields ───────────────────────────────────────────
+    print("  [pre-submit verification]")
+    for fname, fval in [
+        ("PostingTitle", title),
+        ("PostingBody",  description),
+        ("postal",       zip_code),
+        ("FromEMail",    cl_email),
+    ]:
         try:
-            el = driver.find_element(By.ID, fid)
-            val = (el.get_attribute("value") or "").strip()
-            tagname = el.tag_name
-            el_type = el.get_attribute("type") or ""
-            required = el.get_attribute("required") or ""
-            print(f"    {fid}: tag={tagname} type={el_type} required='{required}' len={len(val)} val='{val[:30]}'")
-        except Exception as e:
-            print(f"    {fid}: NOT FOUND ({e})")
+            el = driver.find_element(By.CSS_SELECTOR, f"[name='{fname}']")
+            actual = (el.get_attribute("value") or "").strip()
+            if actual:
+                print(f"    ✓ {fname}: '{actual[:50]}'")
+            else:
+                print(f"    ✗ {fname} EMPTY — emergency re-fill")
+                if fname == "postal":
+                    # Always JS-only for postal
+                    _js_set(driver, f"[name='{fname}']", fval, label=fname)
+                elif fname == "FromEMail" and fval:
+                    _js_set(driver, f"[name='{fname}']", fval, label=fname)
+                else:
+                    _fill_by_keys(driver, f"[name='{fname}']", fval, label=fname,
+                                  send_tab=(fname != "postal"))
+        except Exception:
+            pass  # field may not exist on all forms
 
-    # ── Remove 'required' attributes so browser-native validation can't block ──
-    driver.execute_script("""
-        ['PostingTitle', 'PostingBody', 'postal_code'].forEach(function(id) {
-            var el = document.getElementById(id);
-            if (el) {
-                el.removeAttribute('required');
-                el.removeAttribute('data-required');
-                // Also remove any CSS class that marks it as required
-                el.classList.remove('required');
-            }
-        });
-        // Also remove required from all form fields to ensure no browser validation blocks submit
-        var form = document.getElementById('postingForm');
-        if (form) {
-            var fields = form.querySelectorAll('[required]');
-            fields.forEach(function(f) { f.removeAttribute('required'); });
-        }
-    """)
-
-    # ── Force jQuery to accept all fields as valid ──
-    driver.execute_script("""
-        try {
-            var form = document.getElementById('postingForm');
-            if (!form || !window.jQuery) return;
-            var $form = jQuery(form);
-            var validator = $form.data('validator');
-            if (!validator) return;
-
-            ['PostingTitle', 'PostingBody', 'postal_code'].forEach(function(id) {
-                var el = document.getElementById(id);
-                if (!el) return;
-                // Remove from invalid list
-                if (validator.invalid) delete validator.invalid[el.name || id];
-                if (validator.submitted) delete validator.submitted[el.name || id];
-                // Mark as valid
-                validator.successList = validator.successList || [];
-                if (validator.successList.indexOf(el) === -1) {
-                    validator.successList.push(el);
-                }
-                // Call element validation to update internal state
-                try { validator.element(el); } catch(e) {}
-            });
-        } catch(e) { console.log('validator reset error:', e); }
-    """)
-    time.sleep(0.5)
+    # ── RE-SET postal one final time right before clicking submit ────────────
+    # Some CL pages run a final JS pass when scrolling to bottom — re-set after scroll
+    driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+    time.sleep(0.4)
+    _js_set(driver, "[name='postal']", zip_code, label="postal-final")
+    time.sleep(0.3)
 
     url_before = driver.current_url
 
+    # ── Submit loop ──────────────────────────────────────────────────────────
     for attempt in range(4):
         if attempt > 0:
             if "s=edit" not in driver.current_url:
                 break
             print(f"  ⚠ Still on edit page — retry {attempt}/3")
-            time.sleep(1.0)
+            time.sleep(1.2)
 
-            # Re-fill any cleared fields
-            for fid, fval in [("PostingTitle", title), ("PostingBody", description), ("postal_code", zip_code)]:
+            # Re-fill cleared fields (postal always via JS)
+            for fname, fval in [
+                ("PostingTitle", title),
+                ("PostingBody",  description),
+                ("FromEMail",    cl_email),
+                ("geographic_area", city_name),
+            ]:
                 try:
-                    cur = (driver.find_element(By.ID, fid).get_attribute("value") or "").strip()
-                    if not cur:
-                        print(f"    ↻ {fid} was cleared — re-filling")
-                        _fill_field(driver, fid, fval)
-                except Exception: pass
+                    cur = (driver.find_element(By.CSS_SELECTOR, f"[name='{fname}']")
+                           .get_attribute("value") or "").strip()
+                    if not cur and fval:
+                        print(f"    ↻ {fname} cleared — re-filling")
+                        _fill_by_keys(driver, f"[name='{fname}']", fval, label=fname, send_tab=True)
+                except Exception:
+                    pass
 
-            # Re-run jQuery validator reset
-            driver.execute_script("""
-                try {
-                    var form = document.getElementById('postingForm');
-                    if (!form || !window.jQuery) return;
-                    var validator = jQuery(form).data('validator');
-                    if (!validator) return;
-                    ['PostingTitle', 'PostingBody', 'postal_code'].forEach(function(id) {
-                        var el = document.getElementById(id);
-                        if (!el) return;
-                        if (validator.invalid) delete validator.invalid[el.name || id];
-                        if (validator.submitted) delete validator.submitted[el.name || id];
-                        try { validator.element(el); } catch(e) {}
-                    });
-                } catch(e) {}
-            """)
-            time.sleep(0.5)
+            # Postal always last, always JS
+            _js_set(driver, "[name='postal']", zip_code, label="postal-retry")
+            time.sleep(0.3)
 
-        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        time.sleep(0.5)
-
+        # Click the submit button — do NOT call form.submit() as it skips CL's JS validation
         clicked = False
-        # Strategy 1: Try .go.big-button.submit-button (the actual CL button class)
         for sel in [
             (By.CSS_SELECTOR, "button.go.big-button.submit-button"),
             (By.CSS_SELECTOR, "button.go.submit-button"),
@@ -554,102 +599,57 @@ def fill_listing_details(driver, product: dict):
             (By.XPATH, '//form[@id="postingForm"]//button[@type="submit"]'),
             (By.CSS_SELECTOR, "button.go"),
             (By.CSS_SELECTOR, "button[type='submit']"),
-            (By.CSS_SELECTOR, "input[type='submit']"),
         ]:
             try:
                 btn = WebDriverWait(driver, 4).until(EC.element_to_be_clickable(sel))
                 driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
                 time.sleep(0.3)
+                # Re-set postal right before the actual click — CL sometimes clears it on scroll
+                _js_set(driver, "[name='postal']", zip_code, label="postal-preclick")
+                time.sleep(0.1)
                 btn.click()
-                print(f"  ✓ Submit clicked via {sel[1]} (attempt {attempt+1})")
+                print(f"  ✓ Submit clicked (attempt {attempt+1})")
                 clicked = True
                 time.sleep(5)
                 break
             except Exception:
                 continue
 
-        # Strategy 2: JavaScript form.submit() bypass
-        if not clicked or "s=edit" in driver.current_url:
-            try:
-                driver.execute_script("""
-                    var form = document.getElementById('postingForm');
-                    if (form) form.submit();
-                """)
-                print(f"  ✓ form.submit() fired (attempt {attempt+1})")
-                clicked = True
-                time.sleep(5)
-            except Exception as e:
-                print(f"  ✗ form.submit() failed: {e}")
-
         if not clicked:
-            print("  ✗ No submit method worked")
+            print("  ✗ No submit button found")
             return
 
         if "s=edit" not in driver.current_url:
             break
 
+    # ── Post-submit diagnostics ──────────────────────────────────────────────
     if "s=edit" in driver.current_url:
         print("  ✗ Still on edit page after all retries — giving up")
-        # DIAGNOSTIC: dump validation errors + relevant HTML
         try:
-            errs = [e.text.strip() for e in driver.find_elements(
-                By.CSS_SELECTOR, ".notices li, .err, .error, span.notice, .alert"
-            ) if e.text.strip()]
-            if errs:
-                print("  [validation errors]:")
-                for et in set(errs):
-                    print(f"    → {et[:150]}")
-        except Exception:
-            pass
-
-        # Dump the actual form HTML so we can see what fields CL is generating
-        try:
-            form_html = driver.execute_script("""
+            form_dump = driver.execute_script("""
                 var form = document.getElementById('postingForm');
-                if (!form) return 'NO FORM FOUND';
-                // Just get input/textarea elements with their current values
+                if (!form) return 'NO FORM';
                 var result = '';
-                var fields = form.querySelectorAll('input, textarea, select');
-                fields.forEach(function(f) {
-                    result += f.tagName + '#' + (f.id||'?') + 
-                              ' name=' + (f.name||'?') + 
-                              ' type=' + (f.type||'?') + 
-                              ' required=' + (f.required||'') +
-                              ' val=[' + (f.value||'').substring(0,40) + ']\\n';
+                form.querySelectorAll('input,textarea,select').forEach(function(f) {
+                    if (f.name) result += f.tagName+'#'+(f.id||'?')+' name='+f.name+
+                              ' type='+(f.type||'?')+' required='+(f.required||'')+
+                              ' val=['+(f.value||'').substring(0,40)+']\\n';
                 });
                 return result;
             """)
-            print("  [form fields dump]:")
-            print(form_html)
-        except Exception as e:
-            print(f"  [form dump failed: {e}]")
+            print("  [form fields dump]:\n" + form_dump)
+        except Exception:
+            pass
 
-        # Also dump jQuery validator state
-        try:
-            vstate = driver.execute_script("""
-                var form = document.getElementById('postingForm');
-                if (!form || !window.jQuery) return 'no jQuery';
-                var v = jQuery(form).data('validator');
-                if (!v) return 'no validator';
-                return JSON.stringify({
-                    invalid: v.invalid,
-                    submitted: v.submitted,
-                    settings_rules: Object.keys(v.settings && v.settings.rules || {})
-                }, null, 2);
-            """)
-            print("  [jQuery validator state]:", vstate[:1000])
-        except Exception as e:
-            print(f"  [validator dump failed: {e}]")
-
-    # Check errors
+    # Validation error messages
     try:
         errs = [e.text.strip() for e in driver.find_elements(
-            By.CSS_SELECTOR, ".notices li, .err, .error, span.notice"
-        ) if e.text.strip() and len(e.text.strip()) > 5]
+            By.CSS_SELECTOR, ".notices li, .err, .error, span.notice, .warning"
+        ) if e.text.strip() and len(e.text.strip()) > 3]
         if errs:
             print("  [validation errors]:")
-            for et in set(errs):
-                print(f"    → {et[:100]}")
+            for et in sorted(set(errs)):
+                print(f"    → {et[:120]}")
     except Exception:
         pass
 
@@ -724,7 +724,6 @@ def publish_listing(driver, ad_name, product):
         return False
 
 def post_product(driver, ad_name, product):
-    product_title = product.get("title") or product.get("name", "No Title")
     post_url = "https://post.craigslist.org/c/sss"
     print(f"  Navigating to: {post_url}")
     driver.get(post_url)
@@ -763,7 +762,7 @@ def post_product(driver, ad_name, product):
                 break
         if not city_clicked and menu_items:
             driver.execute_script("arguments[0].click();", menu_items[0])
-            print(f"  ⚠ Fallback city selected")
+            print("  ⚠ Fallback city selected")
         human_delay(2, 3)
         continue_btn = WebDriverWait(driver, 10).until(
             EC.element_to_be_clickable((By.CSS_SELECTOR,
@@ -774,7 +773,7 @@ def post_product(driver, ad_name, product):
             WebDriverWait(driver, 12).until(lambda d: "s=area" not in d.current_url)
             print(f"  ✓ Left area page → {driver.current_url}")
         except TimeoutException:
-            print(f"  ⚠ Still on area page after 12s wait")
+            print("  ⚠ Still on area page after 12s wait")
         handle_captcha_if_present(driver)
     except Exception as e:
         print(f"  City selection error: {e}")
@@ -853,8 +852,8 @@ def post_product(driver, ad_name, product):
             driver.execute_script("arguments[0].click();", inp)
             cat_clicked = True
             print(f"  ✓ Selected category via radio value={ul_value}")
-        except Exception as e:
-            print(f"  Category radio failed: {e}")
+        except Exception:
+            pass
 
     if not cat_clicked:
         try:
