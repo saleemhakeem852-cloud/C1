@@ -752,6 +752,45 @@ def fill_zip_cl(driver, zip_code: str):
     except Exception as e:
         print(f"  ⚠ fill_zip_cl failed: {e}")
 
+def _type_into_field(driver, el, text: str):
+    """Type text into a field using TAB-commit pattern CL validators require.
+    
+    CL's form uses jQuery Validate which marks fields as 'valid' only when:
+    1. The field receives focus
+    2. Characters are typed (keydown/keypress/keyup per char)
+    3. The field loses focus via TAB or click-away
+    
+    This function does exactly that — no synthetic events needed.
+    """
+    from selenium.webdriver.common.keys import Keys
+    
+    # Click to focus
+    try:
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+        time.sleep(0.2)
+        el.click()
+        time.sleep(0.3)
+    except Exception:
+        pass
+    
+    # Select all + delete existing content
+    el.send_keys(Keys.CONTROL + "a")
+    time.sleep(0.05)
+    el.send_keys(Keys.DELETE)
+    time.sleep(0.1)
+    
+    # Type every character individually (real keystroke events)
+    for ch in text:
+        el.send_keys(ch)
+        time.sleep(random.uniform(0.04, 0.09))
+    
+    time.sleep(0.2)
+    
+    # TAB away — this is what triggers CL jQuery Validate to mark field as valid
+    el.send_keys(Keys.TAB)
+    time.sleep(0.4)
+
+
 def fill_listing_details(driver, product: dict):
     # 1. Wait for form — if it never appears, return silently (don't crash)
     try:
@@ -764,7 +803,6 @@ def fill_listing_details(driver, product: dict):
 
     handle_captcha_if_present(driver)
     # Wait for ALL key fields to be present before touching anything.
-    # CL dynamically injects fields via JS — touching them too early = silent loss.
     for fid in ["PostingTitle", "PostingBody", "postal_code"]:
         try:
             WebDriverWait(driver, 10).until(
@@ -772,7 +810,7 @@ def fill_listing_details(driver, product: dict):
             )
         except TimeoutException:
             print(f"  ⚠ Field '{fid}' never appeared — CL may have different IDs")
-    time.sleep(2.5)  # extra settle for CL jQuery to attach all validators
+    time.sleep(3.0)  # wait for CL jQuery Validate to attach to all fields
 
     # 2. Resolve values
     title = product.get("title") or product.get("name") or "Quality Item For Sale"
@@ -802,66 +840,76 @@ def fill_listing_details(driver, product: dict):
     ).strip()
     city_name = CL_CITY.replace("-", " ").title()
 
-    # 3. Use selenium_fill (real keystrokes) for ALL validated fields
-    # js_fill alone is not enough — CL jQuery requires actual keystroke events
+    from selenium.webdriver.common.keys import Keys
+
+    # 3. Fill all fields using TAB-commit pattern
+    # CL jQuery Validate marks a field valid ONLY when it loses focus via Tab/click-away.
+    # Synthetic events (dispatchEvent) do NOT trigger jQuery Validate's focusout handler.
+    # Solution: type into each field then press TAB — exactly what a real user does.
+
     print("  Filling title...")
-    selenium_fill(driver, "PostingTitle", title)
-    time.sleep(0.5)
+    try:
+        title_el = WebDriverWait(driver, 8).until(
+            EC.presence_of_element_located((By.ID, "PostingTitle"))
+        )
+        _type_into_field(driver, title_el, title)
+        print(f"  ✓ title: '{title[:40]}'")
+    except Exception as e:
+        print(f"  ⚠ title fill failed: {e}")
 
     print("  Filling description...")
-    selenium_fill(driver, "PostingBody", description)
-    time.sleep(0.5)
+    try:
+        body_el = WebDriverWait(driver, 8).until(
+            EC.presence_of_element_located((By.ID, "PostingBody"))
+        )
+        _type_into_field(driver, body_el, description)
+        print(f"  ✓ description: {len(description)} chars")
+    except Exception as e:
+        print(f"  ⚠ description fill failed: {e}")
 
-    # city/area fields — js_fill is fine here (not validated)
+    # city/area fields — not validated, JS fill is fine
     js_fill(driver, "geographic_area", city_name)
     js_fill(driver, "city", city_name)
     time.sleep(0.3)
 
-    # ZIP — real keystrokes required for CL validation
     print("  Filling zip...")
-    fill_zip_cl(driver, zip_code)
+    try:
+        zip_el = WebDriverWait(driver, 8).until(
+            EC.presence_of_element_located((By.ID, "postal_code"))
+        )
+        _type_into_field(driver, zip_el, zip_code)
+        print(f"  ✓ zip: {zip_code}")
+    except Exception as e:
+        print(f"  ⚠ zip fill failed: {e}")
 
-    # Price — try by ID with real keystrokes, then CSS fallback
+    # Price
     price_filled = False
     for pid in ["AskingPrice", "AskPrice", "price", "Price", "asking_price", "AskPriceText"]:
         try:
-            driver.find_element(By.ID, pid)
-            selenium_fill(driver, pid, price)
-            print(f"  ✓ Price: {price}")
-            price_filled = True
-            break
+            pi = driver.find_element(By.ID, pid)
+            if pi.is_displayed():
+                _type_into_field(driver, pi, price)
+                print(f"  ✓ Price: {price}")
+                price_filled = True
+                break
         except Exception:
             continue
     if not price_filled:
-        # CSS fallback — real keystrokes via ActionChains
         try:
-            from selenium.webdriver.common.keys import Keys
             price_inputs = driver.find_elements(By.CSS_SELECTOR,
                 "input[id*='rice'], input[name*='rice'], input[id*='ask'], input[name*='ask']")
             for pi in price_inputs:
                 if pi.is_displayed():
-                    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", pi)
-                    pi.click()
-                    time.sleep(0.1)
-                    pi.send_keys(Keys.CONTROL + "a")
-                    pi.send_keys(Keys.DELETE)
-                    pi.clear()
-                    for ch in price:
-                        pi.send_keys(ch)
-                        time.sleep(0.04)
-                    driver.execute_script(
-                        "arguments[0].dispatchEvent(new Event('change',{bubbles:true}));"
-                        "arguments[0].dispatchEvent(new Event('blur',{bubbles:true}));", pi)
+                    _type_into_field(driver, pi, price)
                     print(f"  ✓ Price filled via CSS fallback: {price}")
                     price_filled = True
                     break
         except Exception as pe:
-            print(f"  ⚠ Price CSS fallback failed: {pe}")
+            print(f"  ⚠ Price fallback failed: {pe}")
     if not price_filled:
         print("  ⚠ Price field not found — posting without price")
 
-    # Email — check if field exists first, never crash if absent
-    email_filled = False
+    # Email
     try:
         ef = WebDriverWait(driver, 4).until(
             EC.presence_of_element_located((By.ID, "FromEMail"))
@@ -869,16 +917,13 @@ def fill_listing_details(driver, product: dict):
         cur_val = (ef.get_attribute("value") or "").strip()
         if cur_val:
             print(f"  ✓ Email already in field: {cur_val}")
-            email_filled = True
         elif cl_email:
-            selenium_fill(driver, "FromEMail", cl_email)
+            _type_into_field(driver, ef, cl_email)
             print(f"  ✓ Email: {cl_email}")
-            email_filled = True
         else:
             print("  ✗ CL_EMAIL env var not set AND field is empty — will fail")
     except TimeoutException:
         print("  [info] FromEMail absent — CL using session email (OK if logged in)")
-        email_filled = True  # session auth covers it
 
     # Condition dropdown
     try:
@@ -889,71 +934,37 @@ def fill_listing_details(driver, product: dict):
     except Exception:
         pass
 
-    time.sleep(1)
+    time.sleep(1.5)
 
-    # Pre-submit verification — confirm all critical fields have values
-    # IMPORTANT: PostingBody is a <textarea> — must check BOTH .value and textContent
-    time.sleep(0.8)
-
-    def _get_field_value(el):
-        """Return whichever of .value or .textContent is non-empty."""
-        v = (el.get_attribute("value") or "").strip()
-        if v:
-            return v
-        return (driver.execute_script(
-            "return arguments[0].textContent || '';", el) or "").strip()
-
+    # Pre-submit verification
     try:
-        zip_el = driver.find_element(By.ID, "postal_code")
-        zip_val = _get_field_value(zip_el)
-        if not zip_val or zip_val != zip_code:
-            print(f"  ✗ postal_code mismatch (got '{zip_val}', expected '{zip_code}') — re-filling")
-            fill_zip_cl(driver, zip_code)
-        else:
-            print(f"  ✓ postal_code confirmed: '{zip_val}'")
+        tv = (driver.find_element(By.ID, "PostingTitle").get_attribute("value") or "").strip()
+        bv = (driver.find_element(By.ID, "PostingBody").get_attribute("value") or "").strip()
+        zv = (driver.find_element(By.ID, "postal_code").get_attribute("value") or "").strip()
+        print(f"  ✓ title confirmed: '{tv[:40]}...'")
+        print(f"  ✓ description confirmed ({len(bv)} chars)")
+        print(f"  ✓ postal_code confirmed: '{zv}'")
+        # Re-fill any that are empty
+        if not tv:
+            print("  ✗ title EMPTY — re-filling")
+            _type_into_field(driver, driver.find_element(By.ID, "PostingTitle"), title)
+        if not bv:
+            print("  ✗ description EMPTY — re-filling")
+            _type_into_field(driver, driver.find_element(By.ID, "PostingBody"), description)
+        if not zv:
+            print("  ✗ zip EMPTY — re-filling")
+            _type_into_field(driver, driver.find_element(By.ID, "postal_code"), zip_code)
+    except Exception as e:
+        print(f"  ⚠ pre-submit check error: {e}")
+
+    # 4. Click Continue — use TAB to leave last field, then click button
+    # TAB ensures the last active field commits its value before submit
+    try:
+        driver.switch_to.active_element.send_keys(Keys.TAB)
+        time.sleep(0.3)
     except Exception:
         pass
 
-    try:
-        title_el = driver.find_element(By.ID, "PostingTitle")
-        title_val = _get_field_value(title_el)
-        if not title_val:
-            print(f"  ✗ PostingTitle is EMPTY — re-filling")
-            selenium_fill(driver, "PostingTitle", title)
-            time.sleep(0.5)
-        else:
-            print(f"  ✓ title confirmed: '{title_val[:40]}...'")
-    except Exception:
-        pass
-
-    try:
-        body_el = driver.find_element(By.ID, "PostingBody")
-        body_val = _get_field_value(body_el)
-        if not body_val:
-            print(f"  ✗ PostingBody is EMPTY — re-filling")
-            selenium_fill(driver, "PostingBody", description)
-            time.sleep(0.5)
-        else:
-            print(f"  ✓ description confirmed ({len(body_val)} chars)")
-    except Exception:
-        pass
-
-    # Re-fire jQuery validation on ALL fields right before clicking Continue.
-    # This is the key fix: CL's validator runs on blur/change; we force it here.
-    time.sleep(0.5)
-    driver.execute_script("""
-        ['PostingTitle', 'PostingBody', 'postal_code'].forEach(function(fid) {
-            var el = document.getElementById(fid);
-            if (!el) return;
-            el.focus();
-            el.dispatchEvent(new Event('input',  {bubbles:true, cancelable:true}));
-            el.dispatchEvent(new Event('change', {bubbles:true, cancelable:true}));
-            el.dispatchEvent(new Event('blur',   {bubbles:true, cancelable:true}));
-        });
-    """)
-    time.sleep(0.5)
-
-    # 4. Click the continue button
     driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
     time.sleep(0.5)
 
@@ -967,24 +978,9 @@ def fill_listing_details(driver, product: dict):
             )
             driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
             time.sleep(0.3)
-            # CRITICAL: blur ALL fields first so CL validators fire before submit
-            driver.execute_script("""
-                ['PostingTitle','PostingBody','postal_code'].forEach(function(fid){
-                    var el = document.getElementById(fid);
-                    if (!el) return;
-                    el.blur();
-                    el.dispatchEvent(new Event('blur',{bubbles:true,cancelable:true}));
-                    el.dispatchEvent(new Event('change',{bubbles:true,cancelable:true}));
-                });
-                // Move focus away from all fields before clicking submit
-                document.activeElement && document.activeElement.blur();
-            """)
-            time.sleep(0.5)
-            # Use ActionChains real click — not JS click — so browser fires proper events
-            try:
-                ActionChains(driver).move_to_element(btn).pause(0.2).click().perform()
-            except Exception:
-                driver.execute_script("arguments[0].click();", btn)
+            # Real ActionChains click — moves mouse to button and clicks
+            # This fires proper mouseover/mousedown/mouseup/click sequence
+            ActionChains(driver).move_to_element(btn).pause(0.3).click().perform()
             print(f"  ✓ Continue clicked via: {sel}")
             clicked = True
             time.sleep(3)
