@@ -288,9 +288,12 @@ def make_driver(headless: bool = False) -> webdriver.Chrome:
         }
     } if SELENIUMWIRE_AVAILABLE else {}
 
-    # --- Use a FRESH temp dir every run to avoid stale lock files from prior crashes ---
-    fresh_profile = tempfile.mkdtemp(prefix="clblast_chrome_")
-    options.add_argument(f"--user-data-dir={fresh_profile}")
+    # --- Persistent profile so session cookies survive between runs ---
+    # (Fresh temp dir was wiping cookies every run, forcing re-login each time)
+    profile_dir = os.environ.get("CHROME_PROFILE_DIR", "/tmp/clblast_chrome_profile")
+    os.makedirs(profile_dir, exist_ok=True)
+    options.add_argument(f"--user-data-dir={profile_dir}")
+    print(f"  [driver] Chrome profile: {profile_dir}")
 
     ua_pool = [
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -1602,9 +1605,9 @@ def main():
     print(f"[config] CL_PASSWORD set: {'YES (' + str(len(cl_password)) + ' chars)' if cl_password else 'NO ← PROBLEM'}")
     print(f"[config] CL_CITY: {os.environ.get('CL_CITY', 'NOT SET')}")
 
-    if not cl_email or not cl_password:
-        print("✗ FATAL: CL_EMAIL and/or CL_PASSWORD not set in Railway environment variables")
-        print("  Go to Railway dashboard → your service → Variables → add them")
+    if not cl_email:
+        print("✗ FATAL: CL_EMAIL not set in Railway environment variables")
+        print("  Go to Railway dashboard → your service → Variables → add it")
         return
 
     # Accept credentials from env vars (set by server.py) or fall back to interactive
@@ -1617,9 +1620,43 @@ def main():
 
     driver = make_driver()
 
-    if not craigslist_login(driver, email, password):
-        driver.quit()
-        return
+    COOKIE_FILE = os.environ.get("COOKIE_FILE", "/tmp/clblast_cookies.json")
+
+    # Try to restore saved session cookies before attempting login
+    already_logged_in = False
+    if os.path.exists(COOKIE_FILE):
+        try:
+            driver.get("https://accounts.craigslist.org")
+            time.sleep(2)
+            with open(COOKIE_FILE) as f:
+                cookies = json.load(f)
+            for cookie in cookies:
+                try:
+                    driver.add_cookie(cookie)
+                except Exception:
+                    pass
+            driver.refresh()
+            time.sleep(3)
+            if "login" not in driver.current_url.lower():
+                print("  [login] Session restored from saved cookies ✓")
+                already_logged_in = True
+            else:
+                print("  [login] Saved cookies expired — logging in fresh")
+        except Exception as e:
+            print(f"  [login] Cookie restore failed: {e}")
+
+    if not already_logged_in:
+        if not craigslist_login(driver, email, password):
+            driver.quit()
+            return
+        # Save cookies so next run skips login
+        try:
+            cookies = driver.get_cookies()
+            with open(COOKIE_FILE, "w") as f:
+                json.dump(cookies, f)
+            print(f"  [login] Session cookies saved to {COOKIE_FILE}")
+        except Exception as e:
+            print(f"  [login] Could not save cookies: {e}")
 
     # Read PRODUCTS_FILE env var so server.py can pass a filtered subset
     products_file = os.environ.get("PRODUCTS_FILE", "products.json")
