@@ -530,9 +530,7 @@ def js_fill(driver, field_id: str, value: str):
 
 
 def clipboard_fill(driver, field_id: str, value: str) -> bool:
-    """Fill a field using JS native setter (works on Railway/headless) + full event chain.
-    Pyperclip paste is attempted as a bonus but never required."""
-    from selenium.webdriver.common.keys import Keys
+    """Fill a field using synthetic character-by-character JS KeyboardEvent injection."""
     try:
         el = WebDriverWait(driver, 8).until(
             EC.presence_of_element_located((By.ID, field_id))
@@ -540,54 +538,44 @@ def clipboard_fill(driver, field_id: str, value: str) -> bool:
         driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
         time.sleep(0.3)
 
-        # PRIMARY: JS native setter — bypasses framework value caching, works headless
+        # Run JS keyboard event simulation
         driver.execute_script("""
-            var el = arguments[0];
-            var val = arguments[1];
-            el.focus();
-            var isTextarea = el.tagName === 'TEXTAREA';
-            var proto = isTextarea ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
-            var descriptor = Object.getOwnPropertyDescriptor(proto, 'value');
-            if (descriptor && descriptor.set) {
-                descriptor.set.call(el, val);
-            } else {
-                el.value = val;
+            var el = document.getElementById(arguments[0]);
+            if (el) {
+                el.focus();
+                el.value = '';
+                var val = arguments[1];
+                var chars = val.split('');
+                chars.forEach(function(ch) {
+                    var code = ch.charCodeAt(0);
+                    el.dispatchEvent(new KeyboardEvent('keydown',  {bubbles:true, cancelable:true, key:ch, keyCode:code, charCode:code, which:code}));
+                    el.dispatchEvent(new KeyboardEvent('keypress', {bubbles:true, cancelable:true, key:ch, keyCode:code, charCode:code, which:code}));
+                    el.value += ch;
+                    el.dispatchEvent(new InputEvent('input',       {bubbles:true, cancelable:true, data:ch, inputType:'insertText'}));
+                    el.dispatchEvent(new KeyboardEvent('keyup',    {bubbles:true, cancelable:true, key:ch, keyCode:code, charCode:code, which:code}));
+                });
+                el.dispatchEvent(new Event('change', {bubbles:true}));
+                el.dispatchEvent(new Event('blur',   {bubbles:true}));
             }
-            ['focus','click','keydown','keypress','input','keyup','change','blur'].forEach(function(evtName) {
-                var evt;
-                if (evtName === 'input') {
-                    evt = new InputEvent('input', {bubbles:true, cancelable:true, data:val});
-                } else if (['keydown','keypress','keyup'].indexOf(evtName) > -1) {
-                    evt = new KeyboardEvent(evtName, {bubbles:true, cancelable:true});
-                } else {
-                    evt = new Event(evtName, {bubbles:true, cancelable:true});
-                }
-                el.dispatchEvent(evt);
-            });
-            el.blur();
-        """, el, value)
+        """, field_id, value)
         time.sleep(0.4)
 
         # VERIFY: check the value actually landed
-        actual = (el.get_attribute("value") or "").strip()
-        if actual == value.strip():
-            return True
-
-        # FALLBACK: ActionChains character-by-character typing
-        try:
+        actual = el.get_attribute("value")
+        if actual != value:
+            # Fallback: Selenium send_keys character by character with 0.03s delay
             el.click()
-            time.sleep(0.2)
-            el.send_keys(Keys.CONTROL + "a")
-            el.send_keys(Keys.DELETE)
+            time.sleep(0.1)
+            el.clear()
             for ch in value:
                 el.send_keys(ch)
-                time.sleep(0.02)
-            driver.execute_script(
-                "arguments[0].dispatchEvent(new Event('change',{bubbles:true}));"
-                "arguments[0].dispatchEvent(new Event('blur',{bubbles:true}));", el)
-            time.sleep(0.3)
-        except Exception:
-            pass
+                time.sleep(0.03)
+            driver.execute_script("""
+                var el = arguments[0];
+                el.dispatchEvent(new Event('change', {bubbles:true}));
+                el.dispatchEvent(new Event('blur',   {bubbles:true}));
+            """, el)
+            time.sleep(0.2)
 
         return True
     except Exception as e:
