@@ -283,7 +283,8 @@ def make_driver(headless: bool = False) -> webdriver.Chrome:
         "proxy": {
             "http":  "http://spa1pl920i:dBByddd_WD08p4hk7f@gate.decodo.com:10004",
             "https": "http://spa1pl920i:dBByddd_WD08p4hk7f@gate.decodo.com:10004",
-            "no_proxy": "localhost,127.0.0.1",
+            # Bypass proxy for login — proxy IP triggers CL account security
+            "no_proxy": "localhost,127.0.0.1,accounts.craigslist.org",
         }
     } if SELENIUMWIRE_AVAILABLE else {}
 
@@ -473,9 +474,9 @@ def handle_captcha_if_present(driver):
 # LOGIN
 # ─────────────────────────────────────────────────────────────
 def craigslist_login(driver, email: str, password: str) -> bool:
-    print(f"  [login] Email: '{email[:3]}***', Password length: {len(password)}")
-    if not email or not password:
-        print("  ✗ Empty credentials — set CL_EMAIL and CL_PASSWORD in Railway")
+    print(f"  [login] Email: '{email[:3]}***'")
+    if not email:
+        print("  \u2717 Empty email \u2014 set CL_EMAIL in Railway")
         return False
 
     driver.get("https://accounts.craigslist.org/login")
@@ -486,59 +487,46 @@ def craigslist_login(driver, email: str, password: str) -> bool:
         email_field = WebDriverWait(driver, 15).until(
             EC.presence_of_element_located((By.ID, "inputEmailHandle"))
         )
-        # Scroll to field, click it, clear, type
-        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", email_field)
-        time.sleep(0.5)
-        email_field.click()
-        time.sleep(0.3)
-        email_field.clear()
-        time.sleep(0.2)
-        email_field.send_keys(email)
-        time.sleep(0.5)
+        send_keys_slow(driver, email_field, email)
+        human_delay()
 
-        pw_field = driver.find_element(By.ID, "inputPassword")
-        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", pw_field)
-        time.sleep(0.3)
-        pw_field.click()
-        time.sleep(0.2)
-        pw_field.clear()
-        time.sleep(0.2)
-        pw_field.send_keys(password)
-        time.sleep(1)
+        # Only fill password if one is set and it's not a dummy
+        if password and password != "0000":
+            try:
+                pw_field = driver.find_element(By.ID, "inputPassword")
+                send_keys_slow(driver, pw_field, password)
+                human_delay()
+                print(f"  [login] Password filled ({len(password)} chars)")
+            except NoSuchElementException:
+                print("  [login] No password field found \u2014 email-only login")
+        else:
+            print("  [login] Skipping password (not set or dummy)")
 
-        # Verify what was actually typed
-        typed_email = email_field.get_attribute("value")
-        typed_pw_len = len(pw_field.get_attribute("value") or "")
-        print(f"  [login] Typed email: '{typed_email}', password chars typed: {typed_pw_len}")
-
-        # Submit via JS click to avoid interception
-        submit_btn = driver.find_element(By.CSS_SELECTOR, "button[type='submit']")
-        driver.execute_script("arguments[0].click();", submit_btn)
+        # Submit
+        btn = driver.find_element(By.CSS_SELECTOR, "button[type='submit']")
+        safe_click(driver, btn)
         time.sleep(4)
 
         print(f"  [login] Post-submit URL: {driver.current_url}")
         print(f"  [login] Post-submit title: {driver.title}")
 
-        # Check if login succeeded
         if "login" in driver.current_url.lower():
             try:
                 err_els = driver.find_elements(By.CSS_SELECTOR, ".err, .error, .notice, #error")
                 for el in err_els:
                     if el.text.strip():
-                        print(f"  [login] CL error message: '{el.text.strip()}'")
+                        print(f"  [login] CL error: '{el.text.strip()}'")
             except Exception:
                 pass
-            print("  ✗ Login failed — still on login page")
-            print("  Check: 1) CL_EMAIL and CL_PASSWORD Railway env vars are correct")
-            print("  Check: 2) Account is not locked at https://accounts.craigslist.org")
+            print("  \u2717 Login failed \u2014 still on login page")
             return False
 
         handle_captcha_if_present(driver)
-        print("  ✓ Logged in to Craigslist")
+        print("  \u2713 Logged in to Craigslist")
         return True
 
     except TimeoutException as e:
-        print(f"  ✗ Login form not found: {e}")
+        print(f"  \u2717 Login form not found: {e}")
         return False
 
 
