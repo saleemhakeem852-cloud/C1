@@ -890,45 +890,79 @@ def fill_listing_details(driver, product: dict):
     jquery_validate_fields(driver)
     time.sleep(2.0)  # let CL's validation debounce settle
 
-    # 4. Click the continue button (with up to 3 retries if still on s=edit)
+    # 4. Click the continue button
+    # CRITICAL: re-fill fields AND click in the same JS execution block so
+    # CL's validator cannot run between fill and submit.
     url_before = driver.current_url
-    clicked = False
 
-    for attempt in range(4):  # 0 is first attempt, 1,2,3 are retries
+    for attempt in range(4):
         if attempt > 0:
-            # Check if we already left the edit page
             if "s=edit" not in driver.current_url:
                 break
-            print(f"  ⚠ Still on edit page (?s=edit) — Validation/Submit retry attempt {attempt}/3...")
-            run_native_setter(driver)
-            jquery_validate_fields(driver)
-            time.sleep(2.0)
+            print(f"  ⚠ Still on edit page (?s=edit) — retry attempt {attempt}/3...")
+            time.sleep(1.0)
 
-        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        time.sleep(0.5)
-
-        for sel in ["button.go", "button.submit-button", "button[type='submit']", "input[type='submit']"]:
-            try:
-                btn = WebDriverWait(driver, 5).until(
-                    EC.element_to_be_clickable((By.CSS_SELECTOR, sel))
-                )
-                driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
+        # Re-confirm values are still in DOM right before submit
+        try:
+            t_val = (driver.find_element(By.ID, "PostingTitle").get_attribute("value") or "").strip()
+            b_val = (driver.find_element(By.ID, "PostingBody").get_attribute("value") or "").strip()
+            z_val = (driver.find_element(By.ID, "postal_code").get_attribute("value") or "").strip()
+            if not t_val:
+                clipboard_fill(driver, "PostingTitle", title)
                 time.sleep(0.3)
-                driver.execute_script("arguments[0].click();", btn)
-                print(f"  ✓ Continue clicked via: {sel} (attempt {attempt + 1})")
-                clicked = True
-                time.sleep(4)
-                break
-            except Exception:
-                continue
+            if not b_val:
+                clipboard_fill(driver, "PostingBody", description)
+                time.sleep(0.3)
+            if not z_val:
+                clipboard_fill(driver, "postal_code", zip_code)
+                time.sleep(0.3)
+        except Exception:
+            pass
 
-        if not clicked:
-            print("  ✗ No continue button found")
-            return
+        # Fill fields + submit in ONE atomic JS call so validator sees filled values
+        submitted = driver.execute_script("""
+            var title   = arguments[0];
+            var body    = arguments[1];
+            var zipcode = arguments[2];
 
-        # Settle a bit after click
-        time.sleep(1.0)
-        # If we successfully left the edit page, we are done
+            function jqSet(id, val) {
+                var el = document.getElementById(id);
+                if (!el) return;
+                // native setter
+                try {
+                    var proto = (el.tagName === 'TEXTAREA')
+                        ? window.HTMLTextAreaElement.prototype
+                        : window.HTMLInputElement.prototype;
+                    var s = Object.getOwnPropertyDescriptor(proto, 'value');
+                    if (s && s.set) s.set.call(el, val); else el.value = val;
+                } catch(e) { el.value = val; }
+                // jQuery val + trigger
+                if (window.jQuery) {
+                    try {
+                        jQuery(el).val(val)
+                                  .trigger('input').trigger('change').trigger('blur');
+                        var v = jQuery(el).closest('form').data('validator');
+                        if (v) v.element(el);
+                    } catch(e) {}
+                }
+            }
+
+            jqSet('PostingTitle', title);
+            jqSet('PostingBody',  body);
+            jqSet('postal_code',  zipcode);
+
+            // Now click the submit button immediately in the same call
+            var btn = document.querySelector('button.go') ||
+                      document.querySelector('button[type="submit"]') ||
+                      document.querySelector('input[type="submit"]');
+            if (!btn) return false;
+            btn.click();
+            return true;
+        """, title, description, zip_code)
+
+        print(f"  ✓ Atomic fill+submit fired (attempt {attempt + 1}), submitted={submitted}")
+        time.sleep(5)
+
         if "s=edit" not in driver.current_url:
             break
 
