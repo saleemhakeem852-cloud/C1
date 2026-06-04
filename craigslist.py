@@ -1504,6 +1504,7 @@ def _update_ad_status(ad_name: str):
 # MAIN
 # ─────────────────────────────────────────────────────────────
 def main():
+    global CL_CITY
     # Accept credentials from env vars (set by server.py) or fall back to interactive
     email    = os.environ.get("CL_EMAIL")    or input("Enter Craigslist email: ").strip()
     password = os.environ.get("CL_PASSWORD") or input("Enter Craigslist password: ").strip()
