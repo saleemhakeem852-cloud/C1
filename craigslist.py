@@ -460,30 +460,60 @@ def handle_captcha_if_present(driver):
 # LOGIN
 # ─────────────────────────────────────────────────────────────
 def craigslist_login(driver, email: str, password: str) -> bool:
+    print("[login] Navigating to CL login page...")
     driver.get("https://accounts.craigslist.org/login")
-    time.sleep(5)  # wait for proxy connection to stabilize
-    human_delay(2, 4)
+    time.sleep(6)
+    print(f"[login] Page title: {driver.title}")
+    print(f"[login] URL: {driver.current_url}")
     handle_captcha_if_present(driver)
 
     try:
-        email_field = WebDriverWait(driver, 15).until(
+        email_field = WebDriverWait(driver, 20).until(
             EC.presence_of_element_located((By.ID, "inputEmailHandle"))
         )
+        print("[login] Email field found, typing...")
         send_keys_slow(driver, email_field, email)
         human_delay()
 
         pw_field = driver.find_element(By.ID, "inputPassword")
+        print("[login] Password field found, typing...")
         send_keys_slow(driver, pw_field, password)
         human_delay()
 
         btn = driver.find_element(By.CSS_SELECTOR, "button[type='submit']")
+        print("[login] Clicking submit...")
         safe_click(driver, btn)
+        time.sleep(3)
+        print(f"[login] Post-submit URL: {driver.current_url}")
+        print(f"[login] Post-submit title: {driver.title}")
 
-        WebDriverWait(driver, 15).until(EC.url_contains("craigslist.org"))
+        WebDriverWait(driver, 20).until(EC.url_contains("craigslist.org"))
         handle_captcha_if_present(driver)
+
+        # Verify we are actually logged in, not back on login page
+        if "login" in driver.current_url.lower():
+            print("[login] Still on login page — wrong credentials or CL blocked login")
+            # Print any error messages on page
+            try:
+                errs = driver.find_elements(By.CSS_SELECTOR, ".err, .error, .alert, #errs")
+                for e in errs:
+                    if e.text.strip():
+                        print(f"[login] CL error: {e.text.strip()}")
+            except Exception:
+                pass
+            return False
+
         print("Logged in to Craigslist ✓")
         return True
     except TimeoutException:
+        print(f"[login] Timed out. Current URL: {driver.current_url}")
+        print(f"[login] Page title: {driver.title}")
+        # Check if proxy is working at all
+        try:
+            body = driver.find_element(By.TAG_NAME, "body").text[:300]
+            print(f"[login] Page body: {body}")
+        except Exception:
+            pass
         print("Login failed.")
         return False
 
