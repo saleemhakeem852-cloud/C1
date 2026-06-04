@@ -270,6 +270,7 @@ def make_driver(headless: bool = False) -> webdriver.Chrome:
     # --- Anti-detection (critical) ---
     options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_argument("--proxy-server=http://spa1pl920i:dBByddd_WD08p4hk7f@gate.decodo.com:10004")
+    options.add_argument("--accept-lang=en-US,en;q=0.9")
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option("useAutomationExtension", False)
 
@@ -460,6 +461,7 @@ def handle_captcha_if_present(driver):
 # ─────────────────────────────────────────────────────────────
 def craigslist_login(driver, email: str, password: str) -> bool:
     driver.get("https://accounts.craigslist.org/login")
+    time.sleep(5)  # wait for proxy connection to stabilize
     human_delay(2, 4)
     handle_captcha_if_present(driver)
 
