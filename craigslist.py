@@ -19,6 +19,7 @@ from selenium.webdriver.support.ui import WebDriverWait, Select
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
 from selenium.webdriver.common.action_chains import ActionChains
+from selenium.webdriver.common.keys import Keys
 
 try:
     from twocaptcha import TwoCaptcha
@@ -127,31 +128,25 @@ CATEGORY_MAPPING = {
 
 def get_category_ul_value(category_name: str):
     key = category_name.lower().strip().replace(" ", "")
-    # Try exact match first (with spaces stripped for compound words like 'homeandappliances')
     for k in CATEGORY_MAPPING:
         if k.replace(" ", "") == key:
             return CATEGORY_MAPPING[k][0]
-    # Try substring match
     key_spaced = category_name.lower().strip()
     for k in CATEGORY_MAPPING:
         if k in key_spaced or key_spaced in k:
             return CATEGORY_MAPPING[k][0]
-    # Default fallback — general for sale so post never hard-fails
     print(f"  ⚠  Category '{category_name}' not in mapping — defaulting to 'general for sale'")
-    return CATEGORY_MAPPING["miscellaneous"][0]  # UL 28 = general for sale
+    return CATEGORY_MAPPING["miscellaneous"][0]
 
 
 # ─────────────────────────────────────────────────────────────
 # POSTED LISTINGS TRACKER
 # ─────────────────────────────────────────────────────────────
 posted_listings: dict = {}
-
-# Lock protecting concurrent writes to posted_listings.json (posting thread + analytics thread)
 _listings_lock = threading.Lock()
 
 
 def _load_existing_listings():
-    """Merge posted_listings.json from disk so other platforms' entries survive."""
     global posted_listings
     if not os.path.exists(LISTINGS_JSON):
         return
@@ -159,7 +154,7 @@ def _load_existing_listings():
         with open(LISTINGS_JSON) as f:
             data = json.load(f)
         for k, v in data.items():
-            if k not in posted_listings:          # don't overwrite current session
+            if k not in posted_listings:
                 entry = dict(v)
                 try:
                     entry["post_time"] = datetime.fromisoformat(v["post_time"])
@@ -172,10 +167,6 @@ def _load_existing_listings():
 
 
 def _save_listings():
-    """Persist the merged posted_listings to disk so the UI can read it.
-    Uses a threading.Lock + atomic rename to prevent race conditions when the
-    analytics thread and the posting thread both call _save_listings().
-    """
     serialisable = {}
     for k, v in posted_listings.items():
         entry = dict(v)
@@ -187,23 +178,20 @@ def _save_listings():
     with _listings_lock:
         with open(tmp_path, "w") as f:
             json.dump(serialisable, f, indent=2)
-        os.replace(tmp_path, LISTINGS_JSON)  # atomic on both Windows and POSIX
+        os.replace(tmp_path, LISTINGS_JSON)
 
 
 # ─────────────────────────────────────────────────────────────
 # DRIVER FACTORY
 # ─────────────────────────────────────────────────────────────
 def _find_binary(names: list, fallback_paths: list) -> str | None:
-    """Search PATH, /usr/local/bin, common Nix paths, and the Nix store for a binary."""
     import shutil, subprocess
 
-    # 1. Standard PATH lookup
     for name in names:
         path = shutil.which(name)
         if path:
             return path
 
-    # 2. Shell 'which' — catches Nix profile paths not propagated to os.environ["PATH"]
     for name in names:
         try:
             result = subprocess.run(["which", name], capture_output=True, text=True, timeout=3)
@@ -213,13 +201,11 @@ def _find_binary(names: list, fallback_paths: list) -> str | None:
         except Exception:
             pass
 
-    # 3. Hardcoded fallback paths (including Procfile symlink target /usr/local/bin)
     extended = ["/usr/local/bin/" + n for n in names] + fallback_paths
     for p in extended:
         if os.path.exists(p):
             return p
 
-    # 4. Last resort: search the entire Nix store (slow but guaranteed)
     for name in names:
         try:
             result = subprocess.run(
@@ -227,7 +213,6 @@ def _find_binary(names: list, fallback_paths: list) -> str | None:
                 capture_output=True, text=True, timeout=10
             )
             hits = [ln.strip() for ln in result.stdout.splitlines() if ln.strip()]
-            # Prefer paths that contain 'bin' and not 'doc'
             hits.sort(key=lambda h: (0 if "/bin/" in h else 1, "doc" in h))
             if hits:
                 print(f"  [driver] Found {name} via find: {hits[0]}")
@@ -246,9 +231,8 @@ def make_driver(headless: bool = False) -> webdriver.Chrome:
     os.environ["WDM_SKIP_DOWNLOAD"] = "1"
 
     options = webdriver.ChromeOptions()
-    options.set_capability("goog:loggingPrefs", {"browser": "ALL"})  # enables get_log('browser')
+    options.set_capability("goog:loggingPrefs", {"browser": "ALL"})
 
-    # --- Crash prevention (Railway / Docker / memory-constrained environments) ---
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
@@ -256,11 +240,10 @@ def make_driver(headless: bool = False) -> webdriver.Chrome:
     options.add_argument("--headless=new")
     options.add_argument("--window-size=1280,800")
     options.add_argument("--memory-pressure-off")
-    options.add_argument("--no-zygote")                   # prevents zygote process crash
+    options.add_argument("--no-zygote")
     options.add_argument("--disable-setuid-sandbox")
     options.add_argument("--disable-extensions")
     options.add_argument("--disable-plugins")
-    # NOTE: do NOT add --disable-images — CL's jQuery validation can fail to load
     options.add_argument("--disable-javascript-harmony-shipping")
     options.add_argument("--disable-background-networking")
     options.add_argument("--disable-default-apps")
@@ -269,12 +252,9 @@ def make_driver(headless: bool = False) -> webdriver.Chrome:
     options.add_argument("--mute-audio")
     options.add_argument("--no-first-run")
     options.add_argument("--no-default-browser-check")
-    options.add_argument("--shm-size=128m")               # explicit shared memory cap
-
-    # --- Anti-detection ---
+    options.add_argument("--shm-size=128m")
     options.add_argument("--disable-blink-features=AutomationControlled")
 
-    # --- Use a FRESH temp dir every run to avoid stale lock files from prior crashes ---
     fresh_profile = tempfile.mkdtemp(prefix="clblast_chrome_")
     options.add_argument(f"--user-data-dir={fresh_profile}")
 
@@ -299,7 +279,7 @@ def make_driver(headless: bool = False) -> webdriver.Chrome:
         ["/usr/bin/chromedriver"]
     )
     if not chromedriver_bin:
-        raise RuntimeError("chromedriver not found. Check Dockerfile has: RUN apt-get install -y chromium chromium-driver")
+        raise RuntimeError("chromedriver not found.")
 
     print(f"  [driver] Using chromedriver: {chromedriver_bin}")
     service = Service(
@@ -328,7 +308,7 @@ def make_driver(headless: bool = False) -> webdriver.Chrome:
 # ─────────────────────────────────────────────────────────────
 def human_delay(lo: float = 0.8, hi: float = 2.5):
     if IS_FAST_MODE:
-        time.sleep(random.uniform(lo * 0.3, hi * 0.3))  # 70% faster on Railway
+        time.sleep(random.uniform(lo * 0.3, hi * 0.3))
     else:
         time.sleep(random.uniform(lo, hi))
 
@@ -377,7 +357,7 @@ def send_keys_slow(driver, element, text: str):
 
 
 def safe_click(driver, element):
-    human_delay(2.0, 5.0)  # Random wait of 2-5 seconds between clicks
+    human_delay(2.0, 5.0)
     if random.random() < 0.3:
         human_scroll(driver)
     human_mouse_movement(driver, element)
@@ -406,7 +386,6 @@ def solve_recaptcha_v2(driver) -> bool:
         print("  Sending CAPTCHA to 2captcha…")
         result  = solver.recaptcha(sitekey=sitekey, url=driver.current_url)
         token   = result["code"]
-        # Inject token and fire the callback so the site accepts it
         driver.execute_script(
             "document.getElementById('g-recaptcha-response').innerHTML = arguments[0];", token)
         driver.execute_script(
@@ -526,20 +505,25 @@ def js_fill(driver, field_id: str, value: str):
         });
         el.blur();
     """, field_id, value)
-    import time as _t; _t.sleep(0.2)
+    time.sleep(0.2)
 
 
-def clipboard_fill(driver, field_id: str, value: str) -> bool:
+def _safe_fill(driver, field_id: str, value: str) -> bool:
     """
-    Fill a form field so jQuery Validate accepts it on headless Railway Chromium.
+    THE definitive field filler for Craigslist on headless Railway Chromium.
 
-    Two-phase approach:
-      Phase 1 — element.send_keys(): generates real browser key events (works headless,
-                 no ActionChains/display needed).  TAB at end fires jQuery's blur handler.
-      Phase 2 — jQuery .val()+.trigger(): updates jQuery's internal value cache directly,
-                 then calls validator.element() to mark the field valid.
+    Root cause of all previous failures:
+      - Keys.CONTROL + "a" (string concat) sends literal "\ue009a" characters into the
+        field instead of selecting text. This corrupts the value silently.
+      - ActionChains crashes on headless Linux without a display manager.
+      - JS event injection alone doesn't update jQuery Validate's internal state.
+
+    This function:
+      1. Clears the field using element.clear() only (safe, no key combo needed)
+      2. Types each character via element.send_keys(ch) — real browser events
+      3. Sends Keys.TAB as a separate send_keys call — triggers jQuery blur handler
+      4. Verifies the value landed correctly
     """
-    from selenium.webdriver.common.keys import Keys
     try:
         el = WebDriverWait(driver, 10).until(
             EC.presence_of_element_located((By.ID, field_id))
@@ -547,190 +531,79 @@ def clipboard_fill(driver, field_id: str, value: str) -> bool:
         driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
         time.sleep(0.3)
 
-        # Phase 1: real browser keystrokes via send_keys (headless-safe)
+        # Focus the element
         try:
             el.click()
         except Exception:
             driver.execute_script("arguments[0].focus();", el)
         time.sleep(0.2)
-        el.send_keys(Keys.CONTROL + "a")
-        time.sleep(0.05)
-        el.send_keys(Keys.DELETE)
-        time.sleep(0.05)
+
+        # Clear SAFELY — no key combos, just .clear() which always works headless
+        el.clear()
+        time.sleep(0.15)
+
+        # Type character by character — generates real browser key events
         for ch in value:
             el.send_keys(ch)
             time.sleep(random.uniform(0.03, 0.07))
-        el.send_keys(Keys.TAB)   # triggers jQuery Validate's blur/focusout handler
-        time.sleep(0.4)
 
-        # Phase 2: jQuery val() + trigger + validator.element()
-        driver.execute_script("""
-            var id  = arguments[0];
-            var val = arguments[1];
-            var el  = document.getElementById(id);
-            if (!el) return;
-            if (window.jQuery) {
-                try {
-                    jQuery(el).val(val)
-                              .trigger('input')
-                              .trigger('keyup')
-                              .trigger('change')
-                              .trigger('blur');
-                    var v = jQuery(el).closest('form').data('validator');
-                    if (v) v.element(el);
-                } catch(e) {}
-            }
-            // native setter belt-and-suspenders
-            try {
-                var proto = (el.tagName === 'TEXTAREA')
-                    ? window.HTMLTextAreaElement.prototype
-                    : window.HTMLInputElement.prototype;
-                var setter = Object.getOwnPropertyDescriptor(proto, 'value');
-                if (setter && setter.set) setter.set.call(el, val);
-            } catch(e) { el.value = val; }
-            el.dispatchEvent(new Event('input',  {bubbles:true}));
-            el.dispatchEvent(new Event('change', {bubbles:true}));
-            el.dispatchEvent(new Event('blur',   {bubbles:true}));
-        """, field_id, value)
-        time.sleep(0.3)
+        # TAB away — this is what fires jQuery Validate's blur/focusout handler
+        # MUST be a separate send_keys call, not concatenated with anything
+        el.send_keys(Keys.TAB)
+        time.sleep(0.5)
 
-        # Verify
-        actual = (driver.find_element(By.ID, field_id).get_attribute("value") or "").strip()
+        # Verify value is correct
+        actual = ""
+        try:
+            actual = (driver.find_element(By.ID, field_id).get_attribute("value") or "").strip()
+        except Exception:
+            pass
+
         if actual != value.strip():
-            print(f"  ⚠ clipboard_fill({field_id}): got '{actual[:30]}' — JS direct fallback")
-            driver.execute_script("""
-                var el = document.getElementById(arguments[0]);
-                if (!el) return;
-                if (window.jQuery) jQuery(el).val(arguments[1]).trigger('input').trigger('change').trigger('blur');
-                else { el.value = arguments[1]; el.dispatchEvent(new Event('change',{bubbles:true})); }
-            """, field_id, value)
-            time.sleep(0.2)
+            print(f"  ⚠ _safe_fill({field_id}): got '{actual[:30]}' — retrying with direct send_keys")
+            try:
+                el2 = driver.find_element(By.ID, field_id)
+                el2.clear()
+                time.sleep(0.1)
+                el2.send_keys(value)
+                el2.send_keys(Keys.TAB)
+                time.sleep(0.3)
+            except Exception as e2:
+                print(f"  ⚠ _safe_fill({field_id}) retry failed: {e2}")
+                return False
 
+        print(f"  ✓ {field_id} filled ok")
         return True
     except Exception as e:
-        print(f"  ⚠ clipboard_fill({field_id}) failed: {e}")
+        print(f"  ⚠ _safe_fill({field_id}) failed: {e}")
         return False
 
 
-def jquery_validate_fields(driver):
-    """Force jQuery Validate to re-evaluate all critical fields right before submit."""
-    driver.execute_script("""
-        ['PostingTitle', 'PostingBody', 'postal_code'].forEach(function(id) {
-            var el = document.getElementById(id);
-            if (!el) return;
-            if (window.jQuery) {
-                try {
-                    var cur = jQuery(el).val();
-                    jQuery(el).val(cur)
-                              .trigger('input')
-                              .trigger('keyup')
-                              .trigger('change')
-                              .trigger('focusout')
-                              .trigger('blur');
-                    var v = jQuery(el).closest('form').data('validator');
-                    if (v) v.element(el);
-                } catch(e) {}
-            }
-            el.dispatchEvent(new Event('change', {bubbles:true}));
-            el.dispatchEvent(new Event('blur',   {bubbles:true}));
-        });
-    """)
-    time.sleep(0.6)
-
+def clipboard_fill(driver, field_id: str, value: str) -> bool:
+    """Alias to _safe_fill — keeps the existing call sites working."""
+    return _safe_fill(driver, field_id, value)
 
 
 def robust_fill_zip(driver, zip_code):
-    """Fill postal_code with every event CL jQuery needs, using native setter."""
-    script = """
-        var el = document.getElementById('postal_code');
-        if (!el) return false;
-        el.scrollIntoView({block: 'center'});
-        el.focus();
-        // Use native setter to bypass framework value caching
-        var nativeInputValueSetter = Object.getOwnPropertyDescriptor(
-            window.HTMLInputElement.prototype, 'value'
-        ).set;
-        nativeInputValueSetter.call(el, arguments[0]);
-        // Fire complete jQuery-compatible event chain
-        var events = ['focus','click','keydown','keypress','input','keyup','change','blur'];
-        events.forEach(function(evtName) {
-            var evt;
-            if (evtName === 'input') {
-                evt = new InputEvent('input', {bubbles: true, cancelable: true, data: arguments[0]});
-            } else if (['keydown','keypress','keyup'].includes(evtName)) {
-                evt = new KeyboardEvent(evtName, {bubbles: true, cancelable: true, keyCode: 13});
-            } else {
-                evt = new Event(evtName, {bubbles: true, cancelable: true});
-            }
-            el.dispatchEvent(evt);
-        });
-        el.blur();
-        return true;
-    """
-    driver.execute_script(script, zip_code)
-    time.sleep(0.5)
-    # Verify fill worked; fallback to ActionChains if not
-    try:
-        from selenium.webdriver.common.keys import Keys
-        el = driver.find_element(By.ID, 'postal_code')
-        actual = el.get_attribute('value')
-        if actual != zip_code:
-            actions = ActionChains(driver)
-            actions.click(el).key_down(Keys.CONTROL).send_keys('a').key_up(Keys.CONTROL)
-            actions.send_keys(Keys.DELETE)
-            for ch in zip_code:
-                actions.send_keys(ch)
-                actions.pause(0.05)
-            actions.perform()
-            time.sleep(0.3)
-            driver.execute_script(
-                "arguments[0].dispatchEvent(new Event('change',{bubbles:true}));"
-                "arguments[0].dispatchEvent(new Event('blur',{bubbles:true}));",
-                el
-            )
-        print(f"  ✓ Zip filled and verified: {zip_code}")
-    except Exception as e:
-        print(f"  ⚠ Zip verification error: {e}")
-
-
-def _type_into(driver, field_id, value):
-    """Find field by ID, clear it, send_keys directly. No JS. No events. Just works."""
-    from selenium.webdriver.common.keys import Keys
-    el = WebDriverWait(driver, 10).until(
-        EC.element_to_be_clickable((By.ID, field_id))
-    )
-    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
-    time.sleep(0.2)
-    el.click()
-    time.sleep(0.15)
-    # Clear via select-all + delete (works for both input and textarea)
-    el.send_keys(Keys.CONTROL + "a")
-    time.sleep(0.05)
-    el.send_keys(Keys.DELETE)
-    time.sleep(0.05)
-    el.clear()
-    time.sleep(0.05)
-    # Type the value
-    for ch in value:
-        el.send_keys(ch)
-        time.sleep(random.uniform(0.03, 0.06))
-    # Tab away to trigger blur/validation
-    el.send_keys(Keys.TAB)
-    time.sleep(0.3)
-    # Verify
-    actual = (el.get_attribute("value") or "").strip()
-    if not actual:
-        # Retry once with direct send_keys (no char loop)
-        el.click()
-        el.clear()
-        el.send_keys(value)
-        el.send_keys(Keys.TAB)
-        time.sleep(0.2)
-    return el
+    """Fill postal_code — just uses _safe_fill which is reliable."""
+    result = _safe_fill(driver, "postal_code", zip_code)
+    if not result:
+        # Last resort: JS direct set
+        driver.execute_script("""
+            var el = document.getElementById('postal_code');
+            if (!el) return;
+            el.focus();
+            el.value = arguments[0];
+            el.dispatchEvent(new Event('input', {bubbles:true}));
+            el.dispatchEvent(new Event('change', {bubbles:true}));
+            el.dispatchEvent(new Event('blur', {bubbles:true}));
+        """, zip_code)
+        time.sleep(0.3)
+        print(f"  ✓ Zip filled via JS fallback: {zip_code}")
 
 
 def fill_listing_details(driver, product: dict):
-    # 1. Wait for form — if it never appears, return silently (don't crash)
+    # 1. Wait for form
     try:
         WebDriverWait(driver, 15).until(
             EC.presence_of_element_located((By.ID, "postingForm"))
@@ -740,7 +613,7 @@ def fill_listing_details(driver, product: dict):
         return
 
     handle_captcha_if_present(driver)
-    time.sleep(2)  # let CL's JS finish rendering all fields
+    time.sleep(2)
 
     # 2. Resolve values
     title = product.get("title") or product.get("name") or "Quality Item For Sale"
@@ -761,6 +634,50 @@ def fill_listing_details(driver, product: dict):
         "miami": "33101",      "dallas": "75201",
         "denver": "80201",     "atlanta": "30301",
         "boston": "02101",     "portland": "97201",
+        # Extended locations
+        "anchorage": "99502",
+        "brookland": "72417", "jonesboro": "72417",
+        "coloradosprings": "80990", "cosprings": "80990",
+        "bloomfield": "06002", "hartford": "06002",
+        "newark": "19702", "delaware": "19702",
+        "orlando": "32827",
+        "honolulu": "96820",
+        "pocatello": "83204", "eastidaho": "83204",
+        "bloomington": "61701",
+        "indianapolis": "46220",
+        "cedarrapids": "52404",
+        "wichita": "67212",
+        "louisville": "40210",
+        "neworleans": "70117",
+        "westbrook": "04092", "maine": "04092",
+        "baltimore": "21222",
+        "detroit": "48210",
+        "minneapolis": "55440",
+        "jackson": "39201",
+        "stlouis": "63138",
+        "ashland": "59004", "billings": "59004",
+        "omaha": "68110",
+        "lasvegas": "89030",
+        "manchester": "03063",
+        "lakewood": "08701", "jerseyshore": "08701",
+        "albuquerque": "87108",
+        "brooklyn": "11206", "newyork": "10001",
+        "raleigh": "27604",
+        "fargo": "58102",
+        "columbus": "43211",
+        "mustang": "73064", "oklahomacity": "73064",
+        "canby": "97013",
+        "philadelphia": "19019",
+        "providence": "02858",
+        "columbia": "29223",
+        "siouxfalls": "57101",
+        "nashville": "37205",
+        "saltlakecity": "84118",
+        "burlington": "05401", "vermont": "05401",
+        "bristol": "24202",
+        "charleston": "25302", "charlestonwv": "25302",
+        "milwaukee": "53221",
+        "sheridan": "82801",
     }
     zip_code = (product.get("zip_code") or product.get("postal_code") or "").strip()
     if not zip_code:
@@ -774,43 +691,32 @@ def fill_listing_details(driver, product: dict):
     ).strip()
     city_name = CL_CITY.replace("-", " ").title()
 
-    # 3. Fill all validated fields with plain send_keys (same as working bots)
+    # 3. Fill all fields using _safe_fill (correct key handling, headless-safe)
     print("  Filling title...")
-    try:
-        _type_into(driver, "PostingTitle", title)
-        time.sleep(0.3)
-    except Exception as e:
-        print(f"  ⚠ title fill failed: {e}")
+    _safe_fill(driver, "PostingTitle", title)
+    time.sleep(0.3)
 
     print("  Filling description...")
-    try:
-        _type_into(driver, "PostingBody", description)
-        time.sleep(0.3)
-    except Exception as e:
-        print(f"  ⚠ description fill failed: {e}")
+    _safe_fill(driver, "PostingBody", description)
+    time.sleep(0.3)
 
     print("  Filling zip...")
-    try:
-        _type_into(driver, "postal_code", zip_code)
-        time.sleep(0.5)
-    except Exception as e:
-        print(f"  ⚠ zip fill failed: {e}")
+    _safe_fill(driver, "postal_code", zip_code)
+    time.sleep(0.5)
 
     # Price — try by ID, then CSS fallback
     price_filled = False
     for pid in ["AskingPrice", "AskPrice", "price", "Price", "asking_price", "AskPriceText"]:
         try:
             driver.find_element(By.ID, pid)
-            clipboard_fill(driver, pid, price)
+            _safe_fill(driver, pid, price)
             print(f"  ✓ Price: {price}")
             price_filled = True
             break
         except Exception:
             continue
     if not price_filled:
-        # CSS fallback — real keystrokes via ActionChains
         try:
-            from selenium.webdriver.common.keys import Keys
             price_inputs = driver.find_elements(By.CSS_SELECTOR,
                 "input[id*='rice'], input[name*='rice'], input[id*='ask'], input[name*='ask']")
             for pi in price_inputs:
@@ -818,12 +724,11 @@ def fill_listing_details(driver, product: dict):
                     driver.execute_script("arguments[0].scrollIntoView({block:'center'});", pi)
                     pi.click()
                     time.sleep(0.1)
-                    pi.send_keys(Keys.CONTROL + "a")
-                    pi.send_keys(Keys.DELETE)
                     pi.clear()
                     for ch in price:
                         pi.send_keys(ch)
                         time.sleep(0.04)
+                    pi.send_keys(Keys.TAB)
                     driver.execute_script(
                         "arguments[0].dispatchEvent(new Event('change',{bubbles:true}));"
                         "arguments[0].dispatchEvent(new Event('blur',{bubbles:true}));", pi)
@@ -835,7 +740,7 @@ def fill_listing_details(driver, product: dict):
     if not price_filled:
         print("  ⚠ Price field not found — posting without price")
 
-    # Email — check if field exists first, never crash if absent
+    # Email
     email_filled = False
     try:
         ef = WebDriverWait(driver, 4).until(
@@ -846,14 +751,14 @@ def fill_listing_details(driver, product: dict):
             print(f"  ✓ Email already in field: {cur_val}")
             email_filled = True
         elif cl_email:
-            clipboard_fill(driver, "FromEMail", cl_email)
+            _safe_fill(driver, "FromEMail", cl_email)
             print(f"  ✓ Email: {cl_email}")
             email_filled = True
         else:
             print("  ✗ CL_EMAIL env var not set AND field is empty — will fail")
     except TimeoutException:
         print("  [info] FromEMail absent — CL using session email (OK if logged in)")
-        email_filled = True  # session auth covers it
+        email_filled = True
 
     # Condition dropdown
     try:
@@ -866,67 +771,42 @@ def fill_listing_details(driver, product: dict):
 
     time.sleep(1)
 
-    # Pre-submit verification — confirm all critical fields have values
+    # Pre-submit verification
     time.sleep(0.5)
     try:
-        zip_el = driver.find_element(By.ID, "postal_code")
-        zip_val = (zip_el.get_attribute("value") or "").strip()
+        zip_val = (driver.find_element(By.ID, "postal_code").get_attribute("value") or "").strip()
         if not zip_val or zip_val != zip_code:
-            print(f"  ✗ postal_code mismatch (got '{zip_val}', expected '{zip_code}') — re-filling")
-            clipboard_fill(driver, "postal_code", zip_code)
+            print(f"  ✗ postal_code mismatch (got '{zip_val}') — re-filling")
+            _safe_fill(driver, "postal_code", zip_code)
             time.sleep(0.8)
         else:
             print(f"  ✓ postal_code confirmed: '{zip_val}'")
     except Exception:
         pass
     try:
-        title_el = driver.find_element(By.ID, "PostingTitle")
-        title_val = (title_el.get_attribute("value") or "").strip()
+        title_val = (driver.find_element(By.ID, "PostingTitle").get_attribute("value") or "").strip()
         if not title_val:
             print(f"  ✗ PostingTitle is EMPTY — re-filling")
-            clipboard_fill(driver, "PostingTitle", title)
+            _safe_fill(driver, "PostingTitle", title)
             time.sleep(0.5)
         else:
             print(f"  ✓ title confirmed: '{title_val[:40]}...'")
     except Exception:
         pass
     try:
-        body_el = driver.find_element(By.ID, "PostingBody")
-        body_val = (body_el.get_attribute("value") or "").strip()
+        body_val = (driver.find_element(By.ID, "PostingBody").get_attribute("value") or "").strip()
         if not body_val:
             print(f"  ✗ PostingBody is EMPTY — re-filling")
-            clipboard_fill(driver, "PostingBody", description)
+            _safe_fill(driver, "PostingBody", description)
             time.sleep(0.5)
         else:
             print(f"  ✓ description confirmed ({len(body_val)} chars)")
     except Exception:
         pass
 
-    # Force-fill all three critical fields via React/Vue native setter right before submit
-    def run_native_setter(d):
-        d.execute_script("""
-            ['PostingTitle', 'PostingBody', 'postal_code'].forEach(function(id) {
-                var el = document.getElementById(id);
-                if (!el) return;
-                var proto = (el.tagName === 'TEXTAREA')
-                    ? window.HTMLTextAreaElement.prototype
-                    : window.HTMLInputElement.prototype;
-                var desc = Object.getOwnPropertyDescriptor(proto, 'value');
-                if (desc && desc.set) {
-                    desc.set.call(el, el.value);
-                }
-                ['input', 'change', 'blur'].forEach(function(e) {
-                    el.dispatchEvent(new Event(e, {bubbles:true}));
-                });
-            });
-        """)
+    time.sleep(2.0)
 
-    run_native_setter(driver)
-    jquery_validate_fields(driver)
-    time.sleep(2.0)  # let CL's validation debounce settle
-
-    # 4. Submit — use REAL browser click on the actual form button element
-    # (JS execute_script click bypasses native form submission; don't use it)
+    # 4. Submit
     url_before = driver.current_url
 
     for attempt in range(4):
@@ -935,20 +815,19 @@ def fill_listing_details(driver, product: dict):
                 break
             print(f"  ⚠ Still on edit page — retry {attempt}/3, re-filling fields...")
             time.sleep(1.0)
-            # Re-fill any empty fields
             try:
                 if not (driver.find_element(By.ID, "PostingTitle").get_attribute("value") or "").strip():
-                    _type_into(driver, "PostingTitle", title)
+                    _safe_fill(driver, "PostingTitle", title)
                     time.sleep(0.3)
             except Exception: pass
             try:
                 if not (driver.find_element(By.ID, "PostingBody").get_attribute("value") or "").strip():
-                    _type_into(driver, "PostingBody", description)
+                    _safe_fill(driver, "PostingBody", description)
                     time.sleep(0.3)
             except Exception: pass
             try:
                 if not (driver.find_element(By.ID, "postal_code").get_attribute("value") or "").strip():
-                    _type_into(driver, "postal_code", zip_code)
+                    _safe_fill(driver, "postal_code", zip_code)
                     time.sleep(0.3)
             except Exception: pass
 
@@ -956,7 +835,6 @@ def fill_listing_details(driver, product: dict):
         time.sleep(0.5)
 
         clicked = False
-        # Try submitting via the form's own submit button — real .click(), NOT JS click
         for sel in [
             (By.XPATH, '//*[@id="postingForm"]/button'),
             (By.XPATH, '//form[@id="postingForm"]//button[@type="submit"]'),
@@ -969,7 +847,7 @@ def fill_listing_details(driver, product: dict):
                 btn = WebDriverWait(driver, 5).until(EC.element_to_be_clickable(sel))
                 driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
                 time.sleep(0.3)
-                btn.click()   # REAL browser click — not JS
+                btn.click()
                 print(f"  ✓ Submit clicked (attempt {attempt + 1})")
                 clicked = True
                 time.sleep(5)
@@ -999,7 +877,7 @@ def fill_listing_details(driver, product: dict):
     except Exception:
         pass
 
-    # 6. Wait for URL to change away from ?s=edit
+    # 6. Wait for URL to change
     try:
         WebDriverWait(driver, 12).until(lambda d: d.current_url != url_before)
         print(f"  ✓ Navigated to: {driver.current_url}")
@@ -1008,12 +886,10 @@ def fill_listing_details(driver, product: dict):
         print("  ⚠ CL validation blocked submit — check errors above")
 
 
-
 # ─────────────────────────────────────────────────────────────
 # PHOTO UPLOAD
 # ─────────────────────────────────────────────────────────────
 def upload_photos(driver, product: dict):
-    # BUG 3 FIX: Support both URL and local file paths for photos
     photo_paths = product.get("photo_paths", []) or product.get("images", [])
     if not photo_paths:
         print("  No photos to upload.")
@@ -1046,7 +922,6 @@ def upload_photos(driver, product: dict):
         safe_click(driver, add_btn)
 
         fi = driver.find_element(By.ID, "fileInput")
-        # Upload one file at a time — some inputs reject newline-joined paths
         for path in valid:
             fi.send_keys(os.path.abspath(path))
             human_delay(1.5, 3)
@@ -1058,7 +933,6 @@ def upload_photos(driver, product: dict):
     except (TimeoutException, NoSuchElementException) as e:
         print(f"  ⚠  Photo upload issue: {e}")
     finally:
-        # Clean up temp downloaded files
         for tf in temp_files:
             try:
                 os.unlink(tf)
@@ -1108,7 +982,6 @@ def post_product(driver, ad_name: str, product: dict) -> bool:
     human_delay(4, 7)
     handle_captcha_if_present(driver)
 
-    # Wait up to 20 seconds for ANY meaningful content to appear
     try:
         WebDriverWait(driver, 20).until(
             lambda d: d.execute_script("return document.readyState") == "complete"
@@ -1117,25 +990,21 @@ def post_product(driver, ad_name: str, product: dict) -> bool:
         print(f"  ✗ Page timed out for '{product_title}'. URL: {driver.current_url}")
         return False
 
-    # Debug: print page title and URL to help diagnose
     print(f"  Page title: {driver.title}")
     print(f"  Current URL: {driver.current_url}")
 
-    # Check if redirected to login (session expired)
     if "login" in driver.current_url.lower() or "accounts.craigslist" in driver.current_url.lower():
         print(f"  ✗ Session expired, redirected to login.")
         return False
 
-    # 1. City / Location selection (if prompted)
+    # 1. City / Location selection
     try:
-        # Check if the jQuery UI dropdown button exists
         city_button = WebDriverWait(driver, 5).until(
             EC.presence_of_element_located((By.CSS_SELECTOR, "span#ui-id-1-button"))
         )
         driver.execute_script("arguments[0].click();", city_button)
-        human_delay(2, 3)  # increased — give dropdown time to fully render
+        human_delay(2, 3)
 
-        # Wait for menu items to appear
         menu_items = WebDriverWait(driver, 5).until(
             EC.presence_of_all_elements_located((By.CSS_SELECTOR, "ul#ui-id-1-menu li"))
         )
@@ -1157,10 +1026,8 @@ def post_product(driver, ad_name: str, product: dict) -> bool:
             fallback_text = menu_items[0].text.strip() or menu_items[0].get_attribute("textContent").strip()
             print(f"  ⚠ Target city '{CL_CITY}' not found. Selected fallback: {fallback_text}")
 
-        # CRITICAL: Give jQuery UI time to commit the selection to the underlying <select>
         human_delay(2, 3)
 
-        # Also force-set the hidden <select> value directly so CL's form always sees the right city
         try:
             select_el = driver.find_element(By.CSS_SELECTOR, "select#ui-id-1")
             driver.execute_script(
@@ -1171,13 +1038,11 @@ def post_product(driver, ad_name: str, product: dict) -> bool:
         except Exception:
             pass
 
-        # Fresh element reference + explicit wait before submitting
         continue_btn = WebDriverWait(driver, 10).until(
             EC.element_to_be_clickable((By.CSS_SELECTOR, "button.go.pickbutton, button[class*='pickbutton'], button[type='submit']"))
         )
         driver.execute_script("arguments[0].click();", continue_btn)
         print("  ✓ Submitted city selection")
-        # FIX 4: WebDriverWait instead of flat sleep for city AJAX nav
         try:
             WebDriverWait(driver, 12).until(
                 lambda d: "s=area" not in d.current_url
@@ -1189,7 +1054,7 @@ def post_product(driver, ad_name: str, product: dict) -> bool:
     except Exception as e:
         print(f"  City selection error: {e}")
 
-    # 2. Wait to leave ?s=area — flat 4s then immediate check+retry
+    # 2. Wait to leave ?s=area
     print(f"  Waiting for post-type page... current URL: {driver.current_url}")
     if "s=area" in driver.current_url:
         print("  Still on area page, retrying city continue...")
@@ -1199,7 +1064,6 @@ def post_product(driver, ad_name: str, product: dict) -> bool:
                     "button.go.pickbutton, button[class*='pickbutton'], button[type='submit']"))
             )
             driver.execute_script("arguments[0].click();", retry_btn)
-            # FIX 5 (retry): WebDriverWait instead of flat sleep
             try:
                 WebDriverWait(driver, 10).until(lambda d: "s=area" not in d.current_url)
             except TimeoutException:
@@ -1210,14 +1074,13 @@ def post_product(driver, ad_name: str, product: dict) -> bool:
 
     if "s=area" in driver.current_url:
         print(f"  ✗ Still on area page after retry, giving up")
-        print(f"  Page source preview: {driver.page_source[:500]}")
         return False
     print(f"  ✓ Left area → {driver.current_url}")
 
     handle_captcha_if_present(driver)
     human_delay(2, 4)
 
-    # 3. Wait for post TYPE radio buttons to appear before FSO selection
+    # 3. Post type selection
     try:
         WebDriverWait(driver, 15).until(
             lambda d: d.find_elements(By.CSS_SELECTOR, "input[value='fso']") or
@@ -1227,14 +1090,10 @@ def post_product(driver, ad_name: str, product: dict) -> bool:
         print(f"  ✓ Post type page loaded")
     except TimeoutException:
         print(f"  ✗ Post type radio buttons never appeared.")
-        print(f"  URL: {driver.current_url}, Title: {driver.title}")
-        print(f"  Page preview: {driver.page_source[:800]}")
         return False
 
-    # Select 'for sale by owner' — try all known methods
     fso_clicked = False
 
-    # Method 1: radio input with value 'fso'
     for val in ['fso', 'fs', 'forsale', 'sss']:
         try:
             el = driver.find_element(By.CSS_SELECTOR, f"input[value='{val}']")
@@ -1245,7 +1104,6 @@ def post_product(driver, ad_name: str, product: dict) -> bool:
         except NoSuchElementException:
             pass
 
-    # Method 2: label or li containing 'sale by owner'
     if not fso_clicked:
         for tag in ["label", "li", "a"]:
             elements = driver.find_elements(By.TAG_NAME, tag)
@@ -1262,38 +1120,14 @@ def post_product(driver, ad_name: str, product: dict) -> bool:
             if fso_clicked:
                 break
 
-    # Method 3: fallback to any element containing owner or fso
     if not fso_clicked:
-        try:
-            all_elements = driver.find_elements(By.CSS_SELECTOR, "li, label, a, button, input")
-            for el in all_elements:
-                txt = el.text.lower().strip()
-                val = el.get_attribute("value") or ""
-                val = val.lower().strip()
-                if "owner" in txt or "owner" in val or "fso" in val:
-                    driver.execute_script("arguments[0].click();", el)
-                    fso_clicked = True
-                    print(f"  ✓ Selected post type via owner fallback: '{txt or val}'")
-                    break
-        except Exception:
-            pass
-
-    if not fso_clicked:
-        print(f"  ✗ Could not find 'for sale by owner'. Title: {driver.title}, URL: {driver.current_url}")
-        lis = driver.find_elements(By.TAG_NAME, "li")
-        print(f"  LI elements found ({len(lis)}):")
-        for i, li in enumerate(lis[:15]):
-            print(f"    [{i}] '{li.text.strip()}'")
-        inputs = driver.find_elements(By.TAG_NAME, "input")
-        print(f"  Input elements found ({len(inputs)}):")
-        for i, inp in enumerate(inputs[:10]):
-            print(f"    [{i}] type={inp.get_attribute('type')} value={inp.get_attribute('value')}")
+        print(f"  ✗ Could not find 'for sale by owner'.")
         return False
 
     human_delay(3, 5)
     handle_captcha_if_present(driver)
 
-    # 3. Select Category / Subcategory
+    # 4. Category selection
     cat_clicked = False
     mapped_label = CATEGORY_MAPPING.get(product.get("category", "").lower().strip(), (None, ""))[1]
     if not mapped_label:
@@ -1303,7 +1137,6 @@ def post_product(driver, ad_name: str, product: dict) -> bool:
 
     if mapped_label:
         try:
-            # Re-fetch fresh label every time right before clicking using XPath to avoid stale element reference
             target_lower = mapped_label.lower().strip()
             xpath = f"//label[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{target_lower}')]"
             label_el = WebDriverWait(driver, 10).until(
@@ -1315,7 +1148,6 @@ def post_product(driver, ad_name: str, product: dict) -> bool:
         except Exception as e:
             print(f"  Category lookup via label failed: {e}")
 
-    # Fallback 1: try matching input elements with value containing the category name/ID (re-fetched fresh)
     if not cat_clicked:
         try:
             ul_value = get_category_ul_value(product.get("category", ""))
@@ -1328,7 +1160,6 @@ def post_product(driver, ad_name: str, product: dict) -> bool:
         except Exception as e:
             print(f"  Category selection via radio value failed: {e}")
 
-    # Fallback 2: click first available option so it doesn't fail (re-fetched fresh)
     if not cat_clicked:
         try:
             first_label = WebDriverWait(driver, 5).until(
@@ -1345,23 +1176,20 @@ def post_product(driver, ad_name: str, product: dict) -> bool:
         return False
 
     human_delay(2, 3)
-    # Check if there is a continue button to proceed to the posting form
     try:
         continue_btn = WebDriverWait(driver, 8).until(
             EC.element_to_be_clickable((By.CSS_SELECTOR, "button.go.pickbutton, button[class*='pickbutton'], button[type='submit']"))
         )
-        current_url_before = driver.current_url
         driver.execute_script("arguments[0].click();", continue_btn)
         print("  ✓ Clicked category continue button")
-        # FIX 7: Wait for postingForm to appear instead of flat sleep
         try:
             WebDriverWait(driver, 12).until(
                 EC.presence_of_element_located((By.ID, "postingForm"))
             )
-            time.sleep(1.5)  # extra settle for all fields to render
+            time.sleep(1.5)
             print(f"  ✓ postingForm visible after category selection")
         except TimeoutException:
-            time.sleep(3)  # fallback
+            time.sleep(3)
         print(f"  Current URL after category continue: {driver.current_url}")
         handle_captcha_if_present(driver)
     except TimeoutException:
@@ -1375,7 +1203,6 @@ def post_product(driver, ad_name: str, product: dict) -> bool:
         print(f"  ✗ fill_listing_details crashed: {e}")
         return False
 
-    # FIX 3: URL guard — only upload photos if we actually left the edit page
     reached_photo_step = False
     try:
         WebDriverWait(driver, 15).until(
@@ -1389,7 +1216,6 @@ def post_product(driver, ad_name: str, product: dict) -> bool:
     except TimeoutException:
         print(f"  ⚠ Did not reach photo step. Still at: {driver.current_url}")
 
-    # CRITICAL: Only run photo upload if we actually left the edit page
     if not reached_photo_step or "s=edit" in driver.current_url:
         print(f"  ✗ Skipping photo upload — still on edit/form page. Aborting post.")
         return False
@@ -1398,13 +1224,10 @@ def post_product(driver, ad_name: str, product: dict) -> bool:
     return publish_listing(driver, ad_name, product)
 
 
-
 # ─────────────────────────────────────────────────────────────
 # ANALYTICS
 # ─────────────────────────────────────────────────────────────
 def update_ad_analytics_periodically():
-    # On Railway/cloud, skip live Chrome-based analytics to avoid memory crashes.
-    # Analytics will still show from posted_listings.json data.
     if IS_RAILWAY:
         print("[CL] Analytics thread disabled on Railway (memory constraint). Skipping.")
         return
@@ -1455,12 +1278,10 @@ def _update_ad_status(ad_name: str):
 # ─────────────────────────────────────────────────────────────
 def main():
     global CL_CITY
-    # Accept credentials from env vars (set by server.py) or fall back to interactive
     email    = os.environ.get("CL_EMAIL")    or input("Enter Craigslist email: ").strip()
     password = os.environ.get("CL_PASSWORD") or input("Enter Craigslist password: ").strip()
     CL_CITY  = os.environ.get("CL_CITY", CL_CITY)
 
-    # Merge any listings already written by other platform scripts
     _load_existing_listings()
 
     driver = make_driver()
@@ -1469,7 +1290,6 @@ def main():
         driver.quit()
         return
 
-    # Read PRODUCTS_FILE env var so server.py can pass a filtered subset
     products_file = os.environ.get("PRODUCTS_FILE", "products.json")
     if not os.path.exists(products_file):
         print(f"✗ {products_file} not found.")
