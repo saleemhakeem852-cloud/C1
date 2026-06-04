@@ -555,7 +555,14 @@ def clipboard_fill(driver, field_id: str, value: str) -> bool:
                     el.dispatchEvent(new KeyboardEvent('keyup',    {bubbles:true, cancelable:true, key:ch, keyCode:code, charCode:code, which:code}));
                 });
                 el.dispatchEvent(new Event('change', {bubbles:true}));
-                el.dispatchEvent(new Event('blur',   {bubbles:true}));
+                el.dispatchEvent(new Event('blur', {bubbles:true}));
+                if (window.jQuery) {
+                    try {
+                        var $form = jQuery(el).closest('form');
+                        var v = $form.data('validator');
+                        if (v) { v.element(el); }
+                    } catch(e) {}
+                }
                 if (window.jQuery) {
                     try {
                         jQuery('#' + arguments[0]).trigger('keyup').trigger('change').trigger('blur');
@@ -586,6 +593,33 @@ def clipboard_fill(driver, field_id: str, value: str) -> bool:
     except Exception as e:
         print(f"  ⚠ clipboard_fill({field_id}) failed: {e}")
         return False
+
+
+def jquery_validate_fields(driver):
+    """Force jQuery Validate to re-evaluate all critical fields before submit."""
+    driver.execute_script("""
+        var ids = ['PostingTitle', 'PostingBody', 'postal_code'];
+        ids.forEach(function(id) {
+            var el = document.getElementById(id);
+            if (!el) return;
+            // 1. Mark field as "visited" so validator won't skip it
+            el.focus();
+            el.blur();
+            // 2. If jQuery Validate is active on the form, call .valid() on the element
+            if (window.jQuery) {
+                try {
+                    var $form = jQuery(el).closest('form');
+                    var validator = $form.data('validator');
+                    if (validator) {
+                        validator.element(el);
+                    }
+                } catch(e) {}
+                // 3. Also fire the events jQuery listens to for value change detection
+                jQuery(el).trigger('focusin').trigger('keyup').trigger('focusout');
+            }
+        });
+    """)
+    time.sleep(0.5)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -835,6 +869,7 @@ def fill_listing_details(driver, product: dict):
         """)
 
     run_native_setter(driver)
+    jquery_validate_fields(driver)   # <-- ADD THIS LINE
     time.sleep(2.0)  # let CL's validation debounce settle
 
     # 4. Click the continue button (with up to 3 retries if still on s=edit)
@@ -848,6 +883,7 @@ def fill_listing_details(driver, product: dict):
                 break
             print(f"  ⚠ Still on edit page (?s=edit) — Validation/Submit retry attempt {attempt}/3...")
             run_native_setter(driver)
+            jquery_validate_fields(driver)   # <-- ADD THIS LINE
             time.sleep(2.0)
 
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
