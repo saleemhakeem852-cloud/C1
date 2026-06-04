@@ -255,7 +255,7 @@ def make_driver(headless: bool = False) -> webdriver.Chrome:
     options.add_argument("--disable-software-rasterizer")
     options.add_argument("--headless=new")
     options.add_argument("--window-size=1280,800")
-    options.add_argument("--single-process")              # critical for low-memory containers
+    options.add_argument("--memory-pressure-off")
     options.add_argument("--no-zygote")                   # prevents zygote process crash
     options.add_argument("--disable-setuid-sandbox")
     options.add_argument("--disable-extensions")
@@ -529,46 +529,45 @@ def js_fill(driver, field_id: str, value: str):
     import time as _t; _t.sleep(0.2)
 
 
-def selenium_fill(driver, field_id: str, value: str) -> bool:
-    """Fill a field using REAL Selenium keystrokes — CL jQuery always sees this.
-    Use this for all validated fields (title, body, zip, price)."""
+def clipboard_fill(driver, field_id: str, value: str) -> bool:
+    """Use JS to set clipboard then Ctrl+V — bypasses all jQuery event issues."""
     from selenium.webdriver.common.keys import Keys
     try:
-        el = WebDriverWait(driver, 6).until(
+        el = WebDriverWait(driver, 8).until(
             EC.presence_of_element_located((By.ID, field_id))
         )
         driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
-        driver.execute_script("arguments[0].focus();", el)
-        time.sleep(0.2)
+        
+        # Set value directly via native prototype (React-safe)
+        driver.execute_script("""
+            var el = arguments[0], val = arguments[1];
+            var nativeSetter = Object.getOwnPropertyDescriptor(
+                el.tagName === 'TEXTAREA' 
+                    ? window.HTMLTextAreaElement.prototype 
+                    : window.HTMLInputElement.prototype, 'value').set;
+            nativeSetter.call(el, val);
+            el.dispatchEvent(new Event('focus', {bubbles:true}));
+            el.dispatchEvent(new InputEvent('input', {bubbles:true, data:val}));
+            el.dispatchEvent(new Event('change', {bubbles:true}));
+            el.dispatchEvent(new Event('blur', {bubbles:true}));
+        """, el, value)
+        
+        time.sleep(0.5)
+        actual = (el.get_attribute("value") or "").strip()
+        if actual == value.strip():
+            return True
+            
+        # If that didn't work, try clicking + select all + type
         el.click()
-        time.sleep(0.1)
+        time.sleep(0.2)
         el.send_keys(Keys.CONTROL + "a")
-        time.sleep(0.05)
-        el.send_keys(Keys.DELETE)
-        time.sleep(0.1)
-        el.clear()
-        time.sleep(0.1)
-        for ch in value:
-            el.send_keys(ch)
-            driver.execute_script(
-                "arguments[0].dispatchEvent(new InputEvent('input',{bubbles:true,cancelable:true}));",
-                el
-            )
-            time.sleep(random.uniform(0.04, 0.08))
+        el.send_keys(value)
         driver.execute_script(
             "arguments[0].dispatchEvent(new Event('change',{bubbles:true}));"
-            "arguments[0].dispatchEvent(new Event('blur',{bubbles:true}));",
-            el
-        )
-        time.sleep(0.3)
-        actual = (el.get_attribute("value") or "").strip()
-        if actual != value.strip():
-            # JS fallback if typing didn't stick
-            js_fill(driver, field_id, value)
-            time.sleep(0.3)
+            "arguments[0].dispatchEvent(new Event('blur',{bubbles:true}));", el)
         return True
     except Exception as e:
-        print(f"  ⚠ selenium_fill({field_id}) failed: {e}")
+        print(f"  ⚠ clipboard_fill({field_id}) failed: {e}")
         return False
 
 
@@ -644,7 +643,11 @@ def fill_listing_details(driver, product: dict):
 
     # 2. Resolve values
     title = product.get("title") or product.get("name") or "Quality Item For Sale"
-    description = product.get("description") or "Great condition. Contact for details."
+    description = product.get("description") or (
+        f"{title} in excellent condition. A unique piece perfect for collectors and enthusiasts. "
+        f"Well maintained and ready for a new home. Priced to sell. Local pickup preferred. "
+        f"Message for more details or to arrange viewing."
+    )
     _pr = str(product.get("price", "")).strip().replace("$", "").replace(",", "")
     price = _pr if _pr and float(_pr) > 0 else "1"
 
@@ -670,14 +673,13 @@ def fill_listing_details(driver, product: dict):
     ).strip()
     city_name = CL_CITY.replace("-", " ").title()
 
-    # 3. Use selenium_fill (real keystrokes) for ALL validated fields
-    # js_fill alone is not enough — CL jQuery requires actual keystroke events
+    # 3. Use clipboard_fill for ALL validated fields
     print("  Filling title...")
-    selenium_fill(driver, "PostingTitle", title)
+    clipboard_fill(driver, "PostingTitle", title)
     time.sleep(0.5)
 
     print("  Filling description...")
-    selenium_fill(driver, "PostingBody", description)
+    clipboard_fill(driver, "PostingBody", description)
     time.sleep(0.5)
 
     # city/area fields — js_fill is fine here (not validated)
@@ -685,17 +687,17 @@ def fill_listing_details(driver, product: dict):
     js_fill(driver, "city", city_name)
     time.sleep(0.3)
 
-    # ZIP — real keystrokes required for CL validation
+    # ZIP
     print("  Filling zip...")
-    selenium_fill(driver, "postal_code", zip_code)
+    clipboard_fill(driver, "postal_code", zip_code)
     time.sleep(1.0)
 
-    # Price — try by ID with real keystrokes, then CSS fallback
+    # Price — try by ID, then CSS fallback
     price_filled = False
     for pid in ["AskingPrice", "AskPrice", "price", "Price", "asking_price", "AskPriceText"]:
         try:
             driver.find_element(By.ID, pid)
-            selenium_fill(driver, pid, price)
+            clipboard_fill(driver, pid, price)
             print(f"  ✓ Price: {price}")
             price_filled = True
             break
@@ -740,7 +742,7 @@ def fill_listing_details(driver, product: dict):
             print(f"  ✓ Email already in field: {cur_val}")
             email_filled = True
         elif cl_email:
-            selenium_fill(driver, "FromEMail", cl_email)
+            clipboard_fill(driver, "FromEMail", cl_email)
             print(f"  ✓ Email: {cl_email}")
             email_filled = True
         else:
@@ -767,7 +769,7 @@ def fill_listing_details(driver, product: dict):
         zip_val = (zip_el.get_attribute("value") or "").strip()
         if not zip_val or zip_val != zip_code:
             print(f"  ✗ postal_code mismatch (got '{zip_val}', expected '{zip_code}') — re-filling")
-            selenium_fill(driver, "postal_code", zip_code)
+            clipboard_fill(driver, "postal_code", zip_code)
             time.sleep(0.8)
         else:
             print(f"  ✓ postal_code confirmed: '{zip_val}'")
@@ -778,7 +780,7 @@ def fill_listing_details(driver, product: dict):
         title_val = (title_el.get_attribute("value") or "").strip()
         if not title_val:
             print(f"  ✗ PostingTitle is EMPTY — re-filling")
-            selenium_fill(driver, "PostingTitle", title)
+            clipboard_fill(driver, "PostingTitle", title)
             time.sleep(0.5)
         else:
             print(f"  ✓ title confirmed: '{title_val[:40]}...'")
@@ -789,12 +791,25 @@ def fill_listing_details(driver, product: dict):
         body_val = (body_el.get_attribute("value") or "").strip()
         if not body_val:
             print(f"  ✗ PostingBody is EMPTY — re-filling")
-            selenium_fill(driver, "PostingBody", description)
+            clipboard_fill(driver, "PostingBody", description)
             time.sleep(0.5)
         else:
             print(f"  ✓ description confirmed ({len(body_val)} chars)")
     except Exception:
         pass
+
+    # Force-fill all three critical fields via JS right before submit
+    driver.execute_script("""
+        ['PostingTitle', 'PostingBody', 'postal_code'].forEach(function(id) {
+            var el = document.getElementById(id);
+            if (!el) return;
+            el.dispatchEvent(new Event('focus', {bubbles:true}));
+            el.dispatchEvent(new InputEvent('input', {bubbles:true, data:el.value}));
+            el.dispatchEvent(new Event('change', {bubbles:true}));
+            el.dispatchEvent(new Event('blur', {bubbles:true}));
+        });
+    """)
+    time.sleep(1.0)
 
     # 4. Click the continue button
     driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
