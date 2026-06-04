@@ -530,31 +530,65 @@ def js_fill(driver, field_id: str, value: str):
 
 
 def clipboard_fill(driver, field_id: str, value: str) -> bool:
-    """Use pyperclip to copy the value and Keys.CONTROL + 'v' to paste into the field, then fire events."""
+    """Fill a field using JS native setter (works on Railway/headless) + full event chain.
+    Pyperclip paste is attempted as a bonus but never required."""
     from selenium.webdriver.common.keys import Keys
-    import pyperclip
     try:
         el = WebDriverWait(driver, 8).until(
             EC.presence_of_element_located((By.ID, field_id))
         )
         driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
         time.sleep(0.3)
-        el.click()
-        time.sleep(0.4)
-        el.send_keys(Keys.CONTROL + "a")
-        time.sleep(0.1)
-        pyperclip.copy(value)
-        time.sleep(0.1)
-        el.send_keys(Keys.CONTROL + "v")
-        time.sleep(0.3)
-        
-        # Fire change and blur events via JS
+
+        # PRIMARY: JS native setter — bypasses framework value caching, works headless
         driver.execute_script("""
             var el = arguments[0];
-            el.dispatchEvent(new Event('change', {bubbles:true}));
-            el.dispatchEvent(new Event('blur', {bubbles:true}));
-        """, el)
-        time.sleep(0.2)
+            var val = arguments[1];
+            el.focus();
+            var isTextarea = el.tagName === 'TEXTAREA';
+            var proto = isTextarea ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
+            var descriptor = Object.getOwnPropertyDescriptor(proto, 'value');
+            if (descriptor && descriptor.set) {
+                descriptor.set.call(el, val);
+            } else {
+                el.value = val;
+            }
+            ['focus','click','keydown','keypress','input','keyup','change','blur'].forEach(function(evtName) {
+                var evt;
+                if (evtName === 'input') {
+                    evt = new InputEvent('input', {bubbles:true, cancelable:true, data:val});
+                } else if (['keydown','keypress','keyup'].indexOf(evtName) > -1) {
+                    evt = new KeyboardEvent(evtName, {bubbles:true, cancelable:true});
+                } else {
+                    evt = new Event(evtName, {bubbles:true, cancelable:true});
+                }
+                el.dispatchEvent(evt);
+            });
+            el.blur();
+        """, el, value)
+        time.sleep(0.4)
+
+        # VERIFY: check the value actually landed
+        actual = (el.get_attribute("value") or "").strip()
+        if actual == value.strip():
+            return True
+
+        # FALLBACK: ActionChains character-by-character typing
+        try:
+            el.click()
+            time.sleep(0.2)
+            el.send_keys(Keys.CONTROL + "a")
+            el.send_keys(Keys.DELETE)
+            for ch in value:
+                el.send_keys(ch)
+                time.sleep(0.02)
+            driver.execute_script(
+                "arguments[0].dispatchEvent(new Event('change',{bubbles:true}));"
+                "arguments[0].dispatchEvent(new Event('blur',{bubbles:true}));", el)
+            time.sleep(0.3)
+        except Exception:
+            pass
+
         return True
     except Exception as e:
         print(f"  ⚠ clipboard_fill({field_id}) failed: {e}")
