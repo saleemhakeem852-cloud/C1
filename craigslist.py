@@ -570,13 +570,8 @@ def js_fill(driver, field_id: str, value: str):
 
 def selenium_fill(driver, field_id: str, value: str) -> bool:
     """Fill a field so CL's jQuery validator always accepts it.
-
-    Strategy (in order):
-    1. JS-clear the field completely (no race between .clear() and typing).
-    2. Type character-by-character with ActionChains (real OS-level input events).
-    3. Fire change + blur so jQuery marks the field valid.
-    4. Verify via both .value attribute AND .textContent (covers <textarea>).
-    5. If still empty, fall back to js_fill + re-fire events.
+    Uses real TAB keypress at the end — this is what triggers jQuery Validate's
+    blur handler (native dispatchEvent does NOT trigger jQuery .on('blur') handlers).
     """
     from selenium.webdriver.common.keys import Keys
     try:
@@ -586,71 +581,53 @@ def selenium_fill(driver, field_id: str, value: str) -> bool:
         driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
         time.sleep(0.3)
 
-        # Step 1 — JS-clear: wipes value AND textContent so nothing lingers
+        # JS-clear via native setter (bypasses React/Vue/jQuery value caching)
         driver.execute_script("""
             var el = arguments[0];
             el.focus();
-            // Clear via native setter (bypasses React/Vue/jQuery caching)
             var tag = el.tagName.toLowerCase();
-            if (tag === 'textarea') {
-                var setter = Object.getOwnPropertyDescriptor(
-                    window.HTMLTextAreaElement.prototype, 'value').set;
-                setter.call(el, '');
-            } else {
-                var setter = Object.getOwnPropertyDescriptor(
-                    window.HTMLInputElement.prototype, 'value').set;
-                setter.call(el, '');
-            }
+            var proto = tag === 'textarea'
+                ? window.HTMLTextAreaElement.prototype
+                : window.HTMLInputElement.prototype;
+            var setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+            if (setter) setter.call(el, ''); else el.value = '';
             el.dispatchEvent(new Event('input',  {bubbles:true}));
             el.dispatchEvent(new Event('change', {bubbles:true}));
         """, el)
-        time.sleep(0.2)
+        time.sleep(0.15)
 
-        # Also Ctrl+A + Delete via Selenium to make sure
+        # Ctrl+A + Delete to clear any residual
         el.click()
         time.sleep(0.1)
         el.send_keys(Keys.CONTROL + "a")
         time.sleep(0.05)
         el.send_keys(Keys.DELETE)
-        time.sleep(0.15)
+        time.sleep(0.1)
 
-        # Step 2 — type with ActionChains (fires real keydown/keypress/keyup)
+        # Type character-by-character with ActionChains (real OS-level key events)
         actions = ActionChains(driver)
-        actions.click(el)
-        actions.pause(0.1)
+        actions.click(el).pause(0.1)
         for ch in value:
             actions.send_keys(ch)
             actions.pause(random.uniform(0.03, 0.07))
         actions.perform()
-        time.sleep(0.4)
-
-        # Step 3 — fire jQuery-compatible event chain after typing
-        driver.execute_script("""
-            var el = arguments[0];
-            ['input','change','blur'].forEach(function(name) {
-                el.dispatchEvent(new Event(name, {bubbles:true, cancelable:true}));
-            });
-        """, el)
         time.sleep(0.3)
 
-        # Step 4 — verify: check BOTH .value and .textContent
-        actual_value = (el.get_attribute("value") or "").strip()
-        actual_text  = (driver.execute_script(
-            "return arguments[0].textContent || '';", el) or "").strip()
-        filled_ok = bool(actual_value) or bool(actual_text)
+        # Press TAB — this is the critical step:
+        # Real TAB fires focus-out/blur in the browser's native event loop,
+        # which jQuery Validate hooks into via $.on('blur'). Synthetic
+        # dispatchEvent('blur') does NOT reach jQuery's event handlers.
+        el.send_keys(Keys.TAB)
+        time.sleep(0.4)
 
-        if not filled_ok:
-            # Step 5 — last resort: pure JS fill + full event chain
+        # Verify fill
+        actual = (el.get_attribute("value") or "").strip()
+        if not actual:
+            # Fallback: JS fill with native setter
             print(f"  ⚠ selenium_fill({field_id}): typing didn't stick — JS fallback")
             js_fill(driver, field_id, value)
-            time.sleep(0.4)
-            # Re-fire change/blur after js_fill too
-            driver.execute_script("""
-                var el = arguments[0];
-                ['input','change','blur'].forEach(function(name) {
-                    el.dispatchEvent(new Event(name, {bubbles:true, cancelable:true}));
-                });
-            """, el)
+            time.sleep(0.3)
+            el.send_keys(Keys.TAB)  # TAB again after JS fill too
             time.sleep(0.3)
 
         return True
@@ -1036,11 +1013,41 @@ def fill_listing_details(driver, product: dict):
     except Exception as e:
         print(f"  ⚠ pre-submit check error: {e}")
 
-    # 4. Click Continue — use TAB to leave last field, then click button
+    # 4. Explicitly trigger jQuery Validate on every critical field before submit.
+    #    $(el).trigger('blur') routes through jQuery's event system — unlike native
+    #    dispatchEvent which bypasses $.on('blur') handlers entirely.
+    try:
+        driver.execute_script("""
+            var fieldIds = ['PostingTitle', 'PostingBody', 'postal_code', 'AskingPrice',
+                            'AskPrice', 'price', 'FromEMail'];
+            fieldIds.forEach(function(id) {
+                var el = document.getElementById(id);
+                if (!el) return;
+                // jQuery trigger — reaches $.on('blur') handlers CL uses for validation
+                if (typeof jQuery !== 'undefined') {
+                    jQuery(el).trigger('blur');
+                    jQuery(el).trigger('change');
+                }
+            });
+            // Tell jQuery Validate the form is valid (clears error highlights)
+            if (typeof jQuery !== 'undefined') {
+                var form = jQuery('#postingForm');
+                if (form.length && form.data('validator')) {
+                    form.data('validator').form();
+                }
+            }
+        """)
+        time.sleep(0.5)
+        print("  [jq] jQuery Validate triggered on all fields")
+    except Exception as jq_err:
+        print(f"  [jq] jQuery trigger skipped: {jq_err}")
+
+    # 5. Click Continue — use TAB to leave last field, then click button
     # TAB ensures the last active field commits its value before submit
     try:
         driver.switch_to.active_element.send_keys(Keys.TAB)
         time.sleep(0.3)
+
     except Exception:
         pass
 
