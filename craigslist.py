@@ -269,7 +269,7 @@ def make_driver(headless: bool = False) -> webdriver.Chrome:
 
     # --- Anti-detection (critical) ---
     options.add_argument("--disable-blink-features=AutomationControlled")
-    options.add_argument("--proxy-server=http://spa1pl920i:dBByddd_WD08p4hk7f@gate.decodo.com:10004")
+    options.add_argument("--proxy-server=http://gate.decodo.com:10004")
     options.add_argument("--accept-lang=en-US,en;q=0.9")
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option("useAutomationExtension", False)
@@ -323,6 +323,15 @@ def make_driver(headless: bool = False) -> webdriver.Chrome:
             except Exception:
                 pass
             raise
+    # --- Proxy authentication via CDP (credentials in URL not supported on Linux Chromium) ---
+    driver.execute_cdp_cmd("Network.enable", {})
+    driver.execute_cdp_cmd("Network.setExtraHTTPHeaders", {
+        "headers": {
+            "Proxy-Authorization": "Basic " + __import__('base64').b64encode(
+                b"spa1pl920i:dBByddd_WD08p4hk7f"
+            ).decode()
+        }
+    })
     driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": """
         Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
         Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
