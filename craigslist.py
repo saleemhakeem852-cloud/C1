@@ -278,15 +278,11 @@ def make_driver(headless: bool = False) -> webdriver.Chrome:
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option("useAutomationExtension", False)
 
-    # --- Proxy via seleniumwire (handles auth natively on headless Linux) ---
-    sw_options = {
-        "proxy": {
-            "http":  "http://spa1pl920i:dBByddd_WD08p4hk7f@gate.decodo.com:10004",
-            "https": "http://spa1pl920i:dBByddd_WD08p4hk7f@gate.decodo.com:10004",
-            # Bypass proxy for login — proxy IP triggers CL account security
-            "no_proxy": "localhost,127.0.0.1,accounts.craigslist.org",
-        }
-    } if SELENIUMWIRE_AVAILABLE else {}
+    # --- No proxy: all CL requests use Railway's direct IP ---
+    # Proxy caused session IP mismatch: login used direct IP (no_proxy bypass),
+    # but form submission used proxy IP → CL server rejected all fields as security.
+    # jQuery Validate is now bypassed client-side, so proxy is no longer needed.
+    sw_options = {}
 
     # --- Persistent profile (reuse between runs so CL session cookies survive) ---
     profile_dir = os.environ.get("CHROME_PROFILE_DIR", "/tmp/clblast_chrome_profile")
