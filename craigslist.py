@@ -885,8 +885,14 @@ def update_ad_analytics_periodically():
 
 def main():
     global CL_CITY
-    email    = os.environ.get("CL_EMAIL")    or input("Enter Craigslist email: ").strip()
-    password = os.environ.get("CL_PASSWORD") or input("Enter Craigslist password: ").strip()
+    email    = os.environ.get("CL_EMAIL", "").strip()
+    password = os.environ.get("CL_PASSWORD", "").strip()
+    if not email:
+        print("✗ CL_EMAIL environment variable not set. Add it to Railway Variables.")
+        return
+    if not password:
+        print("✗ CL_PASSWORD environment variable not set. Add it to Railway Variables.")
+        return
     CL_CITY  = os.environ.get("CL_CITY", CL_CITY)
     _load_existing_listings()
 
