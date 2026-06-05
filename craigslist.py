@@ -998,7 +998,7 @@ def _type_into_field(driver, selector, value, label="field"):
     time.sleep(0.3)
 
     # Triple-click to select all existing text, then delete it
-    ActionChains(driver).move_to_element(el).triple_click(el).perform()
+    ActionChains(driver).move_to_element(el).click(el).click(el).click(el).perform()
     time.sleep(0.2)
     el.send_keys(Keys.DELETE)
     time.sleep(0.2)
@@ -1126,7 +1126,7 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
             actual_zip = (postal_el.get_attribute("value") or "").strip()
             if actual_zip != zip_code:
                 print(f"  [ZIP-final] Still empty/wrong — refilling one last time")
-                ActionChains(driver).move_to_element(postal_el).triple_click(postal_el).perform()
+                ActionChains(driver).move_to_element(postal_el).click(postal_el).click(postal_el).click(postal_el).perform()
                 time.sleep(0.2)
                 postal_el.send_keys(Keys.DELETE)
                 time.sleep(0.1)
