@@ -505,10 +505,23 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
         form_dict.pop('postal', None)  # Don't send invalid/empty postal
     if cl_email:
         form_dict['FromEMail'] = cl_email
+
+    # Price: set in whichever field CL uses, AND always include 'price' as fallback
+    price_set = False
     for pf in ['price', 'AskingPrice', 'AskPrice']:
         if pf in form_dict:
             form_dict[pf] = price
-            break
+            price_set = True
+    if not price_set:
+        form_dict['price'] = price  # Always include price
+
+    # Privacy field: CL requires 'C' (contact by email only) — preserve if already set
+    if 'Privacy' not in form_dict:
+        form_dict['Privacy'] = 'C'
+
+    # Language: preserve whatever the form has; default to English (5) if missing
+    if 'language' not in form_dict:
+        form_dict['language'] = '5'
 
     # Only include phone-related checkboxes if a phone number is actually provided
     contact_phone = (product.get("phone") or product.get("contact_phone") or
@@ -557,66 +570,142 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
             el.dispatchEvent(new Event('blur', {bubbles:true}));
         });
         """)
-        time.sleep(0.5)
+        time.sleep(1.0)
+    except Exception:
+        pass
+
+    # Log any visible validation errors before submitting
+    try:
+        errs = driver.find_elements(By.CSS_SELECTOR, ".err, .error, [class*='error'], [class*='invalid']")
+        for err in errs:
+            txt = (err.text or "").strip()
+            if txt:
+                print(f"  [validate] Visible error: {txt}")
     except Exception:
         pass
 
     print("  [submit] Attempting form submission (multi-strategy)...")
 
+    # Diagnostic: show what submit buttons are available
+    try:
+        btns = driver.find_elements(By.CSS_SELECTOR, "button, input[type='submit']")
+        for b in btns:
+            btype = b.get_attribute('type') or ''
+            bcls = b.get_attribute('class') or ''
+            btxt = (b.text or b.get_attribute('value') or '')[:30]
+            bdis = b.get_attribute('disabled')
+            print(f"  [btn-scan] type={btype} class={bcls[:30]} text={btxt} disabled={bdis}")
+    except Exception:
+        pass
+
+    # Helper: detect whether submission actually succeeded
+    def _submission_succeeded(wait_secs=12):
+        """
+        Returns True if we've moved past the edit page.
+        CL can redirect to s=images, s=preview, s=confirm, s=success, etc.
+        Also returns True if a requests.Response is passed and its HTML
+        doesn't contain the posting form (meaning CL accepted it).
+        """
+        deadline = time.time() + wait_secs
+        while time.time() < deadline:
+            url = driver.current_url
+            if "s=edit" not in url:
+                return True
+            time.sleep(1)
+        return False
+
     # ── Strategy 1: ActionChains real click (most human-like) ──────────────
     submitted = False
+    _SUBMIT_SEL = (
+        "button.go:not([disabled]), "
+        "button.continue:not([disabled]), "
+        "button[type='submit']:not([disabled]), "
+        "button.pickbutton:not([disabled]), "
+        "input[type='submit']:not([disabled])"
+    )
+    def _try_click_submit_buttons():
+        """Try clicking all submit buttons, return True if any navigation occurs."""
+        try:
+            all_btns = driver.find_elements(By.CSS_SELECTOR, _SUBMIT_SEL)
+        except Exception:
+            return False
+        # Try last button first (CL's continue is at page bottom)
+        for btn in reversed(all_btns):
+            try:
+                driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
+                time.sleep(0.4)
+                ActionChains(driver).move_to_element(btn).pause(
+                    random.uniform(0.2, 0.5)).click().perform()
+                time.sleep(2)
+                if "s=edit" not in driver.current_url:
+                    return True
+                # Also try JS click on same button
+                driver.execute_script("arguments[0].click();", btn)
+                time.sleep(2)
+                if "s=edit" not in driver.current_url:
+                    return True
+            except Exception:
+                continue
+        return False
+
     try:
-        btn = WebDriverWait(driver, 10).until(
-            EC.element_to_be_clickable((
-                By.CSS_SELECTOR,
-                "button.go, button.continue, button[type='submit'], button.pickbutton"
-            ))
+        WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, _SUBMIT_SEL))
         )
-        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
-        time.sleep(0.8)
-        ActionChains(driver).move_to_element(btn).pause(
-            random.uniform(0.3, 0.6)).click().perform()
         print("  [submit] ActionChains click sent")
-        time.sleep(8)
-        if "s=edit" not in driver.current_url:
+        if _try_click_submit_buttons() or _submission_succeeded(10):
             submitted = True
-            print("  ✅ Strategy 1 (ActionChains) succeeded")
+            print(f"  ✅ Strategy 1 (ActionChains) succeeded → {driver.current_url}")
+        else:
+            print(f"  [submit] Strategy 1: still on edit page after click")
     except Exception as e:
         print(f"  [submit] Strategy 1 failed: {e}")
 
-    # ── Strategy 2: JS click ───────────────────────────────────────────────
+    # ── Strategy 2: JS click on all buttons ───────────────────────────────
     if not submitted:
         try:
-            btn = driver.find_element(
-                By.CSS_SELECTOR,
-                "button.go, button.continue, button[type='submit'], button.pickbutton"
-            )
-            driver.execute_script("arguments[0].click();", btn)
+            all_btns = driver.find_elements(By.CSS_SELECTOR, _SUBMIT_SEL)
+            for btn in reversed(all_btns):
+                driver.execute_script("arguments[0].click();", btn)
+                time.sleep(3)
+                if "s=edit" not in driver.current_url:
+                    break
             print("  [submit] JS click sent")
-            time.sleep(8)
-            if "s=edit" not in driver.current_url:
+            if _submission_succeeded(10):
                 submitted = True
-                print("  ✅ Strategy 2 (JS click) succeeded")
+                print(f"  ✅ Strategy 2 (JS click) succeeded → {driver.current_url}")
         except Exception as e:
             print(f"  [submit] Strategy 2 failed: {e}")
 
-    # ── Strategy 3: JS form.submit() ──────────────────────────────────────
+    # ── Strategy 3: Enter key on focused form field ─────────────────────────
+    if not submitted:
+        try:
+            # Focus a text field then press Enter — triggers CL's own submit handler
+            title_el = driver.find_element(By.CSS_SELECTOR, "[name='PostingTitle']")
+            title_el.send_keys(Keys.RETURN)
+            print("  [submit] Enter key sent on title field")
+            if _submission_succeeded(12):
+                submitted = True
+                print(f"  ✅ Strategy 3 (Enter key) succeeded → {driver.current_url}")
+        except Exception as e:
+            print(f"  [submit] Strategy 3 failed: {e}")
+
+    # ── Strategy 4: JS form.submit() ──────────────────────────────────────
     if not submitted:
         try:
             driver.execute_script(
                 "var f=document.getElementById('postingForm'); if(f) f.submit();"
             )
             print("  [submit] form.submit() sent")
-            time.sleep(8)
-            if "s=edit" not in driver.current_url:
+            if _submission_succeeded(12):
                 submitted = True
-                print("  ✅ Strategy 3 (form.submit) succeeded")
+                print(f"  ✅ Strategy 4 (form.submit) succeeded → {driver.current_url}")
         except Exception as e:
-            print(f"  [submit] Strategy 3 failed: {e}")
+            print(f"  [submit] Strategy 4 failed: {e}")
 
-    # ── Strategy 4: requests POST using cookies from browser session ───────
+    # ── Strategy 5: requests POST using cookies from browser session ───────
     if not submitted:
-        print("  [submit] Strategy 4: requests POST with browser cookies...")
+        print("  [submit] Strategy 5: requests POST with browser cookies...")
         try:
             session = requests.Session()
             # Copy all browser cookies into requests session
@@ -641,16 +730,23 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
                 timeout=30,
             )
             print(f"  [submit] requests POST → {resp.status_code} → {resp.url}")
-            if resp.status_code == 200 and "s=edit" not in resp.url:
+            # CL returns 200 even on failure — check for postingForm in body
+            # If the response body still contains postingForm, submission was rejected
+            resp_has_form = 'id="postingForm"' in resp.text or "name=\"cryptedStepCheck\"" in resp.text
+            if resp.status_code == 200 and "s=edit" not in resp.url and not resp_has_form:
                 # Navigate driver to the response URL so publish step works
                 driver.get(resp.url)
                 time.sleep(3)
                 submitted = True
-                print("  ✅ Strategy 4 (requests POST) succeeded")
+                print(f"  ✅ Strategy 5 (requests POST) succeeded → {resp.url}")
             else:
-                print(f"  [submit] Strategy 4 response URL: {resp.url}")
+                # Extract any error messages from the response HTML
+                err_matches = re.findall(r'class="[^"]*err[^"]*"[^>]*>([^<]{5,})<', resp.text)
+                if err_matches:
+                    print(f"  [submit] CL error(s): {err_matches[:3]}")
+                print(f"  [submit] Strategy 5 rejected (form still present: {resp_has_form})")
         except Exception as e:
-            print(f"  [submit] Strategy 4 failed: {e}")
+            print(f"  [submit] Strategy 5 failed: {e}")
 
     if not submitted:
         print("  ❌ All submit strategies failed — still on edit page")
