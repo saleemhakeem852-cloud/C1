@@ -842,6 +842,18 @@ def main():
     password = os.environ.get("CL_PASSWORD") or input("Enter Craigslist password: ").strip()
     CL_CITY  = os.environ.get("CL_CITY", CL_CITY)
     _load_existing_listings()
+
+    # Start virtual display so Chromium runs non-headless (avoids bot detection)
+    # while still working on a headless server like Railway
+    try:
+        from xvfbwrapper import Xvfb
+        vdisplay = Xvfb(width=1280, height=800, colordepth=24)
+        vdisplay.start()
+        print("  [Xvfb] Virtual display started ✓")
+    except Exception as e:
+        print(f"  [Xvfb] Could not start virtual display: {e} — continuing without it")
+        vdisplay = None
+
     driver = make_driver()
     if not craigslist_login(driver, email, password):
         driver.quit()
@@ -869,6 +881,11 @@ def main():
         time.sleep(3)
     print("\nAll Craigslist products processed.")
     driver.quit()
+    try:
+        if vdisplay:
+            vdisplay.stop()
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":
