@@ -12,6 +12,8 @@ import time
 import json
 import os
 import random
+import shutil
+import subprocess
 import threading
 import tempfile
 import urllib.request
@@ -31,12 +33,6 @@ try:
     CAPTCHA_SOLVER_AVAILABLE = True
 except ImportError:
     CAPTCHA_SOLVER_AVAILABLE = False
-
-try:
-    import pyperclip
-    PYPERCLIP_AVAILABLE = True
-except ImportError:
-    PYPERCLIP_AVAILABLE = False
 
 TWO_CAPTCHA_API_KEY = os.environ.get("TWO_CAPTCHA_KEY", "YOUR_2CAPTCHA_API_KEY")
 LISTINGS_JSON       = "posted_listings.json"
@@ -142,21 +138,44 @@ def _find_binary(names, fallback_paths):
             return p
     return None
 
+def _ensure_xvfb():
+    """Headed Chromium on a virtual display — CL often rejects headless fills."""
+    if os.environ.get("DISPLAY"):
+        return
+    if not IS_RAILWAY and not shutil.which("Xvfb"):
+        return
+    xvfb = shutil.which("Xvfb") or "/usr/bin/Xvfb"
+    if not os.path.exists(xvfb):
+        return
+    try:
+        subprocess.Popen(
+            [xvfb, ":99", "-screen", "0", "1280x800x24", "-ac"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        os.environ["DISPLAY"] = ":99"
+        time.sleep(1.0)
+        print("  [driver] Xvfb started (DISPLAY=:99)")
+    except Exception as e:
+        print(f"  [driver] Xvfb unavailable: {e}")
+
+
 def make_driver(proxy_url=None):
     from selenium.webdriver.chrome.service import Service as ChromeService
     os.environ["SE_MANAGER_PATH"] = ""
     os.environ["WDM_SKIP_DOWNLOAD"] = "1"
+    _ensure_xvfb()
+    use_headed = bool(os.environ.get("DISPLAY"))
 
     # Use proxy from argument or environment
     if not proxy_url:
         proxy_url = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
 
     options = webdriver.ChromeOptions()
-    for arg in [
+    chrome_args = [
         "--no-sandbox",
         "--disable-dev-shm-usage",
         "--disable-gpu",
-        "--headless=new",
         "--window-size=1280,800",
         "--disable-setuid-sandbox",
         "--disable-blink-features=AutomationControlled",
@@ -165,8 +184,13 @@ def make_driver(proxy_url=None):
         "--mute-audio",
         "--no-first-run",
         "--shm-size=256m",
-    ]:
+    ]
+    if not use_headed:
+        chrome_args.insert(3, "--headless=new")
+    for arg in chrome_args:
         options.add_argument(arg)
+    if use_headed:
+        print("  [driver] Headed mode (virtual display)")
 
     # Apply proxy to Chrome so login + navigation use the same IP as the POST request
     if proxy_url:
@@ -216,7 +240,7 @@ def make_driver(proxy_url=None):
             options=options,
             driver_executable_path=chromedriver_bin,
             browser_executable_path=chromium_bin,
-            headless=True,
+            headless=not use_headed,
             use_subprocess=True,
         )
         print("  [driver] Using undetected-chromedriver")
@@ -351,75 +375,19 @@ def _react_set_value(driver, element, value):
 
 
 def _disable_form_autofill(driver):
-    """Block browser autofill and CL prefills before we type."""
+    """Block browser autofill before we type."""
     try:
         driver.execute_script("""
             var form = document.getElementById('postingForm');
             if (!form) return;
             form.setAttribute('autocomplete', 'off');
             form.querySelectorAll('input,textarea').forEach(function(el) {
-                el.setAttribute('autocomplete', 'one-time-code');
+                el.setAttribute('autocomplete', 'off');
                 el.setAttribute('data-lpignore', 'true');
-                el.setAttribute('data-form-type', 'other');
-                el.setAttribute('readonly', 'readonly');
-                el.addEventListener('focus', function onFocus() {
-                    el.removeAttribute('readonly');
-                    el.removeEventListener('focus', onFocus);
-                });
             });
         """)
     except Exception:
         pass
-
-
-_ACKNOWLEDGE_FIELD_JS = """
-var el = arguments[0];
-var value = String(arguments[1]);
-function walkFiber(f, d) {
-    if (!f || d > 22) return;
-    var s = f.memoizedState;
-    while (s) {
-        var m = s.memoizedState;
-        if (m && typeof m === 'object') {
-            Object.keys(m).forEach(function(k) {
-                if (/autofill/i.test(k)) m[k] = false;
-                if (/userEdited|userModified|manuallyEdited|touched|dirty/i.test(k)) m[k] = true;
-            });
-        }
-        s = s.next;
-    }
-    walkFiber(f.child, d + 1);
-    walkFiber(f.sibling, d + 1);
-}
-el.dispatchEvent(new FocusEvent('focusin', {bubbles: true}));
-el.focus();
-if (el._valueTracker) el._valueTracker.setValue('');
-var proto = el.tagName === 'TEXTAREA'
-    ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-var desc = Object.getOwnPropertyDescriptor(proto, 'value');
-if (desc && desc.set) desc.set.call(el, value);
-else el.value = value;
-try {
-    el.dispatchEvent(new InputEvent('beforeinput', {
-        bubbles: true, cancelable: true, inputType: 'insertFromPaste', data: value
-    }));
-} catch (e) {}
-el.dispatchEvent(new InputEvent('input', {bubbles: true, inputType: 'insertFromPaste', data: value}));
-el.dispatchEvent(new Event('change', {bubbles: true}));
-var fk = Object.keys(el).find(function(k) { return k.indexOf('__reactFiber') === 0; });
-if (fk) walkFiber(el[fk], 0);
-el.dispatchEvent(new FocusEvent('blur', {bubbles: true}));
-el.dispatchEvent(new FocusEvent('focusout', {bubbles: true}));
-return el.value;
-"""
-
-
-def _acknowledge_field(driver, element, value):
-    """Mark a field user-edited in React so CL clears the autofilled flag."""
-    try:
-        return driver.execute_script(_ACKNOWLEDGE_FIELD_JS, element, str(value)) or ""
-    except Exception:
-        return ""
 
 
 def _cdp_click_element(driver, element):
@@ -455,7 +423,7 @@ def _focus_field(driver, element):
 
 
 def _type_with_send_keys(driver, element, value):
-    """Type with real send_keys — works reliably in headless Chromium."""
+    """Type with real send_keys — trusted events React/CL accept."""
     driver.execute_script("""
         var el = arguments[0];
         if (el._valueTracker) { el._valueTracker.setValue(''); }
@@ -466,69 +434,39 @@ def _type_with_send_keys(driver, element, value):
     time.sleep(0.1)
     for ch in str(value):
         element.send_keys(ch)
-        time.sleep(random.uniform(0.04, 0.11))
+        time.sleep(random.uniform(0.06, 0.14))
 
 
-def _paste_fill(driver, element, value):
-    """Paste via clipboard — CL treats paste as a manual user edit."""
-    value = str(value)
+def _nudge_user_edited(element):
+    """Tiny edit at end-of-field via send_keys — clears CL 'autofilled' flag."""
+    element.click()
+    time.sleep(0.12)
+    element.send_keys(Keys.END)
+    time.sleep(0.08)
+    val = (element.get_attribute("value") or "").strip()
+    ch = val[-1] if val else " "
+    element.send_keys(ch)
+    time.sleep(0.08)
+    element.send_keys(Keys.BACKSPACE)
+    time.sleep(0.1)
+
+
+def _cl_fill_field(driver, element, value, *, nudge=False, use_tab=True):
+    """Focus, type slowly, optional nudge for autofilled-sensitive fields."""
     _focus_field(driver, element)
-    pasted = False
-    if PYPERCLIP_AVAILABLE:
-        try:
-            pyperclip.copy(value)
-            element.send_keys(Keys.CONTROL + "a")
-            time.sleep(0.05)
-            element.send_keys(Keys.DELETE)
-            time.sleep(0.08)
-            element.send_keys(Keys.CONTROL + "v")
-            time.sleep(0.25)
-            if (element.get_attribute("value") or "").strip() == value.strip():
-                pasted = True
-        except Exception as e:
-            print(f"  [paste] clipboard failed: {e}")
-    if not pasted:
-        try:
-            element.send_keys(Keys.CONTROL + "a")
-            time.sleep(0.05)
-            element.send_keys(Keys.DELETE)
-            time.sleep(0.08)
-            _cdp_click_element(driver, element)
-            time.sleep(0.1)
-            driver.execute_cdp_cmd("Input.insertText", {"text": value})
-            time.sleep(0.2)
-            if (element.get_attribute("value") or "").strip() == value.strip():
-                pasted = True
-        except Exception:
-            pass
-    if not pasted:
-        _type_with_send_keys(driver, element, value)
-    _acknowledge_field(driver, element, value)
-    time.sleep(0.15)
-
-
-def _reliable_fill(driver, element, value, use_paste=False, use_tab=True):
-    """Focus, fill (paste or keys), acknowledge for CL, blur."""
-    if use_paste:
-        _paste_fill(driver, element, value)
-    else:
-        _focus_field(driver, element)
-        _type_with_send_keys(driver, element, value)
-        _acknowledge_field(driver, element, value)
+    _type_with_send_keys(driver, element, value)
+    if nudge:
+        _nudge_user_edited(element)
     if use_tab:
-        try:
-            element.send_keys(Keys.TAB)
-        except Exception:
-            driver.execute_script(
-                "arguments[0].dispatchEvent(new Event('blur',{bubbles:true}));", element)
+        element.send_keys(Keys.TAB)
     else:
         driver.execute_script(
             "arguments[0].dispatchEvent(new Event('blur',{bubbles:true}));", element)
-    time.sleep(0.35)
+    time.sleep(0.4)
 
 
-def _ensure_field_value(driver, name, expected):
-    """Re-fill if DOM value does not match expected (fixes corrupted fields)."""
+def _ensure_field_value(driver, name, expected, nudge=False):
+    """Re-fill if DOM value does not match expected."""
     expected = str(expected).strip()
     if not expected:
         return True
@@ -538,7 +476,7 @@ def _ensure_field_value(driver, name, expected):
         if actual == expected:
             return True
         print(f"  [fix] {name}: got '{actual[:40]}' want '{expected[:40]}'")
-        _paste_fill(driver, el, expected)
+        _cl_fill_field(driver, el, expected, nudge=nudge, use_tab=True)
         actual = (el.get_attribute("value") or "").strip()
         ok = actual == expected
         if not ok:
@@ -547,6 +485,10 @@ def _ensure_field_value(driver, name, expected):
     except Exception as e:
         print(f"  [fix] {name}: {e}")
         return False
+
+
+# CL flags these unless the user appears to have edited them manually
+_NUDGE_FIELDS = frozenset({"PostingTitle", "postal", "FromEMail"})
 
 
 def _autofill_fields_from_errors(errs):
@@ -615,9 +557,6 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     except Exception:
         price = "1"
 
-    # Fields CL most often flags as browser-autofilled — use paste + acknowledge
-    _PASTE_FIELDS = frozenset({"PostingTitle", "postal", "FromEMail"})
-
     def real_fill(selector, value, use_tab=True):
         value = str(value).strip()
         if not value:
@@ -626,12 +565,15 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
             el = WebDriverWait(driver, 8).until(
                 EC.presence_of_element_located((By.CSS_SELECTOR, selector)))
             name = el.get_attribute("name") or ""
-            use_paste = name in _PASTE_FIELDS
-            _reliable_fill(driver, el, value, use_paste=use_paste, use_tab=use_tab)
+            _cl_fill_field(
+                driver, el, value,
+                nudge=(name in _NUDGE_FIELDS),
+                use_tab=use_tab,
+            )
             actual = (el.get_attribute("value") or "").strip()
             if actual != value:
-                print(f"  ⚠ {selector} mismatch — retrying with paste")
-                _paste_fill(driver, el, value)
+                print(f"  ⚠ {selector} mismatch — retrying")
+                _cl_fill_field(driver, el, value, nudge=True, use_tab=use_tab)
                 actual = (el.get_attribute("value") or "").strip()
             print(f"  ✓ {selector} = '{actual[:50]}'")
             return actual
@@ -660,7 +602,11 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
                 continue
             try:
                 el = driver.find_element(By.CSS_SELECTOR, f"[name='{name}']")
-                _reliable_fill(driver, el, val, use_paste=True)
+                _cl_fill_field(
+                    driver, el, val,
+                    nudge=(name in _NUDGE_FIELDS),
+                    use_tab=True,
+                )
             except Exception as e:
                 print(f"  [retry] Could not re-fill {name}: {e}")
 
@@ -706,22 +652,23 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     else:
         print("  ⚠ No ZIP/postal code for this city — skipping postal field")
 
-    print("  Acknowledging title + ZIP for CL autofill check...")
-    for ack_name in ("PostingTitle", "postal"):
-        ack_val = _field_map.get(ack_name)
-        if not ack_val:
+    print("  Nudging title, email, ZIP (CL autofill check)...")
+    for nudge_name in _NUDGE_FIELDS:
+        nudge_val = _field_map.get(nudge_name)
+        if not nudge_val:
             continue
         try:
-            el = driver.find_element(By.CSS_SELECTOR, f"[name='{ack_name}']")
-            _paste_fill(driver, el, ack_val)
-            time.sleep(0.4)
+            el = driver.find_element(By.CSS_SELECTOR, f"[name='{nudge_name}']")
+            _nudge_user_edited(el)
+            time.sleep(0.35)
         except Exception as e:
-            print(f"  [ack] {ack_name}: {e}")
+            print(f"  [nudge] {nudge_name}: {e}")
 
     print("  Verifying field values...")
     for fname, fval in _field_map.items():
         if fval:
-            _ensure_field_value(driver, fname, fval)
+            _ensure_field_value(
+                driver, fname, fval, nudge=(fname in _NUDGE_FIELDS))
 
     time.sleep(0.5)
     val_errs = _form_validation_errors(driver)
@@ -736,7 +683,8 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
         time.sleep(0.8)
         for fname, fval in _field_map.items():
             if fval:
-                _ensure_field_value(driver, fname, fval)
+                _ensure_field_value(
+                    driver, fname, fval, nudge=(fname in _NUDGE_FIELDS))
         val_errs = _form_validation_errors(driver)
         for err in val_errs[:4]:
             print(f"  [validate] Still visible: {err[:120]}")
@@ -846,14 +794,10 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     for k, v in sorted(form_dict.items()):
         print(f"  [post-field] {k}={str(v)[:50]}")
 
-    # Last chance: re-acknowledge autofilled fields before browser submit
-    for ack_name in ("PostingTitle", "postal"):
-        ack_val = _field_map.get(ack_name)
-        if not ack_val:
-            continue
+    for nudge_name in ("PostingTitle", "postal", "FromEMail"):
         try:
-            el = driver.find_element(By.CSS_SELECTOR, f"[name='{ack_name}']")
-            _acknowledge_field(driver, el, ack_val)
+            el = driver.find_element(By.CSS_SELECTOR, f"[name='{nudge_name}']")
+            _nudge_user_edited(el)
         except Exception:
             pass
     time.sleep(0.5)

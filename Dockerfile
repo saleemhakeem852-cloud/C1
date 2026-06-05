@@ -28,7 +28,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgbm1 \
     libasound2 \
     xclip \
+    xvfb \
     && rm -rf /var/lib/apt/lists/*
+
+ENV DISPLAY=:99
 
 # Wrapper script so chromedriver always starts with --allowed-origins=*
 RUN printf '#!/bin/sh\nexec /usr/bin/chromedriver --allowed-ips="" --allowed-origins="*" "$@"\n' \
