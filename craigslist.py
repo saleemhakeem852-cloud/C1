@@ -318,8 +318,6 @@ def make_driver(proxy_url=None):
         "autofill.credit_card_enabled": False,
         "intl.accept_languages": fp["lang"],
     })
-    options.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
-    options.add_experimental_option("useAutomationExtension", False)
 
     chromium_bin = _find_binary(
         ["google-chrome", "chromium", "chromium-browser"],
@@ -1507,7 +1505,7 @@ def _click_first(driver, selectors, label="button"):
             driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
             time.sleep(0.3)
             try:
-                ActionChains(driver).move_to_element(el).pause(0.4).click().perform()
+                ActionChains(driver).move_to_element(el).pause(random.uniform(0.2, 0.5)).click().perform()
             except Exception:
                 driver.execute_script("arguments[0].click();", el)
             print(f"  ✓ Clicked {label} ({sel[:50]})")
