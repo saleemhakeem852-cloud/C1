@@ -554,201 +554,83 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
         except Exception:
             print(f"  [pre-submit] {fname}: NOT FOUND")
 
-    # ── EXTRACT form data NOW before any JS can clear it ─────────────────────
-    # This is the key fix: read everything into Python, then override postal
-    # with our Python variable. CL's JS cannot touch Python variables.
-    print("  [submit] Extracting form data before any JS runs...")
-    try:
-        form_info = driver.execute_script("""
-            var form = document.getElementById('postingForm');
-            if (!form) return null;
-            var data = {};
-            form.querySelectorAll('input,textarea,select').forEach(function(el) {
-                if (!el.name) return;
-                if ((el.type === 'checkbox' || el.type === 'radio') && !el.checked) return;
-                data[el.name] = el.value || '';
-            });
-            return {fields: data, action: form.action || ''};
-        """)
-    except Exception as e:
-        print(f"  [submit] Could not extract form: {e}")
-        return None
+    # ── SUBMIT: type postal last, then click Continue immediately ───────────────
+    # Key insight from logs: region/subregion/category are server-side only —
+    # they are NOT in the DOM. So requests POST always fails on ZIP.
+    # Solution: use the BROWSER to submit (it has the full session).
+    # Type postal as the very last action, then click Continue within 200ms
+    # before CL's JS can run and clear it.
+    print("  [submit] Typing postal last then clicking Continue...")
 
-    if not form_info or not form_info.get("fields"):
-        print("  [submit] form_info is empty — postingForm may not be ready")
-        return None
-
-    post_data = form_info["fields"]
-    action_url = form_info.get("action") or driver.current_url
-
-    if action_url.startswith("/"):
-        action_url = "https://post.craigslist.org" + action_url
-
-    # Force our known-good Python values — overrides anything CL's JS cleared
-    post_data["PostingTitle"] = title
-    post_data["PostingBody"]  = description
-    post_data["price"]        = price
+    # Re-type postal right now as absolute last action
     if zip_code:
-        post_data["postal"]   = zip_code
-    if city_name:
-        post_data["geographic_area"] = city_name
-    if cl_email:
-        post_data["FromEMail"] = cl_email
-    post_data["go"] = "continue"
+        try:
+            postal_el = WebDriverWait(driver, 5).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "[name='postal']")))
+            driver.execute_script(
+                "arguments[0].scrollIntoView({block:'center'});", postal_el)
+            time.sleep(0.2)
+            postal_el.click()
+            postal_el.send_keys(Keys.CONTROL + "a")
+            time.sleep(0.08)
+            postal_el.send_keys(Keys.DELETE)
+            time.sleep(0.08)
+            for ch in zip_code:
+                postal_el.send_keys(ch)
+                time.sleep(random.uniform(0.06, 0.10))
+            # Do NOT tab away — keep focus on postal, do not trigger blur
+            actual = (postal_el.get_attribute("value") or "").strip()
+            print(f"  [ZIP-final] typed='{actual}' (not blurred)")
+        except Exception as e:
+            print(f"  [ZIP-final] failed: {e}")
 
-    # ── Build requests session with live browser cookies ──────────────────────
-    session = requests.Session()
-    for cookie in driver.get_cookies():
-        domain = cookie.get("domain", "").lstrip(".")
-        session.cookies.set(cookie["name"], cookie["value"], domain=domain)
+    # Find and click Continue button via JS — fastest possible path
+    # JS click fires synchronously before React's async onChange can clear postal
+    result = driver.execute_script("""
+        var form = document.getElementById('postingForm');
+        if (!form) return 'no-form';
+        var btn = form.querySelector(
+            'button.go, button.bigbutton, button[type="submit"], input[type="submit"]');
+        if (!btn) return 'no-btn';
+        btn.scrollIntoView({block: 'center'});
+        btn.click();
+        return 'clicked:' + (btn.textContent || btn.value || '').trim().substring(0, 20);
+    """)
+    print(f"  [submit] JS click → {result}")
 
-    ua = driver.execute_script("return navigator.userAgent;") or \
-         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36"
+    # Wait up to 25s to leave the edit page
+    deadline = time.time() + 25
+    while time.time() < deadline:
+        cur = driver.current_url
+        if "s=edit" not in cur:
+            print(f"  ✅ Left edit page → {cur}")
+            return cur
+        time.sleep(0.4)
 
-    headers = {
-        "Content-Type":  "application/x-www-form-urlencoded",
-        "Referer":       driver.current_url,
-        "Origin":        "https://post.craigslist.org",
-        "User-Agent":    ua,
-        "Accept":        "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-    }
-
-    # Log ALL hidden fields for diagnosis
-    hidden_keys = [k for k,v in post_data.items() if k not in (
-        'PostingTitle','PostingBody','price','postal','geographic_area','FromEMail','go')]
-    print(f"  [post-data] postal={post_data.get('postal')} "
-          f"title={post_data.get('PostingTitle','')[:30]}")
-    print(f"  [post-data] cryptedStepCheck="
-          f"{'YES' if post_data.get('cryptedStepCheck') else 'MISSING'}")
-    print(f"  [post-data] action={action_url}")
-    print(f"  [post-data] hidden_fields={hidden_keys}")
-    print(f"  [post-data] region={post_data.get('region','MISSING')} "
-          f"subregion={post_data.get('subregion','MISSING')} "
-          f"category={post_data.get('category','MISSING')} "
-          f"catAbb={post_data.get('catAbb','MISSING')}")
-
+    # Still on edit page — check what CL says
     try:
-        resp = session.post(
-            action_url,
-            data=post_data,
-            headers=headers,
-            allow_redirects=True,
-            timeout=30,
-        )
-        print(f"  [submit-result] {resp.status_code} → {resp.url}")
+        errs = driver.execute_script("""
+            var msgs = [];
+            document.querySelectorAll('.err, .error, [class*="error"]').forEach(function(el) {
+                var t = (el.textContent || '').replace(/\\s+/g,' ').trim();
+                if (t && t.length > 4 && t.length < 120) msgs.push(t);
+            });
+            return msgs;
+        """) or []
+        print(f"  [submit-errors] {errs[:5]}")
+        # Log field state
+        for fname in ["PostingTitle", "PostingBody", "postal", "price"]:
+            try:
+                el = driver.find_element(By.CSS_SELECTOR, f"[name='{fname}']")
+                print(f"  [fail] {fname}='{(el.get_attribute('value') or '')[:40]}' "
+                      f"invalid={el.get_attribute('aria-invalid')}")
+            except Exception:
+                print(f"  [fail] {fname}: NOT FOUND")
+    except Exception:
+        pass
 
-        if "s=edit" not in resp.url and resp.status_code == 200:
-            driver.get(resp.url)
-            time.sleep(2)
-            print(f"  ✅ Form submitted → {resp.url}")
-            return resp.url
-
-        # requests POST failed — parse CL error and try browser click fallback
-        try:
-            from html.parser import HTMLParser
-
-            class _ErrParser(HTMLParser):
-                def __init__(self):
-                    super().__init__()
-                    self._in_err = False
-                    self.msgs = []
-                    self._cur = ""
-
-                def handle_starttag(self, tag, attrs):
-                    cls = dict(attrs).get("class", "")
-                    if "err" in cls or "error" in cls:
-                        self._in_err = True
-                        self._cur = ""
-
-                def handle_endtag(self, tag):
-                    if self._in_err:
-                        t = self._cur.strip()
-                        if t and len(t) > 4:
-                            self.msgs.append(t)
-                        self._in_err = False
-
-                def handle_data(self, data):
-                    if self._in_err:
-                        self._cur += data
-
-            p = _ErrParser()
-            p.feed(resp.text)
-            if p.msgs:
-                print(f"  [cl-errors] {p.msgs[:5]}")
-            else:
-                bc_start = resp.text.find("breadcrumbs")
-                if bc_start != -1:
-                    print(f"  [resp-breadcrumb] {resp.text[bc_start:bc_start+120]}")
-                else:
-                    snippet = resp.text.replace("\n", " ").replace("\r", "")
-                    print(f"  [resp-snippet] {snippet[100:400]}")
-        except Exception:
-            pass
-
-        # ── FALLBACK: retype postal fresh and click Continue in the browser ──
-        # The requests POST failed on ZIP. Let CL's own browser submit handle it —
-        # but first re-type postal right now so the DOM is fresh.
-        print("  [fallback] Trying browser Continue click after re-typing postal...")
-        try:
-            # Re-type postal as very last action
-            if zip_code:
-                postal_el = WebDriverWait(driver, 5).until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, "[name='postal']")))
-                driver.execute_script(
-                    "arguments[0].scrollIntoView({block:'center'});", postal_el)
-                time.sleep(0.3)
-                postal_el.click()
-                postal_el.send_keys(Keys.CONTROL + "a")
-                time.sleep(0.1)
-                postal_el.send_keys(Keys.DELETE)
-                time.sleep(0.1)
-                for ch in zip_code:
-                    postal_el.send_keys(ch)
-                    time.sleep(random.uniform(0.08, 0.15))
-                time.sleep(0.4)
-                actual = (postal_el.get_attribute("value") or "").strip()
-                print(f"  [fallback] postal re-typed='{actual}'")
-
-            # Use requestSubmit — triggers CL's own validation + submit pipeline
-            # but with the postal field freshly typed so CL won't flag it
-            result = driver.execute_script("""
-                var form = document.getElementById('postingForm');
-                if (!form) return 'no-form';
-                var btn = form.querySelector(
-                    'button.go, button[type="submit"], input[type="submit"]');
-                if (!btn) return 'no-btn';
-                btn.scrollIntoView({block: 'center'});
-                try {
-                    if (typeof form.requestSubmit === 'function') {
-                        form.requestSubmit(btn);
-                        return 'requestSubmit';
-                    }
-                } catch(e) {}
-                btn.click();
-                return 'click';
-            """)
-            print(f"  [fallback] submit method={result}")
-
-            # Wait up to 20s to leave edit page
-            deadline = time.time() + 20
-            while time.time() < deadline:
-                cur = driver.current_url
-                if "s=edit" not in cur:
-                    print(f"  ✅ [fallback] Left edit page → {cur}")
-                    return cur
-                time.sleep(0.5)
-
-            print("  [fallback] Still on edit page after 20s")
-        except Exception as fe:
-            print(f"  [fallback] error: {fe}")
-
-        return None
-
-    except Exception as e:
-        print(f"  [submit] POST failed: {e}")
-        return None
+    print("  ❌ All submit strategies failed")
+    return None
 
 
 def fill_listing_details(driver, product: dict):
