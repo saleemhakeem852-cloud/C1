@@ -467,8 +467,9 @@ def _type_into_field(driver, selector, value, label="field"):
 
 def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     """
-    Fill CL posting form with human keystrokes, then submit via
-    Python requests POST — bypasses CL's JS that clears postal on submit.
+    Fill the CL posting form and submit via browser click.
+    region/subregion/category live server-side only — requests POST cannot work.
+    We use the browser's own submit with postal typed last.
     """
     try:
         WebDriverWait(driver, 15).until(
@@ -480,12 +481,12 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     handle_captcha_if_present(driver)
     time.sleep(2)
 
-    # ── Build values ──────────────────────────────────────────────────────────
+    # Build values
     title = (product.get("title") or product.get("name") or "Quality Item For Sale").strip()
     description = (product.get("description") or (
         f"{title} in excellent condition. Well maintained and ready for a new home. "
         "Priced to sell. Local pickup preferred. Message for details.")).strip()
-    _pr = str(product.get("price", "")).strip().replace("$", "").replace(",", "").replace("Rs", "").strip()
+    _pr = str(product.get("price", "")).strip().replace("$","").replace(",","").replace("Rs","").strip()
     try:
         price = str(round(float(_pr))) if _pr else "10"
     except Exception:
@@ -493,7 +494,7 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
 
     print(f"  [fill] title='{title[:50]}' price={price} zip={zip_code} city={city_name}")
 
-    # ── Disable browser autofill ──────────────────────────────────────────────
+    # Disable browser autofill
     try:
         driver.execute_script("""
             var f = document.getElementById('postingForm');
@@ -508,10 +509,11 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     except Exception:
         pass
 
-    # ── Fill each field ───────────────────────────────────────────────────────
+    # Fill title
     _type_into_field(driver, "[name='PostingTitle']", title, "title")
     time.sleep(0.4)
 
+    # Fill price
     for price_sel in ["[name='price']", "[name='AskingPrice']", "[name='AskPrice']"]:
         try:
             driver.find_element(By.CSS_SELECTOR, price_sel)
@@ -520,83 +522,67 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
         except Exception:
             continue
 
+    # Fill city/neighborhood (optional)
     try:
         driver.find_element(By.CSS_SELECTOR, "[name='geographic_area']")
         _type_into_field(driver, "[name='geographic_area']", city_name, "city")
     except Exception:
         pass
 
-    if zip_code:
-        _type_into_field(driver, "[name='postal']", zip_code, "ZIP")
-        time.sleep(0.5)
-
+    # Fill description
     _type_into_field(driver, "[name='PostingBody']", description, "description")
     time.sleep(0.5)
 
+    # Fill email if editable
     try:
         email_el = driver.find_element(By.CSS_SELECTOR, "[name='FromEMail']")
         if not email_el.get_attribute("disabled") and not email_el.get_attribute("readOnly"):
             if cl_email:
                 _type_into_field(driver, "[name='FromEMail']", cl_email, "email")
         else:
-            print("  [email] Pre-filled by account (not editable)")
+            print("  [email] Pre-filled by account")
     except Exception:
         pass
 
-    time.sleep(1.0)
+    time.sleep(0.8)
 
-    # ── Log pre-submit state ──────────────────────────────────────────────────
-    for fname in ["PostingTitle", "PostingBody", "postal", "price", "FromEMail"]:
-        try:
-            el = driver.find_element(By.CSS_SELECTOR, f"[name='{fname}']")
-            val = (el.get_attribute("value") or "")[:50]
-            print(f"  [pre-submit] {fname}: '{val}'")
-        except Exception:
-            print(f"  [pre-submit] {fname}: NOT FOUND")
+    # ── POSTAL LAST — type it, do NOT blur/tab, click button immediately ─────
+    # CL's JS clears postal on blur. So: type postal -> click button in same
+    # synchronous JS call -> browser submits before React can clear anything.
+    print("  [submit] Typing postal then clicking Continue in one JS call...")
 
-    # ── SUBMIT: type postal last, then click Continue immediately ───────────────
-    # Key insight from logs: region/subregion/category are server-side only —
-    # they are NOT in the DOM. So requests POST always fails on ZIP.
-    # Solution: use the BROWSER to submit (it has the full session).
-    # Type postal as the very last action, then click Continue within 200ms
-    # before CL's JS can run and clear it.
-    print("  [submit] Typing postal last then clicking Continue...")
+    submit_result = driver.execute_script("""
+        var zipCode = arguments[0];
 
-    # Re-type postal right now as absolute last action
-    if zip_code:
-        try:
-            postal_el = WebDriverWait(driver, 5).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "[name='postal']")))
-            driver.execute_script(
-                "arguments[0].scrollIntoView({block:'center'});", postal_el)
-            time.sleep(0.2)
-            postal_el.click()
-            postal_el.send_keys(Keys.CONTROL + "a")
-            time.sleep(0.08)
-            postal_el.send_keys(Keys.DELETE)
-            time.sleep(0.08)
-            for ch in zip_code:
-                postal_el.send_keys(ch)
-                time.sleep(random.uniform(0.06, 0.10))
-            # Do NOT tab away — keep focus on postal, do not trigger blur
-            actual = (postal_el.get_attribute("value") or "").strip()
-            print(f"  [ZIP-final] typed='{actual}' (not blurred)")
-        except Exception as e:
-            print(f"  [ZIP-final] failed: {e}")
+        // Step 1: find postal field and type into it via native setter
+        var postal = document.querySelector("[name='postal']");
+        if (postal) {
+            // Use native value setter so React sees the change
+            var proto = HTMLInputElement.prototype;
+            var setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+            if (postal._valueTracker) postal._valueTracker.setValue('');
+            setter.call(postal, zipCode);
+            postal.dispatchEvent(new Event('input',  {bubbles: true}));
+            postal.dispatchEvent(new Event('change', {bubbles: true}));
+        }
 
-    # Find and click Continue button via JS — fastest possible path
-    # JS click fires synchronously before React's async onChange can clear postal
-    result = driver.execute_script("""
+        // Step 2: find and click the Continue button immediately
         var form = document.getElementById('postingForm');
-        if (!form) return 'no-form';
+        if (!form) return {ok: false, reason: 'no-form'};
         var btn = form.querySelector(
             'button.go, button.bigbutton, button[type="submit"], input[type="submit"]');
-        if (!btn) return 'no-btn';
+        if (!btn) return {ok: false, reason: 'no-btn'};
         btn.scrollIntoView({block: 'center'});
         btn.click();
-        return 'clicked:' + (btn.textContent || btn.value || '').trim().substring(0, 20);
-    """)
-    print(f"  [submit] JS click → {result}")
+
+        return {
+            ok: true,
+            postal: postal ? postal.value : 'not-found',
+            btn: (btn.textContent || btn.value || '').trim().substring(0, 30)
+        };
+    """, zip_code)
+
+    print(f"  [submit] result={submit_result}")
 
     # Wait up to 25s to leave the edit page
     deadline = time.time() + 25
@@ -607,31 +593,34 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
             return cur
         time.sleep(0.4)
 
-    # Still on edit page — check what CL says
+    # Still stuck — log what CL shows
+    print("  [submit] Still on edit page after 25s")
     try:
-        errs = driver.execute_script("""
-            var msgs = [];
-            document.querySelectorAll('.err, .error, [class*="error"]').forEach(function(el) {
-                var t = (el.textContent || '').replace(/\\s+/g,' ').trim();
-                if (t && t.length > 4 && t.length < 120) msgs.push(t);
-            });
-            return msgs;
-        """) or []
-        print(f"  [submit-errors] {errs[:5]}")
-        # Log field state
         for fname in ["PostingTitle", "PostingBody", "postal", "price"]:
             try:
                 el = driver.find_element(By.CSS_SELECTOR, f"[name='{fname}']")
-                print(f"  [fail] {fname}='{(el.get_attribute('value') or '')[:40]}' "
-                      f"invalid={el.get_attribute('aria-invalid')}")
+                val = (el.get_attribute("value") or "")[:40]
+                inv = el.get_attribute("aria-invalid")
+                print(f"  [fail] {fname}='{val}' invalid={inv}")
             except Exception:
                 print(f"  [fail] {fname}: NOT FOUND")
+        errs = driver.execute_script("""
+            var msgs = [];
+            document.querySelectorAll('[aria-invalid="true"]').forEach(function(el) {
+                msgs.push(el.name + ':invalid');
+            });
+            document.querySelectorAll('.err,.error').forEach(function(el) {
+                var t = (el.textContent||'').replace(/[ \t\n]+/g,' ').trim();
+                if (t && t.length > 3 && t.length < 100) msgs.push(t);
+            });
+            return msgs;
+        """) or []
+        print(f"  [fail-errors] {errs[:8]}")
     except Exception:
         pass
 
-    print("  ❌ All submit strategies failed")
+    print("  ❌ Submit failed")
     return None
-
 
 def fill_listing_details(driver, product: dict):
     _ZIPS = {
