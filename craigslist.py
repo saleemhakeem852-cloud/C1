@@ -482,6 +482,10 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     print(f"  [fill] title='{title[:50]}' price={price} zip={zip_code} city={city_name}")
 
     # ── 1. ZIP / postal — multiple possible field names ──────────────────────
+    # CL uses a jQuery autocomplete on the postal field: typing triggers a
+    # lookup that can CLEAR the field value. We must type, then wait for the
+    # autocomplete suggestion to appear and dismiss it (Enter/Tab), then wait
+    # for the lookup to complete, then verify the value stuck.
     zip_field = _find_field(driver, [
         "[name='postal']",
         "[name='postal_code']",
@@ -490,7 +494,34 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     ])
     if zip_field and zip_code:
         _clear_and_type(driver, zip_field, zip_code)
-        actual = zip_field.get_attribute("value") or ""
+        # Wait up to 4s for the autocomplete dropdown to appear then dismiss
+        try:
+            WebDriverWait(driver, 4).until(
+                lambda d: d.find_elements(By.CSS_SELECTOR,
+                    ".ui-autocomplete li, .autocomplete-suggestion, [class*='autocomplete'] li"))
+            # Press Enter to select the first suggestion (confirms the ZIP)
+            zip_field.send_keys(Keys.RETURN)
+            print("  [ZIP] Autocomplete suggestion appeared — pressed Enter to confirm")
+        except TimeoutException:
+            # No dropdown — just press Tab to trigger blur/change
+            zip_field.send_keys(Keys.TAB)
+            print("  [ZIP] No autocomplete dropdown — pressed Tab to blur")
+        # Wait for any AJAX lookup to finish (field may be cleared then re-populated)
+        time.sleep(2.0)
+        # Re-locate the field (DOM may have been rebuilt)
+        zip_field = _find_field(driver, [
+            "[name='postal']", "[name='postal_code']",
+            "input#postal_code", "input#postal",
+        ])
+        actual = (zip_field.get_attribute("value") if zip_field else "") or ""
+        if not actual:
+            # Autocomplete wiped it — type again now that lookup has settled
+            print(f"  [ZIP] Field cleared by autocomplete — re-typing...")
+            if zip_field:
+                _clear_and_type(driver, zip_field, zip_code)
+                zip_field.send_keys(Keys.TAB)
+                time.sleep(1.5)
+                actual = zip_field.get_attribute("value") or ""
         print(f"  ✓ [ZIP] = '{actual}'")
     else:
         print(f"  ⚠ [ZIP] field not found or no zip_code")
@@ -604,20 +635,38 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     if submit_btn:
         driver.execute_script("arguments[0].scrollIntoView({block:'center'});", submit_btn)
         time.sleep(0.5)
+        # Strategy A: requestSubmit — native form submission, bypasses CL bot-detection
+        # that intercepts synthetic mouse clicks
         try:
-            # Use ActionChains — goes through full browser event pipeline
-            ActionChains(driver).move_to_element(submit_btn).pause(
-                random.uniform(0.3, 0.7)).click().perform()
-            submitted = True
-            print("  [submit] Clicked via ActionChains ✓")
-        except Exception as e:
-            print(f"  [submit] ActionChains failed ({e}), trying direct click")
-            try:
-                submit_btn.click()
+            result = driver.execute_script("""
+                var form = document.getElementById('postingForm');
+                var btn  = arguments[0];
+                if (form && typeof form.requestSubmit === 'function') {
+                    form.requestSubmit(btn);
+                    return 'requestSubmit';
+                }
+                return null;
+            """, submit_btn)
+            if result == 'requestSubmit':
                 submitted = True
-                print("  [submit] Clicked via .click() ✓")
-            except Exception as e2:
-                print(f"  [submit] Direct click also failed: {e2}")
+                print("  [submit] Submitted via form.requestSubmit(btn) ✓")
+        except Exception as e:
+            print(f"  [submit] requestSubmit failed ({e}), falling back to ActionChains")
+        # Strategy B: ActionChains Selenium click
+        if not submitted:
+            try:
+                ActionChains(driver).move_to_element(submit_btn).pause(
+                    random.uniform(0.3, 0.7)).click().perform()
+                submitted = True
+                print("  [submit] Clicked via ActionChains ✓")
+            except Exception as e:
+                print(f"  [submit] ActionChains failed ({e}), trying direct click")
+                try:
+                    submit_btn.click()
+                    submitted = True
+                    print("  [submit] Clicked via .click() ✓")
+                except Exception as e2:
+                    print(f"  [submit] Direct click also failed: {e2}")
     else:
         print("  [submit] ✗ No submit button found!")
         # Dump what's on the page for debugging
