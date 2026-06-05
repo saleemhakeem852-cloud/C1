@@ -404,6 +404,93 @@ def _cdp_click_element(driver, element):
         })
 
 
+def _cdp_type_text(driver, element, value):
+    """Trusted keystrokes via CDP — CL only clears 'autofilled' on isTrusted input."""
+    value = str(value)
+    _cdp_click_element(driver, element)
+    time.sleep(0.2)
+    for _ in range(len(element.get_attribute("value") or "") + 5):
+        driver.execute_cdp_cmd("Input.dispatchKeyEvent", {
+            "type": "keyDown", "key": "Backspace", "code": "Backspace",
+        })
+        driver.execute_cdp_cmd("Input.dispatchKeyEvent", {
+            "type": "keyUp", "key": "Backspace", "code": "Backspace",
+        })
+        time.sleep(0.04)
+    time.sleep(0.1)
+    for ch in value:
+        driver.execute_cdp_cmd("Input.dispatchKeyEvent", {
+            "type": "keyDown", "key": ch, "text": ch, "unmodifiedText": ch,
+        })
+        driver.execute_cdp_cmd("Input.dispatchKeyEvent", {
+            "type": "keyUp", "key": ch,
+        })
+        time.sleep(random.uniform(0.07, 0.16))
+    driver.execute_script("""
+        arguments[0].dispatchEvent(new Event('change', {bubbles: true}));
+        arguments[0].dispatchEvent(new FocusEvent('blur', {bubbles: true}));
+    """, element)
+
+
+_REACT_TYPE_JS = """
+var el = arguments[0];
+var value = String(arguments[1]);
+var proto = el.tagName === 'TEXTAREA'
+    ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+var setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+el.focus();
+el.dispatchEvent(new FocusEvent('focusin', {bubbles: true}));
+if (el._valueTracker) { el._valueTracker.setValue(el.value || ''); }
+setter.call(el, '');
+el.dispatchEvent(new InputEvent('input', {bubbles: true, inputType: 'deleteContentBackward'}));
+var built = '';
+for (var i = 0; i < value.length; i++) {
+    built += value[i];
+    setter.call(el, built);
+    el.dispatchEvent(new InputEvent('input', {
+        bubbles: true, cancelable: true, inputType: 'insertText', data: value[i]
+    }));
+}
+el.dispatchEvent(new Event('change', {bubbles: true}));
+el.dispatchEvent(new FocusEvent('blur', {bubbles: true}));
+return el.value;
+"""
+
+
+def _react_type_field(driver, element, value):
+    return driver.execute_script(_REACT_TYPE_JS, element, str(value)) or ""
+
+
+def _wait_for_cl_prefill(driver, names, timeout=12):
+    """Wait until CL finishes account-autofilling sensitive fields."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            states = driver.execute_script("""
+                var out = {};
+                arguments[0].forEach(function(n) {
+                    var el = document.querySelector('[name="'+n+'"]');
+                    if (!el) { out[n] = null; return; }
+                    out[n] = {
+                        value: el.value || '',
+                        cls: (el.className || '') + ' ' + (el.parentElement && el.parentElement.className || '')
+                    };
+                });
+                return out;
+            """, list(names)) or {}
+            filled = sum(1 for n in names if (states.get(n) or {}).get("value"))
+            if filled >= 1:
+                for n, st in states.items():
+                    if st and st.get("value"):
+                        print(f"  [prefill] {n} = '{str(st['value'])[:40]}'")
+                return states
+        except Exception:
+            pass
+        time.sleep(0.5)
+    print("  [prefill] timeout — CL did not prefill sensitive fields")
+    return {}
+
+
 # Only these fields accept text entry — never "re-type" hidden inputs or checkboxes
 _FILLABLE_FIELDS = frozenset({
     "PostingTitle", "PostingBody", "postal", "FromEMail",
@@ -428,71 +515,51 @@ def _type_chars(element, value, delay=(0.06, 0.14)):
         time.sleep(random.uniform(*delay))
 
 
-def _nudge_user_edited(element):
-    """Minimal manual edit — CL requires this on account-autofilled fields."""
-    element.click()
-    time.sleep(0.15)
-    element.send_keys(Keys.END)
-    time.sleep(0.08)
-    element.send_keys("x")
-    time.sleep(0.1)
-    element.send_keys(Keys.BACKSPACE)
-    time.sleep(0.12)
-
-
-def _edit_autofilled_field(driver, element, value, use_tab=True):
+def _trusted_retype(driver, element, value):
     """
-    Edit a CL-prefilled field the way a human would:
-    never Ctrl+A; backspace existing chars, type new value, nudge.
+    Fully retype a CL autofilled field using trusted CDP keystrokes only.
+    Do NOT follow with synthetic InputEvents — that resets CL's userEdited flag.
     """
     value = str(value).strip()
-    _focus_field(driver, element)
     current = (element.get_attribute("value") or "").strip()
-    if current == value:
-        print(f"  [autofill] prefilled OK — nudging only")
-        _nudge_user_edited(element)
-    else:
-        if current:
-            print(f"  [autofill] editing '{current[:30]}' → '{value[:30]}'")
-            element.send_keys(Keys.END)
-            time.sleep(0.08)
-            for _ in range(len(current)):
-                element.send_keys(Keys.BACKSPACE)
-                time.sleep(random.uniform(0.04, 0.09))
+    if current:
+        print(f"  [autofill] retyping '{current[:25]}' → '{value[:25]}'")
+    try:
+        _cdp_type_text(driver, element, value)
+    except Exception as cdp_err:
+        print(f"  [autofill] CDP type failed ({cdp_err}), using send_keys")
+        _focus_field(driver, element)
+        element.send_keys(Keys.END)
+        for _ in range(len(current) + 3):
+            element.send_keys(Keys.BACKSPACE)
+            time.sleep(0.04)
         _type_chars(element, value)
-        _nudge_user_edited(element)
-    if use_tab:
-        element.send_keys(Keys.TAB)
-    else:
-        driver.execute_script(
-            "arguments[0].dispatchEvent(new Event('blur',{bubbles:true}));", element)
-    time.sleep(0.45)
+    actual = (element.get_attribute("value") or "").strip()
+    if actual != value:
+        print(f"  [autofill] mismatch after type: '{actual[:30]}'")
+    time.sleep(0.15)
 
 
 def _type_with_send_keys(driver, element, value):
-    """Type into an empty/non-autofilled field."""
+    """Type into a normal (non-autofill-flagged) field."""
     _focus_field(driver, element)
-    current = (element.get_attribute("value") or "").strip()
-    if current:
-        element.send_keys(Keys.END)
-        time.sleep(0.08)
-        for _ in range(len(current)):
-            element.send_keys(Keys.BACKSPACE)
-            time.sleep(random.uniform(0.04, 0.08))
-    _type_chars(element, value)
+    _react_type_field(driver, element, value)
 
 
 def _cl_fill_field(driver, element, value, *, autofill_sensitive=False, use_tab=True):
     if autofill_sensitive:
-        _edit_autofilled_field(driver, element, value, use_tab=use_tab)
+        _trusted_retype(driver, element, value)
     else:
         _type_with_send_keys(driver, element, value)
-        if use_tab:
+    if use_tab:
+        try:
             element.send_keys(Keys.TAB)
-        else:
-            driver.execute_script(
-                "arguments[0].dispatchEvent(new Event('blur',{bubbles:true}));", element)
-        time.sleep(0.4)
+        except Exception:
+            pass
+    else:
+        driver.execute_script(
+            "arguments[0].dispatchEvent(new Event('blur',{bubbles:true}));", element)
+    time.sleep(0.45)
 
 
 def _ensure_field_value(driver, name, expected, autofill_sensitive=False):
@@ -576,22 +643,7 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
 
     handle_captcha_if_present(driver)
     _disable_form_autofill(driver)
-    # Let CL finish account-autofilling title / ZIP / email before we touch fields
-    time.sleep(3.0)
-    try:
-        pre = driver.execute_script("""
-            var out = {};
-            ['PostingTitle','postal','FromEMail'].forEach(function(n) {
-                var el = document.querySelector('[name="'+n+'"]');
-                out[n] = el ? (el.value || '') : '';
-            });
-            return out;
-        """) or {}
-        for k, v in pre.items():
-            if v:
-                print(f"  [prefill] {k} = '{str(v)[:40]}'")
-    except Exception:
-        pass
+    _wait_for_cl_prefill(driver, list(_AUTOFILL_SENSITIVE))
 
     title = (product.get("title") or product.get("name") or "Quality Item For Sale").strip()
     description = (product.get("description") or (
@@ -724,7 +776,9 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
                     continue
                 try:
                     el = driver.find_element(By.CSS_SELECTOR, f"[name='{name}']")
-                    _edit_autofilled_field(driver, el, val, use_tab=True)
+                    _trusted_retype(driver, el, val)
+                    el.send_keys(Keys.TAB)
+                    time.sleep(0.4)
                 except Exception as e:
                     print(f"  [autofill-retry] {name}: {e}")
         else:
@@ -843,6 +897,20 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     # Print every field name and value so we can see exactly what's being sent
     for k, v in sorted(form_dict.items()):
         print(f"  [post-field] {k}={str(v)[:50]}")
+
+    if _form_validation_errors(driver):
+        print("  [submit] Validation still failing — final CDP retype of title+ZIP")
+        for name in ("PostingTitle", "postal"):
+            val = _field_map.get(name)
+            if not val:
+                continue
+            try:
+                el = driver.find_element(By.CSS_SELECTOR, f"[name='{name}']")
+                _trusted_retype(driver, el, val)
+                el.send_keys(Keys.TAB)
+                time.sleep(0.5)
+            except Exception:
+                pass
 
     print("  [submit] Attempting form submission (multi-strategy)...")
 
