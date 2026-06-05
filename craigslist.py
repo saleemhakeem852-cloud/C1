@@ -401,7 +401,7 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     for price_sel in ["[name='price']", "[name='AskingPrice']", "[name='AskPrice']"]:
         try:
             driver.find_element(By.CSS_SELECTOR, price_sel)
-            _js_fill_field(driver, price_sel, price)
+            real_fill(price_sel, price, use_tab=True)
             break
         except Exception:
             continue
@@ -418,7 +418,7 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     print("  Filling geographic_area...")
     try:
         driver.find_element(By.CSS_SELECTOR, "[name='geographic_area']")
-        _js_fill_field(driver, "[name='geographic_area']", city_name)
+        real_fill("[name='geographic_area']", city_name, use_tab=True)
     except NoSuchElementException:
         pass
 
@@ -463,15 +463,30 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
         print("  ✗ No submit button found")
         return None
 
-    # Wait up to 10s for page to change
+    # Wait up to 15s for page to change — CL's JS validation can be slow
     try:
-        WebDriverWait(driver, 10).until(lambda d: d.current_url != url_before)
+        WebDriverWait(driver, 15).until(lambda d: d.current_url != url_before)
         print(f"  ✓ Page changed → {driver.current_url}")
         return driver.current_url
     except TimeoutException:
         pass
 
-    print("  ⚠ Page did not change after submit")
+    # Page didn't change — CL's JS rejected the form client-side
+    # Dump what each field actually contains right now via native getter
+    print("  ⚠ Page did not change — field state at rejection time:")
+    for fname in ["PostingTitle", "PostingBody", "price", "FromEMail", "geographic_area", "postal"]:
+        try:
+            val = driver.execute_script("""
+                var el = document.querySelector("[name='" + arguments[0] + "']");
+                if (!el) return 'NOT_FOUND';
+                var p = el.tagName==='TEXTAREA'
+                    ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+                var d = Object.getOwnPropertyDescriptor(p, 'value');
+                return (d && d.get) ? d.get.call(el) : el.value;
+            """, fname)
+            print(f"    {fname}: '{str(val)[:60]}'")
+        except Exception:
+            pass
 
     # Check if CL rejected it client-side (still on edit page)
     try:
