@@ -6,3 +6,5 @@ selenium-wire
 undetected-chromedriver
 2captcha-python
 pyperclip
+packaging
+setuptools
