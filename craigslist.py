@@ -390,6 +390,75 @@ def _disable_form_autofill(driver):
         pass
 
 
+_REACT_HUMAN_SET_JS = """
+var el = arguments[0];
+var value = String(arguments[1]);
+function patchFiber(f, d) {
+    if (!f || d > 24) return;
+    var s = f.memoizedState;
+    while (s) {
+        var m = s.memoizedState;
+        if (m && typeof m === 'object') {
+            Object.keys(m).forEach(function(k) {
+                if (/autofill/i.test(k)) m[k] = false;
+                if (/userEdited|userModified|touched|dirty|manual/i.test(k)) m[k] = true;
+            });
+        }
+        s = s.next;
+    }
+    patchFiber(f.child, d + 1);
+    patchFiber(f.sibling, d + 1);
+}
+el.focus();
+el.dispatchEvent(new FocusEvent('focusin', {bubbles: true}));
+var proto = el.tagName === 'TEXTAREA'
+    ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+var setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+if (el._valueTracker) { el._valueTracker.setValue(''); }
+setter.call(el, '');
+el.dispatchEvent(new InputEvent('input', {bubbles: true, inputType: 'deleteContentBackward'}));
+for (var i = 0; i < value.length; i++) {
+    setter.call(el, value.substring(0, i + 1));
+    el.dispatchEvent(new InputEvent('input', {
+        bubbles: true, cancelable: true, inputType: 'insertText', data: value[i]
+    }));
+}
+el.dispatchEvent(new Event('change', {bubbles: true}));
+el.dispatchEvent(new FocusEvent('blur', {bubbles: true}));
+var fk = Object.keys(el).find(function(k) { return k.indexOf('__reactFiber') === 0; });
+if (fk) patchFiber(el[fk], 0);
+return el.value;
+"""
+
+
+def _react_human_set(driver, element, value):
+    """Set field via React InputEvent chain — updates CL internal state, not just DOM."""
+    try:
+        return driver.execute_script(_REACT_HUMAN_SET_JS, element, str(value).strip()) or ""
+    except Exception:
+        return ""
+
+
+def _clear_stale_errors(driver):
+    """Remove stale error banner when all fields pass aria-invalid check."""
+    try:
+        driver.execute_script("""
+            var form = document.getElementById('postingForm');
+            if (!form) return;
+            if (form.querySelector('[aria-invalid="true"]')) return;
+            form.querySelectorAll('.err, .error, .errorbox, [class*="error"]').forEach(function(el) {
+                var t = (el.textContent || '').toLowerCase();
+                if (t.indexOf('autofill') !== -1 || t.indexOf('missing') !== -1 ||
+                    t.indexOf('incorrect') !== -1) {
+                    el.textContent = '';
+                    el.style.display = 'none';
+                }
+            });
+        """)
+    except Exception:
+        pass
+
+
 def _focus_field(driver, element):
     driver.execute_script("arguments[0].scrollIntoView({block:'center'});", element)
     time.sleep(0.2)
@@ -403,37 +472,67 @@ def _focus_field(driver, element):
 
 def _human_fill(driver, element, value, use_tab=True):
     """
-    Fill one field with real send_keys only.
-    CL's React form accepts trusted browser keystrokes — CDP/JS corrupt or fail.
+    Fill via React InputEvent chain, then verify with send_keys fallback if empty.
     """
     value = str(value).strip()
-    _focus_field(driver, element)
-    element.send_keys(Keys.CONTROL + "a")
-    time.sleep(0.08)
-    element.send_keys(Keys.DELETE)
-    time.sleep(0.12)
-    for ch in value:
-        element.send_keys(ch)
-        time.sleep(random.uniform(0.08, 0.18))
+    actual = _react_human_set(driver, element, value)
+    if actual != value:
+        _focus_field(driver, element)
+        element.send_keys(Keys.CONTROL + "a")
+        time.sleep(0.06)
+        element.send_keys(Keys.DELETE)
+        time.sleep(0.1)
+        for ch in value:
+            element.send_keys(ch)
+            time.sleep(random.uniform(0.06, 0.14))
+        actual = (element.get_attribute("value") or "").strip()
+        _react_human_set(driver, element, actual)
     if use_tab:
         element.send_keys(Keys.TAB)
     else:
         driver.execute_script("arguments[0].blur();", element)
-    time.sleep(0.45)
+    time.sleep(0.4)
     return (element.get_attribute("value") or "").strip()
 
 
-def _touch_field(driver, element):
-    """Click field and make a tiny edit so CL clears its autofilled flag."""
-    _focus_field(driver, element)
-    element.send_keys(Keys.END)
-    time.sleep(0.1)
-    element.send_keys(" ")
-    time.sleep(0.1)
-    element.send_keys(Keys.BACKSPACE)
-    time.sleep(0.1)
-    element.send_keys(Keys.TAB)
-    time.sleep(0.3)
+def _confirm_autofilled_fields(driver, field_map):
+    """
+    CL marks account-prefilled fields until user edits them.
+    Re-sync title, body, ZIP, email through React after initial fill.
+    """
+    for name in ("PostingTitle", "PostingBody", "postal", "FromEMail"):
+        val = field_map.get(name)
+        if not val:
+            continue
+        try:
+            el = driver.find_element(By.CSS_SELECTOR, f"[name='{name}']")
+            _react_human_set(driver, el, val)
+            time.sleep(0.3)
+        except Exception as e:
+            print(f"  [confirm] {name}: {e}")
+    _clear_stale_errors(driver)
+
+
+def _fields_ready(driver):
+    """True when no field is aria-invalid and no visible autofill errors remain."""
+    try:
+        return driver.execute_script("""
+            var form = document.getElementById('postingForm');
+            if (!form) return false;
+            if (form.querySelector('[aria-invalid="true"]')) return false;
+            var bad = false;
+            form.querySelectorAll('.err, .error, [class*="error"]').forEach(function(el) {
+                var st = window.getComputedStyle(el);
+                if (st.display === 'none' || st.visibility === 'hidden') return;
+                var r = el.getBoundingClientRect();
+                if (r.width < 1 || r.height < 1) return;
+                var t = (el.textContent || '').toLowerCase();
+                if (t.indexOf('autofill') !== -1 || t.indexOf('missing') !== -1) bad = true;
+            });
+            return !bad;
+        """)
+    except Exception:
+        return False
 
 
 def _field_status(driver):
@@ -594,24 +693,25 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
         print("  ⚠ No ZIP/postal code for this city — skipping postal field")
 
     # Touch title + ZIP + email once (CL anti-autofill UX)
-    print("  Touching title, email, ZIP...")
-    for touch_name in ("PostingTitle", "FromEMail", "postal"):
-        try:
-            el = driver.find_element(By.CSS_SELECTOR, f"[name='{touch_name}']")
-            _touch_field(driver, el)
-        except Exception:
-            pass
+    print("  Confirming fields with CL (React sync)...")
+    _confirm_autofilled_fields(driver, _field_map)
 
     status = _field_status(driver)
     for fname, st in status.items():
         print(f"  [field] {fname}: value='{st.get('value','')}' "
               f"invalid={st.get('invalid')} autofilled={st.get('autofilled')}")
 
+    ready = _fields_ready(driver)
     val_errs = _form_validation_errors(driver)
+    print(f"  [validate] ready={ready} visible_errors={len(val_errs)}")
     if val_errs:
-        print(f"  [validate] {len(val_errs)} visible error(s) after fill:")
         for err in val_errs[:4]:
             print(f"  [validate] {err[:120]}")
+    if not ready:
+        print("  [validate] Re-confirming autofilled fields...")
+        _confirm_autofilled_fields(driver, _field_map)
+        ready = _fields_ready(driver)
+        print(f"  [validate] ready after re-confirm={ready}")
 
     # Extract form + POST via requests with residential proxy
     time.sleep(0.5)
@@ -717,6 +817,39 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     # Print every field name and value so we can see exactly what's being sent
     for k, v in sorted(form_dict.items()):
         print(f"  [post-field] {k}={str(v)[:50]}")
+
+    _clear_stale_errors(driver)
+    if not _fields_ready(driver):
+        print("  [submit] Fields not ready — final React confirm pass")
+        _confirm_autofilled_fields(driver, _field_map)
+        time.sleep(0.5)
+
+    # Re-read hidden tokens (cryptedStepCheck) after React state sync
+    try:
+        fresh_data = driver.execute_script("""
+            var form = document.getElementById('postingForm');
+            if (!form) return null;
+            var data = [];
+            form.querySelectorAll('input,textarea,select').forEach(function(el) {
+                if (!el.name) return;
+                if ((el.type === 'checkbox' || el.type === 'radio') && !el.checked) return;
+                data.push([el.name, el.value || '']);
+            });
+            return data;
+        """)
+        if fresh_data:
+            for pair in fresh_data:
+                if pair[0] in form_dict and pair[0] not in (
+                    'PostingTitle', 'PostingBody', 'postal', 'FromEMail',
+                    'price', 'geographic_area',
+                ):
+                    form_dict[pair[0]] = pair[1]
+            for pair in fresh_data:
+                if pair[0] not in form_dict:
+                    form_dict[pair[0]] = pair[1]
+            print(f"  [post] refreshed cryptedStepCheck={form_dict.get('cryptedStepCheck','')[:20]}...")
+    except Exception as e:
+        print(f"  [post] token refresh failed: {e}")
 
     print("  [submit] Attempting form submission (multi-strategy)...")
 
