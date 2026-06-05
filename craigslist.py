@@ -298,26 +298,97 @@ def click_relocation_if_needed(driver, ad_name):
 #  modify values (title/desc/price) and replay for subsequent posts.
 # ─────────────────────────────────────────────────────────────────────────────
 
+_REACT_SET_VALUE_JS = """
+var el = arguments[0];
+var value = String(arguments[1]);
+var tracker = el._valueTracker;
+if (tracker) { tracker.setValue(''); }
+var proto = el.tagName === 'TEXTAREA'
+    ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+var ownDesc = Object.getOwnPropertyDescriptor(el, 'value');
+var protoDesc = Object.getOwnPropertyDescriptor(proto, 'value');
+if (ownDesc && ownDesc.set && protoDesc && ownDesc.set !== protoDesc.set) {
+    protoDesc.set.call(el, value);
+} else if (protoDesc && protoDesc.set) {
+    protoDesc.set.call(el, value);
+} else {
+    el.value = value;
+}
+el.dispatchEvent(new Event('input',  {bubbles: true}));
+el.dispatchEvent(new Event('change', {bubbles: true}));
+return el.value;
+"""
+
+
+def _react_set_value(driver, element, value):
+    """Update a React controlled input so CL's validator sees the value."""
+    return driver.execute_script(_REACT_SET_VALUE_JS, element, str(value)) or ""
+
+
+def _cdp_fill_field(driver, element, value):
+    """Fill via CDP keystrokes — triggers React change detection at engine level."""
+    rect = element.rect
+    x = rect['x'] + rect['width'] / 2
+    y = rect['y'] + rect['height'] / 2
+    for event_type in ('mousePressed', 'mouseReleased'):
+        driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
+            "type": event_type,
+            "x": x, "y": y,
+            "buttons": 1,
+            "button": "left",
+            "clickCount": 1,
+        })
+    time.sleep(0.15)
+    # Select all (Control+A on Linux/Windows headless)
+    driver.execute_cdp_cmd("Input.dispatchKeyEvent", {
+        "type": "keyDown", "key": "Control", "code": "ControlLeft", "modifiers": 2,
+    })
+    driver.execute_cdp_cmd("Input.dispatchKeyEvent", {
+        "type": "keyDown", "key": "a", "code": "KeyA", "modifiers": 2,
+    })
+    driver.execute_cdp_cmd("Input.dispatchKeyEvent", {
+        "type": "keyUp", "key": "a", "code": "KeyA", "modifiers": 2,
+    })
+    driver.execute_cdp_cmd("Input.dispatchKeyEvent", {
+        "type": "keyUp", "key": "Control", "code": "ControlLeft",
+    })
+    time.sleep(0.05)
+    for event_type in ('keyDown', 'keyUp'):
+        driver.execute_cdp_cmd("Input.dispatchKeyEvent", {
+            "type": event_type, "key": "Backspace", "code": "Backspace",
+        })
+    driver.execute_cdp_cmd("Input.insertText", {"text": str(value)})
+    time.sleep(0.15)
+
+
+def _form_validation_errors(driver):
+    """Return visible CL form validation messages (empty list = OK to submit)."""
+    try:
+        return driver.execute_script("""
+            var msgs = [];
+            var form = document.getElementById('postingForm');
+            if (!form) return msgs;
+            form.querySelectorAll('.err, .error, [class*="error"], [class*="invalid"]')
+                .forEach(function(el) {
+                    var t = (el.textContent || '').replace(/\\s+/g, ' ').trim();
+                    if (t && t.length > 2 && msgs.indexOf(t) === -1) msgs.push(t);
+                });
+            return msgs;
+        """) or []
+    except Exception:
+        return []
+
+
 def _js_fill_field(driver, selector, value):
-    """Fill field using JS native setter to update DOM value."""
-    driver.execute_script("""
-        var el = document.querySelector(arguments[0]);
-        if (!el) return;
-        var proto = el.tagName === 'TEXTAREA'
-            ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-        var setter = Object.getOwnPropertyDescriptor(proto, 'value');
-        if (setter && setter.set) setter.set.call(el, arguments[1]);
-        else el.value = arguments[1];
-        el.dispatchEvent(new Event('input',  {bubbles:true}));
-        el.dispatchEvent(new Event('change', {bubbles:true}));
-    """, selector, str(value))
+    """Fill field using React-aware native setter."""
+    el = driver.find_element(By.CSS_SELECTOR, selector)
+    _react_set_value(driver, el, value)
 
 
 def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     """
-    Fill the form fields using real send_keys (updates CL's internal state),
-    then click submit. selenium-wire captures the outgoing POST request.
-    We check if it succeeded and return the next URL.
+    Fill CL's React posting form, then submit via browser click (preferred)
+    or requests POST fallback. Returns the next-step URL on success.
     """
     try:
         WebDriverWait(driver, 15).until(
@@ -340,84 +411,52 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     except Exception:
         price = "1"
 
-    # Fill using CDP Input.dispatchMouseEvent + Input.insertText
-    # This is the lowest level possible — indistinguishable from real user input
+    # CL's posting form uses React controlled inputs — DOM .value alone is not enough.
     def real_fill(selector, value, use_tab=True):
         """
-        Fill a field reliably:
-        1. Scroll into view + JS click to focus
-        2. Select-all + delete existing content
-        3. send_keys character by character (CL's JS event listeners fire)
-        4. JS force-set as backup (ensures value is in DOM regardless)
-        5. Dispatch input+change events so CL's framework registers the value
-        6. Optional Tab to trigger blur/validation
+        Fill a React controlled field:
+        1. CDP insertText (engine-level keystrokes — React picks these up)
+        2. React _valueTracker + native setter fallback
+        3. Tab blur so CL runs per-field validation
         """
+        value = str(value)
         try:
             el = WebDriverWait(driver, 8).until(
                 EC.presence_of_element_located((By.CSS_SELECTOR, selector)))
             driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
             time.sleep(0.3)
 
-            # Try ActionChains click first, fall back to JS click
+            actual = ""
             try:
-                ActionChains(driver).move_to_element(el).click().perform()
-            except Exception:
-                driver.execute_script("arguments[0].focus(); arguments[0].click();", el)
-            time.sleep(0.2)
+                _cdp_fill_field(driver, el, value)
+                actual = (el.get_attribute("value") or "").strip()
+            except Exception as cdp_err:
+                print(f"  [fill] CDP failed for {selector}: {cdp_err}")
 
-            # Clear existing content
-            el.send_keys(Keys.CONTROL + "a")
-            time.sleep(0.1)
-            el.send_keys(Keys.DELETE)
-            time.sleep(0.1)
-
-            # Type the value with realistic keystroke delays
-            for ch in str(value):
-                el.send_keys(ch)
-                time.sleep(random.uniform(0.04, 0.10))
-
-            # JS force-set to guarantee value is present (handles React controlled inputs)
-            driver.execute_script("""
-                var el = document.querySelector(arguments[0]);
-                if (!el) return;
-                var proto = el.tagName === 'TEXTAREA'
-                    ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-                var setter = Object.getOwnPropertyDescriptor(proto, 'value');
-                if (setter && setter.set) setter.set.call(el, arguments[1]);
-                else el.value = arguments[1];
-                el.dispatchEvent(new Event('input',  {bubbles:true}));
-                el.dispatchEvent(new Event('change', {bubbles:true}));
-                el.dispatchEvent(new Event('blur',   {bubbles:true}));
-            """, selector, str(value))
-            time.sleep(0.15)
+            if actual != value.strip():
+                actual = (_react_set_value(driver, el, value) or "").strip()
 
             if use_tab:
-                el.send_keys(Keys.TAB)
-                time.sleep(0.3)
+                try:
+                    el.send_keys(Keys.TAB)
+                except Exception:
+                    driver.execute_script(
+                        "arguments[0].dispatchEvent(new Event('blur',{bubbles:true}));", el)
+                time.sleep(0.35)
 
-            # Verify
-            actual = el.get_attribute("value") or driver.execute_script(
-                "var el=document.querySelector(arguments[0]);"
-                "var p=el.tagName==='TEXTAREA'?HTMLTextAreaElement.prototype:HTMLInputElement.prototype;"
-                "var d=Object.getOwnPropertyDescriptor(p,'value');"
-                "return d&&d.get?d.get.call(el):el.value;", selector) or ""
-            print(f"  ✓ {selector} = '{str(actual)[:50]}'")
+            if not actual:
+                actual = (el.get_attribute("value") or value).strip()
+
+            print(f"  ✓ {selector} = '{actual[:50]}'")
             return actual
         except Exception as e:
             print(f"  ✗ real_fill({selector}): {e}")
-            # Last-resort fallback: pure JS set
             try:
-                driver.execute_script("""
-                    var el = document.querySelector(arguments[0]);
-                    if (!el) return;
-                    el.value = arguments[1];
-                    el.dispatchEvent(new Event('input',  {bubbles:true}));
-                    el.dispatchEvent(new Event('change', {bubbles:true}));
-                """, selector, str(value))
-                print(f"  ✓ {selector} set via JS fallback")
-                return str(value)
+                _js_fill_field(driver, selector, value)
+                print(f"  ✓ {selector} set via React fallback")
+                return value
             except Exception as e2:
-                print(f"  ✗ JS fallback also failed for {selector}: {e2}")
+                print(f"  ✗ React fallback also failed for {selector}: {e2}")
                 return ""
 
     print("  Filling title...")
@@ -459,16 +498,50 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     except Exception:
         pass
 
-    # postal — fill last with real keys, no TAB (skip if empty for non-US accounts)
+    # postal — fill last, no TAB (TAB can clear React state on the last field)
     print("  Filling postal (last, no TAB)...")
     if zip_code:
-        real_fill("[name='postal']", zip_code, use_tab=True)
+        real_fill("[name='postal']", zip_code, use_tab=False)
         time.sleep(0.5)
     else:
         print("  ⚠ No ZIP/postal code for this city — skipping postal field")
 
+    time.sleep(0.5)
+    val_errs = _form_validation_errors(driver)
+    if val_errs:
+        print(f"  [validate] Errors after fill — re-syncing React state ({len(val_errs)} msg(s))")
+        for err in val_errs[:4]:
+            print(f"  [validate] {err[:120]}")
+        _retry_fields = [
+            ("[name='PostingTitle']", title),
+            ("[name='PostingBody']", description),
+            ("[name='FromEMail']", cl_email),
+            ("[name='postal']", zip_code),
+            ("[name='geographic_area']", city_name),
+        ]
+        for price_sel in ["[name='price']", "[name='AskingPrice']", "[name='AskPrice']"]:
+            try:
+                driver.find_element(By.CSS_SELECTOR, price_sel)
+                _retry_fields.append((price_sel, price))
+                break
+            except Exception:
+                continue
+        for sel, val in _retry_fields:
+            if not val:
+                continue
+            try:
+                el = driver.find_element(By.CSS_SELECTOR, sel)
+                _react_set_value(driver, el, val)
+                time.sleep(0.2)
+            except Exception:
+                pass
+        time.sleep(0.8)
+        val_errs = _form_validation_errors(driver)
+        for err in val_errs[:4]:
+            print(f"  [validate] Still visible: {err[:120]}")
+
     # Extract form + POST via requests with residential proxy
-    time.sleep(1)
+    time.sleep(0.5)
 
     form_data = driver.execute_script("""
         var form = document.getElementById('postingForm');
@@ -554,35 +627,23 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     elif not zip_code:
         form_dict.pop('postal', None)
 
+    try:
+        for btn in driver.find_elements(By.CSS_SELECTOR,
+                "button.go, button[type='submit'], input[type='submit']"):
+            btn_name = (btn.get_attribute("name") or "").strip()
+            if btn_name:
+                form_dict[btn_name] = (
+                    btn.get_attribute("value") or btn.text or "continue").strip()
+                break
+    except Exception:
+        pass
+
     print(f"  [post] {len(form_dict)} fields → {form_action}")
     print(f"  [post] postal={form_dict.get('postal')} title={form_dict.get('PostingTitle','')[:25]}")
     print(f"  [post] cryptedStepCheck={form_dict.get('cryptedStepCheck','')[:20]}...")
     # Print every field name and value so we can see exactly what's being sent
     for k, v in sorted(form_dict.items()):
         print(f"  [post-field] {k}={str(v)[:50]}")
-
-    # Force validation events before clicking to satisfy any reactive handlers
-    try:
-        driver.execute_script("""
-        document.querySelectorAll('input,textarea,select').forEach(el => {
-            el.dispatchEvent(new Event('input', {bubbles:true}));
-            el.dispatchEvent(new Event('change', {bubbles:true}));
-            el.dispatchEvent(new Event('blur', {bubbles:true}));
-        });
-        """)
-        time.sleep(1.0)
-    except Exception:
-        pass
-
-    # Log any visible validation errors before submitting
-    try:
-        errs = driver.find_elements(By.CSS_SELECTOR, ".err, .error, [class*='error'], [class*='invalid']")
-        for err in errs:
-            txt = (err.text or "").strip()
-            if txt:
-                print(f"  [validate] Visible error: {txt}")
-    except Exception:
-        pass
 
     print("  [submit] Attempting form submission (multi-strategy)...")
 
