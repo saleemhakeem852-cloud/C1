@@ -174,7 +174,17 @@ def make_driver():
         raise RuntimeError("chromedriver not found")
     print(f"  [driver] Using chromedriver: {chromedriver_bin}")
     service = ChromeService(executable_path=chromedriver_bin, log_output="/tmp/chromedriver.log")
-    driver = webdriver.Chrome(service=service, options=options)
+    try:
+        driver = webdriver.Chrome(service=service, options=options)
+    except Exception as e:
+        # Print chromedriver log for diagnosis
+        try:
+            with open("/tmp/chromedriver.log") as f:
+                print("=== chromedriver.log ===")
+                print(f.read()[-3000:])
+        except Exception:
+            pass
+        raise e
     driver.execute_cdp_cmd(
         "Page.addScriptToEvaluateOnNewDocument",
         {"source": "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"}
