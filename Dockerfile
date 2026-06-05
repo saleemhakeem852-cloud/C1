@@ -1,5 +1,16 @@
 FROM python:3.12-slim
 
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1
+
+# Unset any proxy vars that Railway might inject during build
+# so apt can reach debian repos directly
+ARG http_proxy=
+ARG https_proxy=
+ARG HTTP_PROXY=
+ARG HTTPS_PROXY=
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
     chromium \
     chromium-driver \
@@ -18,20 +29,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libasound2 \
     && rm -rf /var/lib/apt/lists/*
 
+# Wrapper script so chromedriver always starts with --allowed-origins=*
 RUN printf '#!/bin/sh\nexec /usr/bin/chromedriver --allowed-ips="" --allowed-origins="*" "$@"\n' \
     > /usr/local/bin/chromedriver \
     && chmod +x /usr/local/bin/chromedriver
 
 WORKDIR /app
-
 COPY requirements.txt .
-
-# Force unset proxy vars at build time so Railway's HTTPS_PROXY doesn't break pip
-RUN env -u HTTPS_PROXY -u HTTP_PROXY -u https_proxy -u http_proxy \
-    pip install --no-cache-dir -r requirements.txt
-
+RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
-
-ENV PYTHONUNBUFFERED=1
-
-CMD ["python", "server.py"]
+EXPOSE 5000
+CMD ["bash", "start.sh"]
