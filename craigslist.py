@@ -496,23 +496,148 @@ def _field_editable(driver, name):
         return False
 
 
+_REACT_CLEAR_AUTOFILL_JS = """
+var el = arguments[0];
+var fk = Object.keys(el).find(function(k) { return k.indexOf('__reactFiber') === 0; });
+if (!fk) return {patched: false};
+var f = el[fk], patched = false;
+for (var d = 0; d < 35 && f; d++, f = f.return) {
+    var s = f.memoizedState;
+    while (s) {
+        var m = s.memoizedState;
+        if (m && typeof m === 'object' && !Array.isArray(m)) {
+            Object.keys(m).forEach(function(k) {
+                if (/autofill/i.test(k)) { m[k] = false; patched = true; }
+                if (/userEdited|userModified|touched|dirty|manual/i.test(k)) { m[k] = true; patched = true; }
+            });
+        }
+        s = s.next;
+    }
+}
+return {patched: patched};
+"""
+
+
+def _react_clear_autofill_flag(driver, element):
+    try:
+        return driver.execute_script(_REACT_CLEAR_AUTOFILL_JS, element) or {}
+    except Exception:
+        return {}
+
+
+def _blur_by_clicking_elsewhere(driver, skip_element):
+    """Blur active field with a real click — no synthetic JS events on the input."""
+    try:
+        for sel in ("#postingForm label", "[name='price']", "[name='language']"):
+            try:
+                el = driver.find_element(By.CSS_SELECTOR, sel)
+                if el != skip_element:
+                    ActionChains(driver).move_to_element(el).click().perform()
+                    time.sleep(0.2)
+                    return
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+
 def _clear_and_type(driver, element, value):
-    """Ctrl+A clear then slow send_keys — works on CL React inputs when backspace fails."""
+    """
+    Trusted keystrokes only. CL React tracks isTrusted input — synthetic JS
+    input/change events after send_keys re-flag fields as autofilled.
+    """
     value = str(value).strip()
     _focus_field(driver, element)
     element.send_keys(Keys.CONTROL + "a")
     time.sleep(0.08)
     element.send_keys(Keys.DELETE)
-    time.sleep(0.12)
+    time.sleep(0.15)
     for ch in value:
         element.send_keys(ch)
-        time.sleep(random.uniform(0.08, 0.15))
-    driver.execute_script(
-        "arguments[0].dispatchEvent(new Event('input',{bubbles:true}));"
-        "arguments[0].dispatchEvent(new Event('change',{bubbles:true}));"
-        "arguments[0].blur();", element)
-    time.sleep(0.35)
+        time.sleep(random.uniform(0.10, 0.18))
+    _blur_by_clicking_elsewhere(driver, element)
+    time.sleep(0.3)
+    _react_clear_autofill_flag(driver, element)
     return (element.get_attribute("value") or "").strip()
+
+
+def _user_nudge_field(driver, name):
+    """Minimal trusted keystroke edit for account-prefilled fields (e.g. email)."""
+    try:
+        el = driver.find_element(By.CSS_SELECTOR, f"[name='{name}']")
+        _focus_field(driver, el)
+        val = (el.get_attribute("value") or "").strip()
+        if not val:
+            return
+        el.send_keys(Keys.END)
+        time.sleep(0.1)
+        el.send_keys(Keys.BACKSPACE)
+        time.sleep(0.1)
+        el.send_keys(val[-1])
+        time.sleep(0.15)
+        _blur_by_clicking_elsewhere(driver, el)
+        _react_clear_autofill_flag(driver, el)
+    except Exception as e:
+        print(f"  [nudge] {name}: {e}")
+
+
+def _click_autofill_banner_links(driver):
+    """Click 'posting title • autofilled' lines in the error banner."""
+    try:
+        clicked = driver.execute_script("""
+            var clicked = [];
+            var form = document.getElementById('postingForm');
+            if (!form) return clicked;
+            form.querySelectorAll('li, a, button, span').forEach(function(el) {
+                var t = (el.textContent || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                if (t.indexOf('autofill') === -1 || t.length > 55 || t.length < 8) return;
+                try { el.click(); clicked.push(t.substring(0, 45)); } catch (e) {}
+            });
+            return clicked;
+        """) or []
+        if clicked:
+            print(f"  [autofill] clicked banner: {clicked[:4]}")
+        time.sleep(0.4)
+    except Exception:
+        pass
+
+
+def _clear_autofill_before_submit(driver, field_map, max_attempts=2):
+    """
+    CL's Continue button runs React validation that blocks while internal
+    autofill flags are set — DOM values can be correct but submit still fails.
+    """
+    for attempt in range(1, max_attempts + 1):
+        flagged = _autofill_banner_fields(driver)
+        if not flagged:
+            if attempt > 1:
+                print(f"  [autofill] cleared on attempt {attempt}")
+            return True
+
+        print(f"  [autofill] attempt {attempt}/{max_attempts}: {flagged}")
+        _click_autofill_banner_links(driver)
+
+        for name in flagged:
+            val = field_map.get(name)
+            try:
+                el = driver.find_element(By.CSS_SELECTOR, f"[name='{name}']")
+            except NoSuchElementException:
+                continue
+            if name == "FromEMail" or not val:
+                _user_nudge_field(driver, name)
+            else:
+                actual = (el.get_attribute("value") or "").strip()
+                if actual != str(val).strip():
+                    _clear_and_type(driver, el, val)
+                else:
+                    _user_nudge_field(driver, name)
+            _react_clear_autofill_flag(driver, el)
+
+        time.sleep(0.5)
+        still = _autofill_banner_fields(driver)
+        print(f"  [autofill] after attempt {attempt}: still flagged={still}")
+
+    return not _autofill_banner_fields(driver)
 
 
 def _human_fill(driver, element, value, use_tab=False):
@@ -546,25 +671,7 @@ def _autofill_banner_fields(driver):
 
 
 def _nudge_autofill_field(driver, name):
-    """One tiny edit at end of field — enough for CL to clear account-autofill flag."""
-    try:
-        el = driver.find_element(By.CSS_SELECTOR, f"[name='{name}']")
-        _focus_field(driver, el)
-        val = (el.get_attribute("value") or "").strip()
-        if not val:
-            return
-        el.send_keys(Keys.END)
-        time.sleep(0.08)
-        el.send_keys(" ")
-        time.sleep(0.08)
-        el.send_keys(Keys.BACKSPACE)
-        time.sleep(0.08)
-        driver.execute_script(
-            "arguments[0].dispatchEvent(new Event('input',{bubbles:true}));"
-            "arguments[0].blur();", el)
-        time.sleep(0.25)
-    except Exception as e:
-        print(f"  [nudge] {name}: {e}")
+    _user_nudge_field(driver, name)
 
 
 def _verify_and_refill(driver, field_map):
@@ -855,17 +962,9 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     if not _verify_and_refill(driver, _field_map):
         print("  [verify] Some fields failed verification")
 
-    flagged = _autofill_banner_fields(driver)
-    if flagged:
-        print(f"  [autofill] Banner flags: {flagged} — nudging once")
-        for name in flagged:
-            if name in _field_map and _field_map.get(name):
-                if (driver.find_element(By.CSS_SELECTOR, f"[name='{name}']").get_attribute("value") or "").strip() != str(_field_map[name]).strip():
-                    el = driver.find_element(By.CSS_SELECTOR, f"[name='{name}']")
-                    _clear_and_type(driver, el, _field_map[name])
-                else:
-                    _nudge_autofill_field(driver, name)
-        time.sleep(0.5)
+    print("  Clearing CL autofill flags (required before Continue works)...")
+    if not _clear_autofill_before_submit(driver, _field_map, max_attempts=2):
+        print("  [autofill] Warning: autofill banner may still block Continue")
 
     status = _field_status(driver)
     for fname, st in status.items():
@@ -985,6 +1084,15 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
 
     print("  [submit] Attempting form submission (multi-strategy)...")
 
+    # Continue is rejected by CL React while autofill flags are set — clear first
+    if _autofill_banner_fields(driver):
+        print("  [submit] autofill banner still visible — clearing before click")
+        _clear_autofill_before_submit(driver, _field_map, max_attempts=2)
+
+    if _autofill_banner_fields(driver):
+        print("  [submit] Continue will fail: CL still marks fields as autofilled")
+        print("  [submit] (DOM values are filled — React internal flags block validation)")
+
     # Diagnostic: show what submit buttons are available
     try:
         btns = driver.find_elements(By.CSS_SELECTOR, "button, input[type='submit']")
@@ -1032,7 +1140,7 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     # ── Strategy 0: form.requestSubmit (CL's native handler) ───────────────
     submitted = False
     if not _ensure_fields_intact(driver, _field_map):
-        _verify_and_refill(driver, _field_map)
+        _clear_autofill_before_submit(driver, _field_map, max_attempts=1)
     try:
         result = _native_request_submit(driver)
         print(f"  [submit] requestSubmit → {result}")
@@ -1241,18 +1349,60 @@ def fill_listing_details(driver, product: dict):
         driver, product, zip_code, city_name, cl_email)
 
     if result_url and "s=edit" not in result_url:
-        print(f"  ✓ Form submitted successfully → {result_url}")
+        print(f"  ✓ Form submitted → {result_url}")
         return True
 
-    print(f"  ✗ Still on edit page after wire submit")
+    print(f"  ✗ Still on edit page after form submit")
     return False
 
 
-def upload_photos(driver, product: dict):
+def _click_first(driver, selectors, label="button"):
+    """Try multiple selectors; click first match."""
+    for by, sel in selectors:
+        try:
+            el = WebDriverWait(driver, 8).until(EC.element_to_be_clickable((by, sel)))
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+            time.sleep(0.3)
+            try:
+                ActionChains(driver).move_to_element(el).pause(0.2).click().perform()
+            except Exception:
+                driver.execute_script("arguments[0].click();", el)
+            print(f"  ✓ Clicked {label} ({sel[:50]})")
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def _wait_for_images_page(driver, timeout=20):
+    """Wait for s=images / Add Images / done with images page."""
+    print("  [images] Waiting for image upload page...")
+    try:
+        WebDriverWait(driver, timeout).until(lambda d: (
+            "s=images" in d.current_url
+            or d.find_elements(By.ID, "done_with_images_button")
+            or d.find_elements(By.ID, "add_photos_button")
+            or "done with images" in (d.page_source or "").lower()
+        ))
+        print(f"  [images] Page ready → {driver.current_url}")
+        return True
+    except TimeoutException:
+        print(f"  [images] Timed out — URL: {driver.current_url}")
+        return False
+
+
+def complete_images_step(driver, product: dict):
+    """
+    Image upload step (screenshot 1): optional Add Images, then always
+    click 'done with images' to reach the draft preview page.
+    """
+    if not _wait_for_images_page(driver):
+        return False
+
+    handle_captcha_if_present(driver)
+    human_delay(2, 4)
+
     photo_paths = product.get("photo_paths", []) or product.get("images", [])
-    if not photo_paths:
-        print("  No photos to upload.")
-        return
     temp_files = []
     valid = []
     for p in photo_paths:
@@ -1264,27 +1414,70 @@ def upload_photos(driver, product: dict):
                 valid.append(tmp.name)
                 temp_files.append(tmp.name)
             except Exception as e:
-                print(f"  Could not download photo {p}: {e}")
+                print(f"  [images] Could not download {p}: {e}")
         elif isinstance(p, str) and os.path.isfile(p):
             valid.append(p)
-    if not valid:
-        print("  No valid photos to upload.")
-        return
-    human_delay(4, 6)
+
     try:
-        add_btn = WebDriverWait(driver, 15).until(
-            EC.element_to_be_clickable((By.ID, "add_photos_button")))
-        safe_click(driver, add_btn)
-        fi = driver.find_element(By.ID, "fileInput")
-        for path in valid:
-            fi.send_keys(os.path.abspath(path))
-            human_delay(1.5, 3)
-        print(f"  Uploaded {len(valid)} photo(s) ✓")
-        human_delay(8, 12)
-        done = driver.find_element(By.ID, "done_with_images_button")
-        safe_click(driver, done)
-    except (TimeoutException, NoSuchElementException) as e:
-        print(f"  ⚠ Photo upload issue: {e}")
+        if valid:
+            print(f"  [images] Uploading {len(valid)} photo(s)...")
+            try:
+                add_selectors = [
+                    (By.ID, "add_photos_button"),
+                    (By.XPATH, "//button[contains(translate(.,'ADD','add'),'add image')]"),
+                    (By.CSS_SELECTOR, "button.add, input[type='file']"),
+                ]
+                if not _click_first(driver, add_selectors, "Add Images"):
+                    print("  [images] Add Images button not found — trying file input directly")
+
+                file_input = None
+                for by, sel in [
+                    (By.ID, "fileInput"),
+                    (By.CSS_SELECTOR, "input[type='file']"),
+                ]:
+                    try:
+                        file_input = driver.find_element(by, sel)
+                        break
+                    except NoSuchElementException:
+                        continue
+
+                if file_input:
+                    for path in valid:
+                        file_input.send_keys(os.path.abspath(path))
+                        human_delay(1.5, 3)
+                    print(f"  [images] Sent {len(valid)} file(s) to input")
+                    human_delay(6, 10)
+                else:
+                    print("  [images] ⚠ No file input found")
+            except Exception as e:
+                print(f"  [images] Upload error: {e}")
+        else:
+            print("  [images] No photos — proceeding to done with images")
+
+        done_selectors = [
+            (By.ID, "done_with_images_button"),
+            (By.XPATH, "//button[contains(translate(normalize-space(.),'DONE','done'),'done with images')]"),
+            (By.CSS_SELECTOR, "button.done_with_images, button[class*='done']"),
+            (By.XPATH, "//input[@type='submit' and contains(translate(@value,'DONE','done'),'done')]"),
+        ]
+        if not _click_first(driver, done_selectors, "done with images"):
+            print("  [images] ✗ Could not find 'done with images' button")
+            return False
+
+        human_delay(3, 5)
+        handle_captcha_if_present(driver)
+
+        try:
+            WebDriverWait(driver, 20).until(lambda d: (
+                "s=preview" in d.current_url
+                or d.find_elements(By.ID, "publish_button")
+                or "unpublished draft" in (d.page_source or "").lower()
+            ))
+            print(f"  [images] ✓ Reached draft preview → {driver.current_url}")
+            return True
+        except TimeoutException:
+            print(f"  [images] ⚠ Preview not detected after done — URL: {driver.current_url}")
+            return "s=edit" not in driver.current_url and "s=images" not in driver.current_url
     finally:
         for tf in temp_files:
             try:
@@ -1292,26 +1485,59 @@ def upload_photos(driver, product: dict):
             except Exception:
                 pass
 
+
+def upload_photos(driver, product: dict):
+    """Legacy wrapper — use complete_images_step."""
+    return complete_images_step(driver, product)
+
 def publish_listing(driver, ad_name, product):
+    """
+    Draft preview step (screenshot 2): 'this is an unpublished draft' page.
+    Click publish to make the listing live.
+    """
     handle_captcha_if_present(driver)
-    human_delay(4, 6)
+    print("  [publish] Waiting for draft preview page...")
     try:
-        pub = WebDriverWait(driver, 15).until(
-            EC.element_to_be_clickable((By.ID, "publish_button")))
-        safe_click(driver, pub)
-        human_delay(5, 8)
-        handle_captcha_if_present(driver)
-        listing_url = driver.current_url
-        print(f"  Published → {listing_url}")
-        posted_listings[ad_name] = {
-            "url": listing_url, "post_time": datetime.now(),
-            "visitors": 0, "platform": "Craigslist",
-        }
-        _save_listings()
-        return True
+        WebDriverWait(driver, 20).until(lambda d: (
+            "s=preview" in d.current_url
+            or d.find_elements(By.ID, "publish_button")
+            or "unpublished draft" in (d.page_source or "").lower()
+        ))
+        print(f"  [publish] Draft page ready → {driver.current_url}")
     except TimeoutException:
-        print(f"  ⚠ Publish button not found for '{ad_name}'.")
+        print(f"  [publish] ⚠ Draft page not detected — URL: {driver.current_url}")
+
+    human_delay(2, 4)
+    publish_selectors = [
+        (By.ID, "publish_button"),
+        (By.XPATH, "//button[contains(translate(normalize-space(.),'PUBLISH','publish'),'publish')]"),
+        (By.XPATH, "//input[@type='submit' and contains(translate(@value,'PUBLISH','publish'),'publish')]"),
+        (By.CSS_SELECTOR, "button.publish, input.publish, .publish_button"),
+    ]
+    if not _click_first(driver, publish_selectors, "publish"):
+        print(f"  [publish] ✗ Publish button not found for '{ad_name}'")
         return False
+
+    human_delay(5, 8)
+    handle_captcha_if_present(driver)
+
+    try:
+        WebDriverWait(driver, 20).until(lambda d: (
+            "s=preview" not in d.current_url
+            and "s=images" not in d.current_url
+            and "s=edit" not in d.current_url
+        ))
+    except TimeoutException:
+        pass
+
+    listing_url = driver.current_url
+    print(f"  [publish] ✓ Published → {listing_url}")
+    posted_listings[ad_name] = {
+        "url": listing_url, "post_time": datetime.now(),
+        "visitors": 0, "platform": "Craigslist",
+    }
+    _save_listings()
+    return True
 
 def post_product(driver, ad_name, product):
     post_url = "https://post.craigslist.org/c/sss"
@@ -1490,24 +1716,17 @@ def post_product(driver, ad_name, product):
     if not success:
         return False
 
-    reached_next_step = False
-    try:
-        WebDriverWait(driver, 15).until(
-            lambda d: d.find_elements(By.ID, "add_photos_button") or
-                      d.find_elements(By.ID, "publish_button") or
-                      "s=images" in d.current_url or
-                      "s=preview" in d.current_url)
-        reached_next_step = True
-        print(f"  ✓ Reached next step: {driver.current_url}")
-    except TimeoutException:
-        print(f"  ⚠ Did not reach photo/publish step. URL: {driver.current_url}")
-
-    if not reached_next_step or "s=edit" in driver.current_url:
-        print("  ✗ Still on edit page. Aborting.")
+    # ── Step 2: Image upload page (s=images) ──────────────────────────────
+    if not complete_images_step(driver, product):
+        print("  ✗ Failed at image upload step")
         return False
 
-    upload_photos(driver, product)
-    return publish_listing(driver, ad_name, product)
+    # ── Step 3: Draft preview → publish ─────────────────────────────────
+    if not publish_listing(driver, ad_name, product):
+        print("  ✗ Failed at publish step")
+        return False
+
+    return True
 
 
 def update_ad_analytics_periodically():
