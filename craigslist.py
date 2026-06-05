@@ -509,11 +509,20 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     except Exception:
         pass
 
-    # Fill title
-    _type_into_field(driver, "[name='PostingTitle']", title, "title")
-    time.sleep(0.4)
+    # ── Fill fields in natural human order: postal FIRST ────────────────────
+    # CL's autofill detector flags postal if filled after other fields.
+    # Filling it first makes it look like natural human tab order.
 
-    # Fill price
+    # 1. Postal/ZIP first
+    if zip_code:
+        _type_into_field(driver, "[name='postal']", zip_code, "ZIP")
+        time.sleep(random.uniform(0.3, 0.6))
+
+    # 2. Title
+    _type_into_field(driver, "[name='PostingTitle']", title, "title")
+    time.sleep(random.uniform(0.3, 0.5))
+
+    # 3. Price
     for price_sel in ["[name='price']", "[name='AskingPrice']", "[name='AskPrice']"]:
         try:
             driver.find_element(By.CSS_SELECTOR, price_sel)
@@ -522,18 +531,18 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
         except Exception:
             continue
 
-    # Fill city/neighborhood (optional)
+    # 4. City/neighborhood (optional)
     try:
         driver.find_element(By.CSS_SELECTOR, "[name='geographic_area']")
         _type_into_field(driver, "[name='geographic_area']", city_name, "city")
     except Exception:
         pass
 
-    # Fill description
+    # 5. Description
     _type_into_field(driver, "[name='PostingBody']", description, "description")
     time.sleep(0.5)
 
-    # Fill email if editable
+    # 6. Email if editable
     try:
         email_el = driver.find_element(By.CSS_SELECTOR, "[name='FromEMail']")
         if not email_el.get_attribute("disabled") and not email_el.get_attribute("readOnly"):
@@ -546,27 +555,9 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
 
     time.sleep(0.8)
 
-    # ── POSTAL LAST — type it, do NOT blur/tab, click button immediately ─────
-    # CL's JS clears postal on blur. So: type postal -> click button in same
-    # synchronous JS call -> browser submits before React can clear anything.
-    print("  [submit] Typing postal then clicking Continue in one JS call...")
-
+    # ── SUBMIT: click the Continue button ────────────────────────────────────
+    print("  [submit] Clicking Continue button...")
     submit_result = driver.execute_script("""
-        var zipCode = arguments[0];
-
-        // Step 1: find postal field and type into it via native setter
-        var postal = document.querySelector("[name='postal']");
-        if (postal) {
-            // Use native value setter so React sees the change
-            var proto = HTMLInputElement.prototype;
-            var setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
-            if (postal._valueTracker) postal._valueTracker.setValue('');
-            setter.call(postal, zipCode);
-            postal.dispatchEvent(new Event('input',  {bubbles: true}));
-            postal.dispatchEvent(new Event('change', {bubbles: true}));
-        }
-
-        // Step 2: find and click the Continue button immediately
         var form = document.getElementById('postingForm');
         if (!form) return {ok: false, reason: 'no-form'};
         var btn = form.querySelector(
@@ -574,14 +565,11 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
         if (!btn) return {ok: false, reason: 'no-btn'};
         btn.scrollIntoView({block: 'center'});
         btn.click();
-
         return {
             ok: true,
-            postal: postal ? postal.value : 'not-found',
             btn: (btn.textContent || btn.value || '').trim().substring(0, 30)
         };
-    """, zip_code)
-
+    """)
     print(f"  [submit] result={submit_result}")
 
     # Wait up to 25s to leave the edit page
