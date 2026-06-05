@@ -34,6 +34,7 @@ except ImportError:
 
 TWO_CAPTCHA_API_KEY = os.environ.get("TWO_CAPTCHA_KEY", "YOUR_2CAPTCHA_API_KEY")
 LISTINGS_JSON       = "posted_listings.json"
+COOKIES_FILE        = "cl_session_cookies.json"
 CL_CITY             = os.environ.get("CL_CITY", "losangeles")
 IS_FAST_MODE        = os.environ.get("FAST_MODE", "1") == "1"
 IS_RAILWAY          = any(os.path.exists(p) for p in [
@@ -116,6 +117,35 @@ def _save_listings():
         with open(tmp_path, "w") as f:
             json.dump(serialisable, f, indent=2)
         os.replace(tmp_path, LISTINGS_JSON)
+
+def save_cookies(driver):
+    cookies = driver.get_cookies()
+    with open(COOKIES_FILE, "w") as f:
+        json.dump(cookies, f)
+    print(f"  Session cookies saved ({len(cookies)} cookies)")
+
+def load_cookies(driver):
+    if not os.path.exists(COOKIES_FILE):
+        return False
+    try:
+        driver.get("https://accounts.craigslist.org")
+        with open(COOKIES_FILE) as f:
+            cookies = json.load(f)
+        for cookie in cookies:
+            try:
+                driver.add_cookie(cookie)
+            except Exception:
+                pass
+        driver.refresh()
+        time.sleep(3)
+        if "accounts.craigslist.org/login" not in driver.current_url:
+            print("Session restored from saved cookies ✓")
+            return True
+        print("Saved cookies expired.")
+        return False
+    except Exception as e:
+        print(f"Cookie load failed: {e}")
+        return False
 
 def _find_binary(names, fallback_paths):
     import shutil, subprocess
@@ -240,6 +270,11 @@ def handle_captcha_if_present(driver):
         time.sleep(8)
 
 def craigslist_login(driver, email, password):
+    # Try saved cookies first
+    if load_cookies(driver):
+        return True
+
+    # No valid session — do fresh login
     driver.get("https://accounts.craigslist.org/login")
     human_delay(2, 4)
     handle_captcha_if_present(driver)
@@ -248,21 +283,21 @@ def craigslist_login(driver, email, password):
             EC.presence_of_element_located((By.ID, "inputEmailHandle")))
         send_keys_slow(driver, ef, email)
         human_delay()
-        if password:
-            try:
-                pf = driver.find_element(By.ID, "inputPassword")
-                send_keys_slow(driver, pf, password)
-                human_delay()
-            except Exception:
-                pass
         btn = driver.find_element(By.CSS_SELECTOR, "button[type='submit']")
         safe_click(driver, btn)
-        WebDriverWait(driver, 15).until(EC.url_contains("craigslist.org"))
-        handle_captcha_if_present(driver)
-        print("Logged in to Craigslist ✓")
-        return True
+        print(f"Magic link sent to {email} — waiting up to 3 minutes (check your email and click the link)...")
+        deadline = time.time() + 180
+        while time.time() < deadline:
+            time.sleep(3)
+            if "accounts.craigslist.org/login" not in driver.current_url:
+                handle_captcha_if_present(driver)
+                save_cookies(driver)
+                print("Logged in to Craigslist ✓")
+                return True
+        print("Login failed — magic link not clicked in time.")
+        return False
     except TimeoutException:
-        print("Login failed.")
+        print("Login failed — could not find login form.")
         return False
 
 def click_relocation_if_needed(driver, ad_name):
