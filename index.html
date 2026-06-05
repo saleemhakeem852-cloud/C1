@@ -1121,6 +1121,91 @@
     /* --- NEW AI + MODAL STYLES --- */
     .spec-label { font-weight: 600; }
     .spec-value { font-weight: 400; }
+
+    /* ══════════════════════════════════════════════════════════
+       LOCATION MANAGER STYLES
+    ══════════════════════════════════════════════════════════ */
+    .location-manager {
+      border: 1px solid var(--border);
+      border-radius: var(--radius-md);
+      background: var(--glass);
+      padding: 14px;
+      margin-top: 4px;
+    }
+    .location-manager-title {
+      font-size: .72rem; font-weight: 700; text-transform: uppercase;
+      letter-spacing: .6px; color: var(--cl); margin-bottom: 10px;
+      display: flex; align-items: center; gap: 6px;
+    }
+    .location-fields-row {
+      display: grid; grid-template-columns: 1fr 1.5fr 100px; gap: 8px; margin-bottom: 10px;
+    }
+    .location-fields-row input {
+      padding: 9px 12px; border-radius: var(--radius-md);
+      border: 1px solid var(--border); background: rgba(0,0,0,.2);
+      color: var(--text); font-family: inherit; font-size: .84rem;
+      outline: none; transition: var(--transition-base); width: 100%;
+    }
+    .location-fields-row input:focus {
+      border-color: var(--cl); background: rgba(168,85,247,.05);
+      box-shadow: 0 0 0 3px rgba(168,85,247,.1);
+    }
+    .location-fields-row input::placeholder { color: var(--muted); }
+    .btn-add-location {
+      padding: 9px 14px; background: rgba(168,85,247,.15); color: var(--cl);
+      border: 1px solid rgba(168,85,247,.3); border-radius: var(--radius-md);
+      cursor: pointer; font-family: inherit; font-size: .82rem; font-weight: 600;
+      transition: var(--transition-base); white-space: nowrap;
+    }
+    .btn-add-location:hover { background: rgba(168,85,247,.25); border-color: rgba(168,85,247,.5); }
+    .saved-locations-list {
+      display: flex; flex-direction: column; gap: 6px; max-height: 220px;
+      overflow-y: auto; margin-top: 4px;
+    }
+    .saved-locations-list:empty::after {
+      content: 'No locations saved yet. Add one above.';
+      display: block; text-align: center; color: var(--muted);
+      font-size: .78rem; padding: 10px 0;
+    }
+    .location-item {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 8px 12px; border-radius: var(--radius-md);
+      background: rgba(0,0,0,.15); border: 1px solid var(--border);
+      gap: 10px; animation: fadeInUp .2s ease-out;
+    }
+    .location-item.selected {
+      border-color: var(--cl); background: rgba(168,85,247,.08);
+    }
+    .location-item-info {
+      display: flex; flex-direction: column; gap: 1px; cursor: pointer; flex: 1;
+    }
+    .location-item-main {
+      font-size: .83rem; font-weight: 600; color: var(--text);
+    }
+    .location-item-sub {
+      font-size: .72rem; color: var(--text2);
+    }
+    .location-item-actions { display: flex; gap: 6px; align-items: center; }
+    .btn-loc-select {
+      padding: 3px 10px; border-radius: var(--radius-sm);
+      border: 1px solid var(--cl); background: transparent;
+      color: var(--cl); font-size: .72rem; font-weight: 600;
+      cursor: pointer; transition: var(--transition-fast);
+    }
+    .btn-loc-select:hover, .location-item.selected .btn-loc-select {
+      background: var(--cl); color: #fff;
+    }
+    .btn-loc-del {
+      background: none; border: none; cursor: pointer;
+      color: var(--muted); font-size: .85rem; padding: 2px 6px;
+      border-radius: var(--radius-sm); transition: var(--transition-fast);
+    }
+    .btn-loc-del:hover { color: #f87171; background: rgba(239,68,68,.1); }
+    .location-badge-active {
+      font-size: .68rem; padding: 2px 8px; border-radius: var(--radius-pill);
+      background: rgba(168,85,247,.15); color: var(--cl);
+      border: 1px solid rgba(168,85,247,.25); font-weight: 600; white-space: nowrap;
+    }
     
     #product-preview-overlay, #search-results-overlay, .ai-card-overlay {
       display:none; position:fixed; inset:0; z-index:900; 
@@ -1603,9 +1688,11 @@
             <div id="bulk-post-settings" style="display:none; flex-direction:column; gap:8px; padding-left:24px;">
               <div style="display:flex; align-items:center; gap:10px;">
                 <span style="font-size:0.85rem; color:var(--text2);">Time Interval:</span>
-                <input type="number" id="bulk-interval" value="10" min="1" max="1440" style="width:70px; padding:4px 8px; border-radius:4px; border:1px solid var(--border); background:var(--card-bg); color:var(--text);" />
+                <input type="number" id="bulk-interval" value="10" min="1" max="1440" oninput="updateBulkTimeEstimate()" style="width:70px; padding:4px 8px; border-radius:4px; border:1px solid var(--border); background:var(--card-bg); color:var(--text);" />
                 <span style="font-size:0.85rem; color:var(--text2);">minutes</span>
               </div>
+              <!-- Live time estimate — shown only when ads are configured -->
+              <div id="bulk-time-estimate" style="display:none; font-size:.8rem; color:var(--text2); padding:6px 10px; background:rgba(99,102,241,.07); border-radius:6px; border-left:3px solid var(--accent);"></div>
               <div id="bulk-countdown-container" style="display:none; font-weight:600; color:#3b82f6; font-size:0.9rem; margin-top:4px;">
                 ⏱️ Next post in: <span id="bulk-countdown">10:00</span>
               </div>
@@ -2250,9 +2337,38 @@ document.getElementById('save-product-btn').addEventListener('click', async () =
   const desc     = document.getElementById('product-description').value.trim();
   const delivery = document.getElementById('product-delivery').checked;
 
+  // Collect specification fields
+  const brand    = document.getElementById('spec-brand')?.value.trim()    || '';
+  const model    = document.getElementById('spec-model')?.value.trim()    || '';
+  const material = document.getElementById('spec-material')?.value.trim() || '';
+  const length   = document.getElementById('spec-length')?.value.trim()   || '';
+  const width    = document.getElementById('spec-width')?.value.trim()    || '';
+  const weight   = document.getElementById('spec-weight')?.value.trim()   || '';
+  const inventory= parseInt(document.getElementById('product-inventory')?.value) || 0;
+  const sku      = document.getElementById('product-sku')?.value.trim()   || '';
+
   if (!title) { alert('Please enter a product title.'); return; }
 
-  const product = { title, description: desc, price, category: cat, zip_code: zip, condition: cond, delivery_available: delivery, photo_paths: [] };
+  const product = {
+    title,
+    description:        desc,
+    price,
+    category:           cat,
+    zip_code:           zip,
+    condition:          cond,
+    delivery_available: delivery,
+    photo_paths:        [],
+    // Specifications — included only if non-empty
+    ...(brand    && { brand }),
+    ...(model    && { model }),
+    ...(material && { material }),
+    ...(length   && { length }),
+    ...(width    && { width }),
+    ...(weight   && { weight }),
+    ...(inventory > 0 && { inventory }),
+    ...(sku      && { sku }),
+  };
+
 
   const btn  = document.getElementById('save-product-btn');
   const orig = btn.innerHTML;
@@ -2323,6 +2439,8 @@ function getAccounts(platform) {
         email: parsed.email || '',
         password: parsed.password || '',
         city: parsed.city || '',
+        locations: platform === 'craigslist' ? (parsed.locations || []) : undefined,
+        selectedLocationIdx: platform === 'craigslist' ? (parsed.selectedLocationIdx ?? -1) : undefined,
         isSaved: true
       };
       const arr = [migrated];
@@ -2343,6 +2461,8 @@ function getInitialDefaultAccounts(platform) {
     email: '',
     password: '',
     city: platform === 'craigslist' ? 'losangeles' : '',
+    locations: platform === 'craigslist' ? [] : undefined,
+    selectedLocationIdx: platform === 'craigslist' ? -1 : undefined,
     isSaved: false
   }];
   localStorage.setItem(`clblast_${platform}`, JSON.stringify(defaults));
@@ -2434,17 +2554,39 @@ function renderPlatformAccounts(platform, containerId) {
             <label>Email</label>
             <input type="email" id="email-${acc.id}" value="${escHtml(acc.email)}" placeholder="you@example.com" oninput="onAccountChange('${platform}', '${acc.id}')" autocomplete="username" />
           </div>
+          ${platform !== 'craigslist' ? `
           <div class="form-group">
             <label>Password</label>
             <div class="pw-wrap">
-              <input type="password" id="password-${acc.id}" value="${escHtml(acc.password)}" placeholder="••••••••" oninput="onAccountChange('${platform}', '${acc.id}')" autocomplete="current-password" />
+              <input type="password" id="password-${acc.id}" value="${escHtml(acc.password || '')}" placeholder="••••••••" oninput="onAccountChange('${platform}', '${acc.id}')" autocomplete="current-password" />
               <button class="pw-eye" onclick="togglePw('password-${acc.id}', this)" type="button" aria-label="Show/hide password">👁</button>
             </div>
           </div>
+          ` : `
+          <div class="form-group" style="display:flex;align-items:center;gap:8px;padding:10px 12px;background:rgba(168,85,247,.06);border:1px solid rgba(168,85,247,.2);border-radius:var(--radius-md);grid-column:1/-1;">
+            <span style="font-size:1rem;">ℹ️</span>
+            <span style="font-size:.78rem;color:var(--text2);line-height:1.4;">Craigslist uses <strong style="color:var(--cl);">email-only</strong> login — no password required.</span>
+          </div>
+          `}
           ${platform === 'craigslist' ? `
-          <div class="form-group full-width">
-            <label>City Override</label>
-            <input type="text" id="city-${acc.id}" value="${escHtml(acc.city)}" placeholder="losangeles" oninput="onAccountChange('${platform}', '${acc.id}')" />
+
+          <div class="form-group full-width" style="margin-top:4px;">
+            <label>📍 Locations <span style="font-size:.7rem;color:var(--text2);text-transform:none;letter-spacing:0;font-weight:400;">(select active, add multiple)</span></label>
+            <div class="location-manager" id="loc-manager-${acc.id}">
+              <div class="location-manager-title">📍 Add New Location</div>
+              <div class="location-fields-row">
+                <input type="text" id="loc-state-${acc.id}" placeholder="State (e.g. CA)" maxlength="30" />
+                <input type="text" id="loc-city-${acc.id}" placeholder="City (e.g. Los Angeles)" />
+                <input type="text" id="loc-zip-${acc.id}" placeholder="ZIP" maxlength="10" />
+              </div>
+              <button class="btn-add-location" onclick="addLocation('${platform}', '${acc.id}')" type="button">+ Save Location</button>
+              <div style="margin-top:12px;">
+                <div style="font-size:.72rem;font-weight:700;text-transform:uppercase;letter-spacing:.6px;color:var(--text2);margin-bottom:6px;">Saved Locations</div>
+                <div class="saved-locations-list" id="loc-list-${acc.id}">
+                  ${renderLocationItems(acc, platform)}
+                </div>
+              </div>
+            </div>
           </div>
           ` : ''}
         </div>
@@ -2506,6 +2648,8 @@ function addAccount(platform) {
     email: '',
     password: '',
     city: platform === 'craigslist' ? 'losangeles' : '',
+    locations: platform === 'craigslist' ? [] : undefined,
+    selectedLocationIdx: platform === 'craigslist' ? -1 : undefined,
     isSaved: false
   };
 
@@ -2540,10 +2684,11 @@ async function saveAccount(platform, id) {
     return;
   }
 
-  const label = document.getElementById(`label-${id}`)?.value?.trim() || 'Account';
-  const email = document.getElementById(`email-${id}`)?.value?.trim() || '';
-  const password = document.getElementById(`password-${id}`)?.value || '';
-  const city = platform === 'craigslist' ? (document.getElementById(`city-${id}`)?.value?.trim() || '') : '';
+  const label    = document.getElementById(`label-${id}`)?.value?.trim() || 'Account';
+  const email    = document.getElementById(`email-${id}`)?.value?.trim() || '';
+  // CL uses email-only login; other platforms use email+password
+  const password = platform === 'craigslist' ? '' : (document.getElementById(`password-${id}`)?.value || '');
+  const city     = platform === 'craigslist' ? (document.getElementById(`city-${id}`)?.value?.trim() || '') : '';
 
   const accounts = getAccounts(platform);
   const acc = accounts.find(a => a.id === id);
@@ -2608,6 +2753,132 @@ function togglePw(inputId, btn) {
   if (!el) return;
   if (el.type === 'password') { el.type = 'text'; btn.textContent = '🙈'; }
   else                        { el.type = 'password'; btn.textContent = '👁'; }
+}
+
+/* ═══════════════════════════════════════════════════════════
+   LOCATION MANAGER (CRAIGSLIST)
+ ═══════════════════════════════════════════════════════════ */
+
+/** Render all saved location items for an account as HTML string */
+function renderLocationItems(acc, platform) {
+  if (platform !== 'craigslist') return '';
+  const locs = acc.locations || [];
+  const selIdx = acc.selectedLocationIdx ?? -1;
+  if (locs.length === 0) return '';
+  return locs.map((loc, idx) => {
+    const isSelected = idx === selIdx;
+    return `
+      <div class="location-item${isSelected ? ' selected' : ''}" id="loc-item-${acc.id}-${idx}">
+        <div class="location-item-info" onclick="selectLocation('craigslist','${acc.id}',${idx})">
+          <div class="location-item-main">${escHtml(loc.city || '—')}, ${escHtml(loc.state || '—')}</div>
+          <div class="location-item-sub">ZIP: ${escHtml(loc.zip || '—')}</div>
+        </div>
+        <div class="location-item-actions">
+          ${isSelected ? '<span class="location-badge-active">✓ Active</span>' : `<button class="btn-loc-select" onclick="selectLocation('craigslist','${acc.id}',${idx})" type="button">Use</button>`}
+          <button class="btn-loc-del" onclick="deleteLocation('craigslist','${acc.id}',${idx})" type="button" title="Remove location">✕</button>
+        </div>
+      </div>`;
+  }).join('');
+}
+
+/** Add a new location to an account */
+function addLocation(platform, accId) {
+  const state = (document.getElementById(`loc-state-${accId}`)?.value || '').trim();
+  const city  = (document.getElementById(`loc-city-${accId}`)?.value  || '').trim();
+  const zip   = (document.getElementById(`loc-zip-${accId}`)?.value   || '').trim();
+
+  if (!state && !city && !zip) {
+    showToast('Please enter at least one location field (state, city, or ZIP).', 'error');
+    return;
+  }
+
+  const accounts = getAccounts(platform);
+  const acc = accounts.find(a => a.id === accId);
+  if (!acc) return;
+
+  if (!Array.isArray(acc.locations)) acc.locations = [];
+  acc.locations.push({ state, city, zip });
+
+  // Auto-select this as the active location if none is selected
+  if ((acc.selectedLocationIdx ?? -1) === -1) {
+    acc.selectedLocationIdx = acc.locations.length - 1;
+  }
+
+  saveAccounts(platform, accounts);
+
+  // Clear the input fields
+  ['loc-state', 'loc-city', 'loc-zip'].forEach(prefix => {
+    const el = document.getElementById(`${prefix}-${accId}`);
+    if (el) el.value = '';
+  });
+
+  // Re-render the locations list
+  const listEl = document.getElementById(`loc-list-${accId}`);
+  if (listEl) listEl.innerHTML = renderLocationItems(acc, platform);
+
+  showToast(`Location saved: ${city}, ${state} ${zip}`, 'success');
+}
+
+/** Select an active location for posting */
+function selectLocation(platform, accId, idx) {
+  const accounts = getAccounts(platform);
+  const acc = accounts.find(a => a.id === accId);
+  if (!acc) return;
+  acc.selectedLocationIdx = idx;
+  saveAccounts(platform, accounts);
+
+  const listEl = document.getElementById(`loc-list-${accId}`);
+  if (listEl) listEl.innerHTML = renderLocationItems(acc, platform);
+  showToast(`Location set to: ${acc.locations[idx]?.city || ''}, ${acc.locations[idx]?.state || ''} ${acc.locations[idx]?.zip || ''}`, 'success');
+}
+
+/** Delete a saved location */
+function deleteLocation(platform, accId, idx) {
+  const accounts = getAccounts(platform);
+  const acc = accounts.find(a => a.id === accId);
+  if (!acc || !Array.isArray(acc.locations)) return;
+  if (!confirm('Remove this location?')) return;
+
+  acc.locations.splice(idx, 1);
+
+  // Adjust selected index
+  if (acc.selectedLocationIdx === idx) {
+    acc.selectedLocationIdx = acc.locations.length > 0 ? 0 : -1;
+  } else if (acc.selectedLocationIdx > idx) {
+    acc.selectedLocationIdx--;
+  }
+
+  saveAccounts(platform, accounts);
+  const listEl = document.getElementById(`loc-list-${accId}`);
+  if (listEl) listEl.innerHTML = renderLocationItems(acc, platform);
+  showToast('Location removed.', 'success');
+}
+
+/** Get the active location's ZIP code for an account */
+function getActiveLocationZip(acc) {
+  if (!acc) return '';
+  const locs = acc.locations || [];
+  const idx = acc.selectedLocationIdx ?? -1;
+  if (idx >= 0 && idx < locs.length) return locs[idx].zip || '';
+  return '';
+}
+
+/** Get the active location's state for an account */
+function getActiveLocationState(acc) {
+  if (!acc) return '';
+  const locs = acc.locations || [];
+  const idx = acc.selectedLocationIdx ?? -1;
+  if (idx >= 0 && idx < locs.length) return locs[idx].state || '';
+  return '';
+}
+
+/** Get the active location's city for an account */
+function getActiveLocationCity(acc) {
+  if (!acc) return '';
+  const locs = acc.locations || [];
+  const idx = acc.selectedLocationIdx ?? -1;
+  if (idx >= 0 && idx < locs.length) return locs[idx].city || '';
+  return '';
 }
 
 /* ═══════════════════════════════════════════════════════════
@@ -2776,7 +3047,8 @@ function buildJobQueue(selectedAccounts, selectedProductIndices) {
   
   Object.entries(selectedAccounts).forEach(([platform, accounts]) => {
     accounts.forEach(acc => {
-      const estSec = estimateJobTime(platform, selectedProductIndices.length);
+      const intervalMins = parseInt(document.getElementById('bulk-interval')?.value || '10', 10);
+      const estSec = estimateJobTime(platform, selectedProductIndices.length, intervalMins);
       queue.push({
         index: jobIdx++,
         platform: platform,
@@ -2785,6 +3057,9 @@ function buildJobQueue(selectedAccounts, selectedProductIndices) {
         email: acc.email,
         password: acc.password,
         city: platform === 'craigslist' ? (acc.city || 'losangeles') : '',
+        zip_code: platform === 'craigslist' ? getActiveLocationZip(acc) : '',
+        state: platform === 'craigslist' ? getActiveLocationState(acc) : '',
+        city_name: platform === 'craigslist' ? getActiveLocationCity(acc) : '',
         productIndices: selectedProductIndices,
         status: 'pending',
         startTime: null,
@@ -2796,13 +3071,19 @@ function buildJobQueue(selectedAccounts, selectedProductIndices) {
   return queue;
 }
 
-function estimateJobTime(platform, numProducts) {
+function estimateJobTime(platform, numProducts, intervalMins) {
+  // Per-ad posting time (seconds)
   const rates = {
-    craigslist: 180,
-    adlandpro: 120,
+    craigslist:    180,
+    adlandpro:     120,
     classifiedads: 120
   };
-  return numProducts * (rates[platform] || 120);
+  const postingTimeSecs = numProducts * (rates[platform] || 120);
+  // Add inter-post wait time: (numProducts - 1) gaps between posts
+  // intervalMins is the bulk-post interval; for queue mode, server.py uses 10 min default
+  const waitMins = typeof intervalMins === 'number' ? intervalMins : 10;
+  const waitTimeSecs = Math.max(0, numProducts - 1) * waitMins * 60;
+  return postingTimeSecs + waitTimeSecs;
 }
 
 function getEstimatedRemainingTime() {
@@ -3065,6 +3346,9 @@ async function launchPost() {
       password: account.password,
       two_captcha_key: captchaKey,
       craigslist_city: account.city || 'losangeles',
+      zip_code: getActiveLocationZip(account),
+      state: getActiveLocationState(account),
+      city_name: getActiveLocationCity(account),
       product_indices: selectedIndices,
       account_label: account.label,
       interval: intervalMins
@@ -3157,13 +3441,16 @@ async function submitJobToServer(job, captchaKey) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        platform: job.platform,
-        email: job.email,
-        password: job.password,
-        two_captcha_key: captchaKey,
-        craigslist_city: job.city,
-        product_indices: job.productIndices,
-        account_label: job.accountLabel
+        platform:         job.platform,
+        email:            job.email,
+        password:         job.password,
+        two_captcha_key:  captchaKey,
+        craigslist_city:  job.city,
+        zip_code:         job.zip_code  || '',
+        state:            job.state     || '',
+        city_name:        job.city_name || '',
+        product_indices:  job.productIndices,
+        account_label:    job.accountLabel
       })
     });
 
@@ -3399,6 +3686,11 @@ function onProductCardCheck() {
   const bulkSel = document.getElementById('bulk-action-select');
   if (bulkSel) {
     bulkSel.style.opacity = checked.length > 0 ? '1' : '0.5';
+  }
+
+  // Refresh the live time estimate in bulk post panel
+  if (document.getElementById('bulk-post-mode')?.checked) {
+    updateBulkTimeEstimate();
   }
 }
 
@@ -3655,8 +3947,25 @@ renderCategories();
       img.src = '';
     }
     
+    // Build specs from flat fields (new format) OR legacy array
+    const flatSpecFields = [
+      ['Brand',     p.brand],
+      ['Model',     p.model],
+      ['Material',  p.material],
+      ['Length',    p.length],
+      ['Width',     p.width],
+      ['Weight',    p.weight],
+      ['Inventory', p.inventory ? String(p.inventory) : ''],
+      ['SKU',       p.sku],
+    ].filter(([, v]) => v);
+
     let specsHtml = '';
-    if (p.specifications && Array.isArray(p.specifications)) {
+    if (flatSpecFields.length > 0) {
+      const rows = flatSpecFields.map(([k, v]) =>
+        `<tr><td style="color:var(--text2);padding:3px 10px 3px 0;font-size:.8rem;font-weight:600;white-space:nowrap;">${k}</td><td style="font-size:.85rem;">${escHtml(String(v))}</td></tr>`
+      ).join('');
+      specsHtml = `<div style="margin-top:14px;"><span class="spec-label" style="font-weight:700;font-size:.78rem;text-transform:uppercase;letter-spacing:.5px;">Specifications</span><table style="border-collapse:collapse;margin-top:6px;width:100%;">${rows}</table></div>`;
+    } else if (p.specifications && Array.isArray(p.specifications)) {
       specsHtml = p.specifications.map(s =>
         `<div class="spec-value">${escHtml(String(s))}</div>`
       ).join('');
@@ -3665,12 +3974,22 @@ renderCategories();
       specsHtml = `<div style="margin-top:12px;"><span class="spec-label">Specifications:</span><div class="spec-value">${escHtml(JSON.stringify(p.specifications))}</div></div>`;
     }
 
+    // Meta badges row
+    const condLabel = (p.condition || '').replace(/^\w/, c => c.toUpperCase());
+    const metaBadges = [
+      p.category  && `<span class="product-category-chip" style="font-size:.75rem;">${escHtml(p.category)}</span>`,
+      condLabel   && `<span class="product-condition-chip ${getConditionClass(p.condition)}" style="font-size:.75rem;">${escHtml(condLabel)}</span>`,
+      p.zip_code  && `<span style="font-size:.75rem;padding:2px 8px;border-radius:999px;background:rgba(99,102,241,.12);color:var(--accent);font-weight:600;">📍 ${escHtml(p.zip_code)}</span>`,
+      p.delivery_available && `<span style="font-size:.75rem;padding:2px 8px;border-radius:999px;background:rgba(34,197,94,.12);color:#22c55e;font-weight:600;">🚚 Delivery</span>`,
+    ].filter(Boolean).join(' ');
+
     document.getElementById('product-preview-details').innerHTML = `
-      <h3>${escHtml(p.title || p.name || 'Untitled')}</h3>
-      <p class="product-price" style="font-size:1.1rem; margin:8px 0;">
+      <h3 style="margin:0 0 6px;">${escHtml(p.title || p.name || 'Untitled')}</h3>
+      <p class="product-price" style="font-size:1.2rem;font-weight:700;margin:6px 0 10px;">
          $${(parseFloat(p.price)||0).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})}
       </p>
-      <p>${escHtml(p.description || '')}</p>
+      ${metaBadges ? `<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:12px;">${metaBadges}</div>` : ''}
+      <p style="font-size:.88rem;line-height:1.6;color:var(--text2);">${escHtml(p.description || '')}</p>
       ${specsHtml}
     `;
     
@@ -3830,6 +4149,42 @@ function toggleBulkPostUI() {
   if (launchBtn) {
     launchBtn.textContent = isBulk ? '🚀 Start Bulk Post' : '🚀 Launch Post';
   }
+  if (isBulk) updateBulkTimeEstimate();
+}
+
+/** Formats total seconds into a human-readable string like "~1 hr 6 min" */
+function formatBulkEstimate(totalSecs) {
+  const hrs  = Math.floor(totalSecs / 3600);
+  const mins = Math.ceil((totalSecs % 3600) / 60);
+  if (hrs > 0 && mins > 0) return `~${hrs} hr ${mins} min`;
+  if (hrs > 0)             return `~${hrs} hr`;
+  return `~${mins} min`;
+}
+
+/** Recomputes and shows the estimated total time in the bulk panel */
+function updateBulkTimeEstimate() {
+  const el = document.getElementById('bulk-time-estimate');
+  if (!el) return;
+
+  const selectedProds = [...document.querySelectorAll('#post-product-list input[type="checkbox"]:checked')];
+  const nProds = selectedProds.length;
+
+  const intervalMins = parseInt(document.getElementById('bulk-interval')?.value || '10', 10);
+
+  // Detect which platform is selected (first account checkbox)
+  const firstAccCb = document.querySelector('#post-accounts-selector input[type="checkbox"]:checked');
+  const platform   = firstAccCb ? (firstAccCb.closest('[data-platform]')?.dataset.platform || 'craigslist') : 'craigslist';
+
+  if (nProds === 0) {
+    el.style.display = 'none';
+    return;
+  }
+
+  const totalSecs = estimateJobTime(platform, nProds, intervalMins);
+  const label     = formatBulkEstimate(totalSecs);
+
+  el.style.display = 'block';
+  el.innerHTML = `⏳ <strong>${nProds} ad${nProds !== 1 ? 's' : ''}</strong> × ${intervalMins} min interval &nbsp;=&nbsp; <strong style="color:var(--accent);">${label}</strong> total`;
 }
 
 async function submitBulkJobToServer(payload) {

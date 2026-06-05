@@ -326,6 +326,144 @@ def click_relocation_if_needed(driver, ad_name):
 #  All three are now correct.
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _selenium_fill_field(driver, el, value, slow=False):
+    """Clear a Selenium element and type value, dispatching all relevant JS events."""
+    try:
+        driver.execute_script("""
+            var el = arguments[0];
+            el.focus();
+            // React / framework-safe value setter
+            var nativeSetter = Object.getOwnPropertyDescriptor(
+                window.HTMLInputElement.prototype, 'value') ||
+                Object.getOwnPropertyDescriptor(
+                window.HTMLTextAreaElement.prototype, 'value');
+            if (nativeSetter && nativeSetter.set) {
+                nativeSetter.set.call(el, '');
+            } else {
+                el.value = '';
+            }
+            el.dispatchEvent(new Event('input', {bubbles:true}));
+        """, el)
+        el.clear()
+        if slow:
+            for ch in value:
+                el.send_keys(ch)
+                time.sleep(random.uniform(0.04, 0.1))
+        else:
+            el.send_keys(value)
+        driver.execute_script("""
+            var el = arguments[0];
+            ['input','change','keyup','blur'].forEach(function(name) {
+                el.dispatchEvent(new Event(name, {bubbles:true, cancelable:true}));
+            });
+        """, el)
+        time.sleep(0.4)
+        return True
+    except Exception as e:
+        return False
+
+
+def prefill_form_fields_via_selenium(driver, product, zip_code, city_name, cl_email):
+    """
+    Fill all form fields via Selenium with proper JS event dispatching.
+    This triggers CL's client-side validation (including the postal ZIP check)
+    so the server accepts the submission.
+    Returns True if the postal field was successfully filled.
+    """
+    title = (product.get("title") or product.get("name") or "Quality Item For Sale").strip()
+    desc  = (product.get("description") or (
+        f"{title} in excellent condition. Well maintained and ready for a new home. "
+        f"Priced to sell. Local pickup preferred. Message for details.")).strip()
+    _pr = str(product.get("price", "")).strip().replace("$", "").replace(",", "")
+    try:
+        price_f = float(_pr) if _pr else 1.0
+        price_val = str(int(price_f)) if price_f == int(price_f) else str(price_f)
+    except Exception:
+        price_val = "1"
+
+    postal_filled = False
+
+    # ── Postal / ZIP field (most critical) ──────────────────────────────
+    postal_selectors = [
+        "input[name='postal']",
+        "input.postal",
+        "input[id*='postal']",
+        "input[placeholder*='zip' i]",
+        "input[placeholder*='postal' i]",
+        "input[type='text'][name*='zip' i]",
+    ]
+    for sel in postal_selectors:
+        try:
+            el = WebDriverWait(driver, 4).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, sel)))
+            if _selenium_fill_field(driver, el, zip_code, slow=True):
+                actual = el.get_attribute("value") or ""
+                print(f"  [prefill] postal '{sel}' → '{actual}'")
+                if actual.strip() == zip_code.strip():
+                    postal_filled = True
+                    break
+        except Exception:
+            pass
+
+    if not postal_filled:
+        # Last attempt: find by XPath text label proximity
+        try:
+            el = driver.find_element(By.XPATH,
+                "//label[contains(translate(.,'ZIP','zip'),'zip') or "
+                "contains(translate(.,'POSTAL','postal'),'postal')]"
+                "/following-sibling::input | "
+                "//label[contains(translate(.,'ZIP','zip'),'zip') or "
+                "contains(translate(.,'POSTAL','postal'),'postal')]"
+                "/..//input")
+            if _selenium_fill_field(driver, el, zip_code, slow=True):
+                print(f"  [prefill] postal via XPath label → '{el.get_attribute('value')}'")
+                postal_filled = True
+        except Exception:
+            pass
+
+    if not postal_filled:
+        print(f"  [prefill] WARNING: Could not fill postal field — will rely on direct POST")
+
+    # ── Title ──
+    for sel in ["input[name='PostingTitle']", "#PostingTitle", "input[name='title']"]:
+        try:
+            el = driver.find_element(By.CSS_SELECTOR, sel)
+            _selenium_fill_field(driver, el, title)
+            break
+        except Exception:
+            pass
+
+    # ── Body / description ──
+    for sel in ["textarea[name='PostingBody']", "#PostingBody", "textarea[name='body']"]:
+        try:
+            el = driver.find_element(By.CSS_SELECTOR, sel)
+            _selenium_fill_field(driver, el, desc)
+            break
+        except Exception:
+            pass
+
+    # ── Price ──
+    for sel in ["input[name='price']", "#price", "input[name='AskingPrice']"]:
+        try:
+            el = driver.find_element(By.CSS_SELECTOR, sel)
+            _selenium_fill_field(driver, el, price_val)
+            break
+        except Exception:
+            pass
+
+    # ── Geographic area ──
+    for sel in ["input[name='geographic_area']", "#geographic_area"]:
+        try:
+            el = driver.find_element(By.CSS_SELECTOR, sel)
+            _selenium_fill_field(driver, el, city_name)
+            break
+        except Exception:
+            pass
+
+    time.sleep(1.5)  # Give CL's JS time to react to all events
+    return postal_filled
+
+
 def submit_form_via_requests(driver, session, product, zip_code, city_name, cl_email):
     """
     Extract the form from the current page and POST it directly via requests.
@@ -335,6 +473,7 @@ def submit_form_via_requests(driver, session, product, zip_code, city_name, cl_e
     print(f"  [direct-post] Extracting form from: {current_url}")
 
     # Extract ALL form fields as they currently exist in the DOM
+    # (postal should already be filled by prefill_form_fields_via_selenium)
     form_data_raw = driver.execute_script("""
         var form = document.getElementById('postingForm');
         if (!form) return null;
@@ -382,14 +521,14 @@ def submit_form_via_requests(driver, session, product, zip_code, city_name, cl_e
     except Exception:
         price = "1"
 
-    # Override with our values
-    form_dict["PostingTitle"] = title
-    form_dict["PostingBody"] = description
-    # CL accepts BOTH field names for zip — send both to be safe
-    form_dict["postal"] = zip_code
-    form_dict["postal_code"] = zip_code
-    form_dict["zip"] = zip_code
+    # Override with our values — postal set via ALL known CL field names
+    form_dict["PostingTitle"]    = title
+    form_dict["PostingBody"]     = description
+    form_dict["postal"]          = zip_code
+    form_dict["postal_code"]     = zip_code
+    form_dict["zip"]             = zip_code
     form_dict["geographic_area"] = city_name
+    form_dict["city"]            = city_name
     if cl_email:
         form_dict["FromEMail"] = cl_email
 
@@ -424,9 +563,10 @@ def submit_form_via_requests(driver, session, product, zip_code, city_name, cl_e
             form_action,
             data=form_dict,
             headers={
-                "Referer": current_url,
-                "Origin": "https://post.craigslist.org",
+                "Referer":      current_url,
+                "Origin":       "https://post.craigslist.org",
                 "Content-Type": "application/x-www-form-urlencoded",
+                "Accept":       "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             },
             allow_redirects=True,
             timeout=30,
@@ -435,14 +575,12 @@ def submit_form_via_requests(driver, session, product, zip_code, city_name, cl_e
 
         # Sniff the response for error clues before loading into Selenium
         resp_text = resp.text
+        import re
         if "ZIP" in resp_text or "postal" in resp_text.lower() or "zip" in resp_text.lower():
-            # Extract the specific ZIP error context from the HTML
-            import re
             zip_snippets = re.findall(r'.{0,80}(?:zip|postal|ZIP).{0,80}', resp_text, re.IGNORECASE)
             for s in zip_snippets[:5]:
                 print(f"  [direct-post] ZIP hint: {s.strip()}")
         
-        # Also check what field names CL's error page mentions
         field_errors = re.findall(r"""name=["']([^"']+)["']""", resp_text)
         zip_fields = [f for f in field_errors if 'post' in f.lower() or 'zip' in f.lower() or 'code' in f.lower()]
         if zip_fields:
@@ -469,9 +607,13 @@ def fill_listing_details(driver, session, product: dict):
     handle_captcha_if_present(driver)
     time.sleep(3)  # Let CL's JS fully initialize so cryptedStepCheck is populated
 
-    # Resolve zip/city/email
+    # ── Resolve zip / city / email ───────────────────────────────────────────
+    # Priority 1: explicit values from UI's Location Manager (sent in product dict)
+    # Priority 2: per-product zip_code / postal_code fields
+    # Priority 3: env var
+    # Priority 4: lookup table based on CL_CITY
     _ZIPS = {
-        "losangeles": "90001", "newyork": "10001", "chicago": "60601",
+        "losangeles": "90025", "newyork": "10001", "chicago": "60601",
         "houston": "77001", "phoenix": "85001", "sfbay": "94102",
         "sandiego": "92101", "seattle": "98101", "miami": "33101",
         "dallas": "75201", "denver": "80201", "atlanta": "30301",
@@ -483,46 +625,173 @@ def fill_listing_details(driver, session, product: dict):
         "albuquerque": "87108", "brooklyn": "11206", "raleigh": "27604",
         "fargo": "58102", "columbus": "43211", "philadelphia": "19019",
         "nashville": "37205", "saltlakecity": "84118", "milwaukee": "53221",
+        "tampa": "33601", "sacramento": "95814", "kansascity": "64101",
+        "charlotte": "28201", "richmond": "23219", "tucson": "85701",
+        "fresno": "93701", "memphis": "38101", "jacksonville": "32099",
     }
-    zip_code = (product.get("zip_code") or product.get("postal_code") or "").strip()
+
+    zip_code = (
+        product.get("_location_zip") or
+        product.get("zip_code") or
+        product.get("postal_code") or
+        os.environ.get("CL_ZIP", "")
+    ).strip()
     if not zip_code:
         _ck = CL_CITY.lower().replace(" ", "").replace("-", "")
-        zip_code = _ZIPS.get(_ck, "90001")
+        zip_code = _ZIPS.get(_ck, "90025")
 
     _CITY_NAMES = {
         "losangeles": "Los Angeles", "newyork": "New York", "chicago": "Chicago",
         "houston": "Houston", "phoenix": "Phoenix", "sfbay": "San Francisco",
         "sandiego": "San Diego", "seattle": "Seattle", "miami": "Miami",
         "dallas": "Dallas", "denver": "Denver", "atlanta": "Atlanta",
-        "boston": "Boston", "portland": "Portland",
+        "boston": "Boston", "portland": "Portland", "lasvegas": "Las Vegas",
+        "nashville": "Nashville", "sacramento": "Sacramento", "tampa": "Tampa",
     }
-    _ck = CL_CITY.lower().replace(" ", "").replace("-", "")
-    city_name = _CITY_NAMES.get(_ck, CL_CITY.title())
+    city_name = (
+        product.get("_location_city") or
+        os.environ.get("CL_CITY_NAME", "")
+    ).strip()
+    if not city_name:
+        _ck = CL_CITY.lower().replace(" ", "").replace("-", "")
+        city_name = _CITY_NAMES.get(_ck, CL_CITY.title())
+
+    state = (product.get("_location_state") or "").strip()
+    if state:
+        print(f"  [location] State={state}, City={city_name}, ZIP={zip_code}")
+    else:
+        print(f"  [location] City={city_name}, ZIP={zip_code}")
 
     cl_email = (os.environ.get("CL_EMAIL") or
                 product.get("contact_email") or product.get("email") or "").strip()
 
-    # Submit form directly via requests (bypasses CL's JS validation)
+    # ── LAYER 1: Selenium fills fields + Selenium clicks submit ──────────────
+    # Most reliable: CL's own JS runs full validation, including postal.
+    print("  [submit] Layer 1: Selenium form fill + Selenium click submit")
+    try:
+        prefill_form_fields_via_selenium(driver, product, zip_code, city_name, cl_email)
+
+        # Click the continue/submit button
+        submit_btn = None
+        for sel in [
+            "button[type='submit'].go",
+            "button.go.pickbutton",
+            "button[type='submit']",
+            "input[type='submit']",
+        ]:
+            try:
+                submit_btn = WebDriverWait(driver, 5).until(
+                    EC.element_to_be_clickable((By.CSS_SELECTOR, sel)))
+                break
+            except Exception:
+                pass
+
+        if submit_btn:
+            driver.execute_script("arguments[0].click();", submit_btn)
+            print("  [submit] Layer 1: Clicked submit via Selenium")
+
+            # Wait to see if we advance off the edit page
+            try:
+                WebDriverWait(driver, 12).until(
+                    lambda d: "s=edit" not in d.current_url)
+                print(f"  [submit] Layer 1 ✓ Advanced past edit page → {driver.current_url}")
+                return True
+            except TimeoutException:
+                print("  [submit] Layer 1: Still on edit page after Selenium submit → Layer 2")
+        else:
+            print("  [submit] Layer 1: No submit button found → Layer 2")
+    except Exception as e:
+        print(f"  [submit] Layer 1 error: {e}")
+
+    # ── LAYER 2: Pre-fill postal via Selenium, then direct requests POST ─────
+    # Extract the form AFTER Selenium has filled it (postal value is now in DOM).
+    print("  [submit] Layer 2: Selenium pre-fill postal + requests POST")
+    # Re-navigate to edit page if Selenium submit sent us somewhere weird
+    if "s=edit" not in driver.current_url:
+        # We may have advanced already — check
+        if "s=images" in driver.current_url or "s=preview" in driver.current_url:
+            return True  # Already past edit!
+
+    # Refresh cookies right before the POST
+    original_url = driver.current_url
+    for cl_domain in [
+        "https://accounts.craigslist.org",
+        "https://post.craigslist.org",
+        "https://www.craigslist.org",
+    ]:
+        try:
+            driver.get(cl_domain)
+            time.sleep(1.5)
+            for cookie in driver.get_cookies():
+                session.cookies.set(cookie["name"], cookie["value"])
+        except Exception:
+            pass
+    driver.get(original_url)
+    time.sleep(2)
+
+    # Ensure postal is filled in the DOM before extraction
+    prefill_form_fields_via_selenium(driver, product, zip_code, city_name, cl_email)
+    time.sleep(1)
+
     result_url = submit_form_via_requests(
         driver, session, product, zip_code, city_name, cl_email)
 
     if result_url and "s=edit" not in result_url:
-        print(f"  ✓ Form submitted successfully → {result_url}")
+        print(f"  [submit] Layer 2 ✓ Form submitted successfully → {result_url}")
         return True
-    else:
-        print(f"  ✗ Direct POST failed or still on edit page: {result_url}")
-        # Last resort: dump what we know
-        try:
-            errs = [e.text.strip() for e in driver.find_elements(
-                By.CSS_SELECTOR, ".notices li, .err, .error, span.notice, .warning"
-            ) if e.text.strip() and len(e.text.strip()) > 3]
-            if errs:
-                print("  [server errors]:")
-                for et in sorted(set(errs)):
-                    print(f"    → {et[:120]}")
-        except Exception:
-            pass
-        return False
+
+    print(f"  [submit] Layer 2 failed: {result_url}")
+
+    # ── LAYER 3: Brute-force Selenium form fill → wait for success ───────────
+    # If both previous layers failed, try typing in the form and submitting
+    # directly through the browser as a final attempt.
+    print("  [submit] Layer 3: Full Selenium form fill + submit (final attempt)")
+    try:
+        # Navigate back to edit page if needed
+        if "s=edit" not in driver.current_url:
+            driver.get(original_url)
+            time.sleep(3)
+
+        prefill_form_fields_via_selenium(driver, product, zip_code, city_name, cl_email)
+        human_delay(2, 3)
+
+        # Try every possible submit selector
+        submitted = False
+        for sel in [
+            "button[type='submit']", "input[type='submit']",
+            "button.go", "button[class*='submit']",
+        ]:
+            try:
+                btn = driver.find_element(By.CSS_SELECTOR, sel)
+                driver.execute_script("arguments[0].scrollIntoView(true);", btn)
+                driver.execute_script("arguments[0].click();", btn)
+                time.sleep(8)
+                if "s=edit" not in driver.current_url:
+                    print(f"  [submit] Layer 3 ✓ → {driver.current_url}")
+                    submitted = True
+                    break
+            except Exception:
+                pass
+
+        if submitted:
+            return True
+
+    except Exception as e:
+        print(f"  [submit] Layer 3 error: {e}")
+
+    # All layers failed — log server errors for diagnosis
+    print("  ✗ All submission layers failed.")
+    try:
+        errs = [e.text.strip() for e in driver.find_elements(
+            By.CSS_SELECTOR, ".notices li, .err, .error, span.notice, .warning"
+        ) if e.text.strip() and len(e.text.strip()) > 3]
+        if errs:
+            print("  [server errors]:")
+            for et in sorted(set(errs)):
+                print(f"    → {et[:120]}")
+    except Exception:
+        pass
+    return False
 
 
 def upload_photos(driver, product: dict):

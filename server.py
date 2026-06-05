@@ -174,6 +174,9 @@ def _run_bulk(body):
     password = body.get("password", "")
     two_captcha_key = body.get("two_captcha_key", "")
     craigslist_city = body.get("craigslist_city", "losangeles")
+    zip_code  = body.get("zip_code", "")
+    city_name = body.get("city_name", "")
+    state     = body.get("state", "")
     product_indices = body.get("product_indices", [])
     account_label = body.get("account_label", "Account")
     interval_mins = float(body.get("interval", 10.0))
@@ -197,6 +200,12 @@ def _run_bulk(body):
             continue
             
         prod = all_prods[prod_idx]
+        # Inject location data from Location Manager into this product
+        if zip_code or city_name or state:
+            prod = dict(prod)  # shallow copy to avoid mutating the cached list
+            if zip_code:  prod["_location_zip"]   = zip_code
+            if city_name: prod["_location_city"]  = city_name
+            if state:     prod["_location_state"] = state
         
         with _lock:
             _bulk_current_product = prod.get("title") or prod.get("name", "Unknown")
@@ -217,6 +226,8 @@ def _run_bulk(body):
         env["PRODUCTS_FILE"]   = str(SUBSET_JSON)
         if platform == "craigslist":
             env["CL_CITY"] = craigslist_city
+            if zip_code:  env["CL_ZIP"]       = zip_code
+            if city_name: env["CL_CITY_NAME"] = city_name
             
         try:
             proc = subprocess.Popen(
@@ -325,12 +336,21 @@ def launch_post():
 
         # Handle product indices
         product_indices = body.get("product_indices")
+        zip_code  = body.get("zip_code", "")
+        city_name = body.get("city_name", "")
+        state     = body.get("state", "")
         if isinstance(product_indices, list) and len(product_indices) > 0:
             if not PRODUCTS_JSON.exists():
                 return jsonify({"error": "products.json not found — add products first."}), 400
             
             all_prods = _read_json(PRODUCTS_JSON, [])
             subset = [all_prods[i] for i in product_indices if i < len(all_prods)]
+            # Inject location data from Location Manager into each product
+            if zip_code or city_name or state:
+                for p in subset:
+                    if zip_code:  p["_location_zip"]   = zip_code
+                    if city_name: p["_location_city"]  = city_name
+                    if state:     p["_location_state"] = state
             _write_json(SUBSET_JSON, subset)
             products_file = str(SUBSET_JSON)
         else:
@@ -345,7 +365,9 @@ def launch_post():
         env["TWO_CAPTCHA_KEY"] = body.get("two_captcha_key", "")
         env["PRODUCTS_FILE"]   = products_file
         if platform == "craigslist":
-            env["CL_CITY"] = body.get("craigslist_city", "losangeles")
+            env["CL_CITY"]      = body.get("craigslist_city", "losangeles")
+            if zip_code:  env["CL_ZIP"]       = zip_code
+            if city_name: env["CL_CITY_NAME"] = city_name
 
         account_label = body.get("account_label", "Account")
         _lines = [f"[CLBlast] Starting {platform} / {account_label}...\n"]
