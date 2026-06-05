@@ -160,6 +160,98 @@ def _ensure_xvfb():
         print(f"  [driver] Xvfb unavailable: {e}")
 
 
+# Real browser fingerprint strings — rotate randomly so each session looks different
+_FINGERPRINTS = [
+    {
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.82 Safari/537.36",
+        "platform": "Win32", "vendor": "Google Inc.", "lang": "en-US",
+        "screen": (1920, 1080), "tz": "America/Los_Angeles",
+    },
+    {
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.6312.122 Safari/537.36",
+        "platform": "Win32", "vendor": "Google Inc.", "lang": "en-US",
+        "screen": (1366, 768), "tz": "America/New_York",
+    },
+    {
+        "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.82 Safari/537.36",
+        "platform": "MacIntel", "vendor": "Google Inc.", "lang": "en-US",
+        "screen": (2560, 1600), "tz": "America/Chicago",
+    },
+    {
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.6261.112 Safari/537.36",
+        "platform": "Win32", "vendor": "Google Inc.", "lang": "en-US",
+        "screen": (1440, 900), "tz": "America/Denver",
+    },
+]
+
+_FINGERPRINT_JS = """
+(function() {{
+    // Navigator overrides
+    Object.defineProperty(navigator, 'webdriver',   {{get: () => undefined}});
+    Object.defineProperty(navigator, 'platform',    {{get: () => '{platform}'}});
+    Object.defineProperty(navigator, 'vendor',      {{get: () => '{vendor}'}});
+    Object.defineProperty(navigator, 'language',    {{get: () => '{lang}'}});
+    Object.defineProperty(navigator, 'languages',   {{get: () => ['{lang}', 'en']}});
+    Object.defineProperty(navigator, 'hardwareConcurrency', {{get: () => 8}});
+    Object.defineProperty(navigator, 'deviceMemory',        {{get: () => 8}});
+    Object.defineProperty(navigator, 'maxTouchPoints',      {{get: () => 0}});
+
+    // Screen
+    Object.defineProperty(screen, 'width',       {{get: () => {sw}}});
+    Object.defineProperty(screen, 'height',      {{get: () => {sh}}});
+    Object.defineProperty(screen, 'availWidth',  {{get: () => {sw}}});
+    Object.defineProperty(screen, 'availHeight', {{get: () => {sh} - 40}});
+    Object.defineProperty(screen, 'colorDepth',  {{get: () => 24}});
+    Object.defineProperty(screen, 'pixelDepth',  {{get: () => 24}});
+
+    // Chrome object — missing in stock chromedriver
+    if (!window.chrome) {{
+        window.chrome = {{
+            app: {{}},
+            runtime: {{
+                onConnect: {{addListener: function(){{}}}},
+                onMessage: {{addListener: function(){{}}}}
+            }},
+        }};
+    }}
+
+    // Plugins — real browsers have these
+    Object.defineProperty(navigator, 'plugins', {{
+        get: () => {{
+            var ps = [
+                {{name:'Chrome PDF Plugin',      filename:'internal-pdf-viewer', description:'Portable Document Format'}},
+                {{name:'Chrome PDF Viewer',      filename:'mhjfbmdgcfjbbpaeojofohoefgiehjai', description:''}},
+                {{name:'Native Client',          filename:'internal-nacl-plugin', description:''}},
+            ];
+            ps.refresh = function(){{}};
+            ps.item    = function(i){{return ps[i];}};
+            ps.namedItem = function(n){{return ps.find(p=>p.name===n)||null;}};
+            Object.defineProperty(ps,'length',{{get:()=>ps.length}});
+            return ps;
+        }}
+    }});
+
+    // Permissions — real browsers return 'granted' for notifications
+    const origQuery = window.Permissions && window.Permissions.prototype.query;
+    if (origQuery) {{
+        window.Permissions.prototype.query = function(p) {{
+            return p.name === 'notifications'
+                ? Promise.resolve({{state: 'granted', onchange: null}})
+                : origQuery.apply(this, arguments);
+        }};
+    }}
+
+    // WebGL vendor/renderer
+    const getParam = WebGLRenderingContext.prototype.getParameter;
+    WebGLRenderingContext.prototype.getParameter = function(p) {{
+        if (p === 37445) return 'Intel Inc.';
+        if (p === 37446) return 'Intel Iris OpenGL Engine';
+        return getParam.call(this, p);
+    }};
+}})();
+"""
+
+
 def make_driver(proxy_url=None):
     from selenium.webdriver.chrome.service import Service as ChromeService
     os.environ["SE_MANAGER_PATH"] = ""
@@ -167,16 +259,20 @@ def make_driver(proxy_url=None):
     _ensure_xvfb()
     use_headed = bool(os.environ.get("DISPLAY"))
 
-    # Use proxy from argument or environment
     if not proxy_url:
         proxy_url = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
+
+    # Pick a random fingerprint for this session
+    fp = random.choice(_FINGERPRINTS)
+    sw, sh = fp["screen"]
+    print(f"  [driver] Fingerprint: {fp['ua'][:60]}...")
 
     options = webdriver.ChromeOptions()
     chrome_args = [
         "--no-sandbox",
         "--disable-dev-shm-usage",
         "--disable-gpu",
-        "--window-size=1280,800",
+        f"--window-size={sw},{sh}",
         "--disable-setuid-sandbox",
         "--disable-blink-features=AutomationControlled",
         "--ignore-certificate-errors",
@@ -184,6 +280,20 @@ def make_driver(proxy_url=None):
         "--mute-audio",
         "--no-first-run",
         "--shm-size=256m",
+        "--disable-features=AutofillServerCommunication,IsolateOrigins,site-per-process",
+        "--enable-features=NetworkService,NetworkServiceInProcess",
+        "--disable-web-security",
+        "--allow-running-insecure-content",
+        # Real browser has these
+        "--enable-javascript",
+        "--enable-local-storage",
+        f"--lang={fp['lang']}",
+        "--disable-popup-blocking",
+        "--disable-translate",
+        "--disable-default-apps",
+        "--disable-sync",
+        "--metrics-recording-only",
+        "--no-report-upload",
     ]
     if not use_headed:
         chrome_args.insert(3, "--headless=new")
@@ -192,48 +302,47 @@ def make_driver(proxy_url=None):
     if use_headed:
         print("  [driver] Headed mode (virtual display)")
 
-    # Apply proxy to Chrome so login + navigation use the same IP as the POST request
     if proxy_url:
-        # Strip scheme for --proxy-server (Chrome accepts http:// or just host:port)
-        proxy_for_chrome = proxy_url
-        print(f"  [driver] Proxy: {proxy_for_chrome.split('@')[-1] if '@' in proxy_for_chrome else proxy_for_chrome}")
-        options.add_argument(f"--proxy-server={proxy_for_chrome}")
-        # Bypass proxy for localhost only
+        print(f"  [driver] Proxy: {proxy_url.split('@')[-1] if '@' in proxy_url else proxy_url}")
+        options.add_argument(f"--proxy-server={proxy_url}")
         options.add_argument("--proxy-bypass-list=localhost,127.0.0.1")
+
     fresh_profile = tempfile.mkdtemp(prefix="clblast_chrome_")
     options.add_argument(f"--user-data-dir={fresh_profile}")
-    options.add_argument(
-        "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    )
+    options.add_argument(f"--user-agent={fp['ua']}")
+
     options.add_experimental_option("prefs", {
         "credentials_enable_service": False,
         "profile.password_manager_enabled": False,
         "autofill.profile_enabled": False,
         "autofill.credit_card_enabled": False,
+        "intl.accept_languages": fp["lang"],
     })
-    options.add_argument("--disable-features=AutofillServerCommunication")
+    options.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
+    options.add_experimental_option("useAutomationExtension", False)
+
     chromium_bin = _find_binary(
         ["google-chrome", "chromium", "chromium-browser"],
         ["/usr/local/bin/google-chrome", "/usr/bin/chromium", "/usr/bin/chromium-browser"])
     if chromium_bin:
         print(f"  [driver] Using chromium: {chromium_bin}")
         options.binary_location = chromium_bin
+
     chromedriver_bin = _find_binary(
         ["chromedriver"],
         ["/usr/local/bin/chromedriver", "/usr/bin/chromedriver"])
-    # Prefer our wrapper script which passes --allowed-origins=*
     if os.path.exists("/usr/local/bin/chromedriver"):
         chromedriver_bin = "/usr/local/bin/chromedriver"
     if not chromedriver_bin:
         raise RuntimeError("chromedriver not found")
     print(f"  [driver] Using chromedriver: {chromedriver_bin}")
+
     service = ChromeService(
         executable_path=chromedriver_bin,
         log_output="/tmp/chromedriver.log",
     )
-    # ChromeDriver 115+ requires explicit allowed origins in newer builds
     options.add_argument("--remote-allow-origins=*")
+
     try:
         import undetected_chromedriver as uc
         driver = uc.Chrome(
@@ -247,15 +356,33 @@ def make_driver(proxy_url=None):
     except Exception as uc_err:
         print(f"  [driver] undetected-chromedriver unavailable ({uc_err}), using stock Chrome")
         driver = webdriver.Chrome(service=service, options=options)
-    driver.execute_cdp_cmd(
-        "Page.addScriptToEvaluateOnNewDocument",
-        {"source": "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"}
+
+    # Inject full fingerprint JS on every new page
+    fingerprint_js = _FINGERPRINT_JS.format(
+        platform=fp["platform"], vendor=fp["vendor"], lang=fp["lang"],
+        sw=sw, sh=sh,
     )
+    driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": fingerprint_js})
+
+    # Set realistic Accept-Language header via CDP
+    try:
+        driver.execute_cdp_cmd("Network.enable", {})
+        driver.execute_cdp_cmd("Network.setExtraHTTPHeaders", {"headers": {
+            "Accept-Language": f"{fp['lang']},en;q=0.9",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Encoding": "gzip, deflate, br",
+            "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": f'"{fp["platform"]}"',
+        }})
+    except Exception:
+        pass
+
     return driver
 
 def human_delay(lo=0.8, hi=2.5):
-    time.sleep(random.uniform(lo * 0.3 if IS_FAST_MODE else lo,
-                              hi * 0.3 if IS_FAST_MODE else hi))
+    # Always use full delays — fast mode was causing CL to flag us as bot
+    time.sleep(random.uniform(lo, hi))
 
 def send_keys_slow(driver, element, text):
     try:
@@ -647,7 +774,7 @@ def _paste_fill(driver, element, value):
     # Step 2: focus + select-all + delete via keyboard
     _focus_field(driver, element)
     element.send_keys(Keys.CONTROL + "a")
-    time.sleep(0.08)
+    time.sleep(random.uniform(0.08, 0.15))
     element.send_keys(Keys.DELETE)
     time.sleep(0.15)
 
@@ -690,7 +817,7 @@ def _clear_and_type(driver, element, value):
     value = str(value).strip()
     _focus_field(driver, element)
     element.send_keys(Keys.CONTROL + "a")
-    time.sleep(0.08)
+    time.sleep(random.uniform(0.08, 0.15))
     element.send_keys(Keys.DELETE)
     time.sleep(0.15)
     for ch in value:
@@ -1006,7 +1133,7 @@ def _type_into_field(driver, selector, value, label="field"):
     # Type character by character like a human
     for ch in value:
         el.send_keys(ch)
-        time.sleep(random.uniform(0.04, 0.12))
+        time.sleep(random.uniform(0.08, 0.18))
 
     # Tab away to trigger blur/change events
     el.send_keys(Keys.TAB)
@@ -1132,7 +1259,7 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
                 time.sleep(0.1)
                 for ch in zip_code:
                     postal_el.send_keys(ch)
-                    time.sleep(0.08)
+                    time.sleep(random.uniform(0.08, 0.15))
                 postal_el.send_keys(Keys.TAB)
                 time.sleep(0.4)
             actual_zip2 = (postal_el.get_attribute("value") or "").strip()
@@ -1150,10 +1277,68 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
         except Exception:
             print(f"  [pre-submit] {fname}: NOT FOUND")
 
-    # ── Submit via requests POST — most reliable, bypasses React's on-submit clearing ──
-    # We MUST NOT rely on DOM values after clicking submit (CL clears postal on click).
-    # Instead: build POST from the cryptedStepCheck + our own field values directly.
-    print("  [submit] Building POST request with browser session cookies...")
+    # ── SUBMIT STRATEGY ──────────────────────────────────────────────────────────
+    # Key insight: CL's React onclick handler clears postal before submitting.
+    # Fix: type postal LAST (right now), then immediately submit via JS form.submit()
+    # which bypasses the onclick handler entirely and sends whatever is in the DOM.
+    print("  [submit] Filling ZIP last then submitting immediately...")
+    submitted = False
+
+    # Re-type postal right now as the very last action
+    if zip_code:
+        try:
+            postal_el = WebDriverWait(driver, 5).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "[name='postal']")))
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", postal_el)
+            time.sleep(0.3)
+            # Clear and retype
+            postal_el.click()
+            postal_el.send_keys(Keys.CONTROL + "a")
+            time.sleep(0.1)
+            postal_el.send_keys(Keys.DELETE)
+            time.sleep(0.1)
+            for ch in zip_code:
+                postal_el.send_keys(ch)
+                time.sleep(random.uniform(0.08, 0.15))
+            time.sleep(0.3)
+            actual = (postal_el.get_attribute("value") or "").strip()
+            print(f"  [ZIP-last] typed='{actual}'")
+        except Exception as e:
+            print(f"  [ZIP-last] failed: {e}")
+
+    # Submit via JS form.submit() — skips React onclick, sends DOM as-is
+    try:
+        result = driver.execute_script("""
+            var form = document.getElementById('postingForm');
+            if (!form) return 'no-form';
+            // Set go=continue hidden field if needed
+            var goEl = form.querySelector('[name="go"]');
+            if (goEl) { goEl.value = 'continue'; }
+            else {
+                var h = document.createElement('input');
+                h.type = 'hidden'; h.name = 'go'; h.value = 'continue';
+                form.appendChild(h);
+            }
+            form.submit();
+            return 'submitted';
+        """)
+        print(f"  [submit] form.submit() → {result}")
+        # Wait to leave edit page
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            if "s=edit" not in driver.current_url:
+                submitted = True
+                print(f"  ✅ Submitted via form.submit() → {driver.current_url}")
+                break
+            time.sleep(0.5)
+    except Exception as e:
+        print(f"  [submit] form.submit() failed: {e}")
+
+    if submitted:
+        return driver.current_url
+
+    # ── Fallback: requests POST ───────────────────────────────────────────────
+    print("  [submit] Trying requests POST fallback...")
     submitted = False
 
     # ── requests POST: use cryptedStepCheck from DOM + our field values ──────────
@@ -1322,7 +1507,7 @@ def _click_first(driver, selectors, label="button"):
             driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
             time.sleep(0.3)
             try:
-                ActionChains(driver).move_to_element(el).pause(0.2).click().perform()
+                ActionChains(driver).move_to_element(el).pause(0.4).click().perform()
             except Exception:
                 driver.execute_script("arguments[0].click();", el)
             print(f"  ✓ Clicked {label} ({sel[:50]})")
@@ -1640,9 +1825,21 @@ def post_product(driver, ad_name, product):
                 city_clicked = True
                 print(f"  ✓ Selected city: {txt}")
                 break
-        if not city_clicked and menu_items:
-            driver.execute_script("arguments[0].click();", menu_items[0])
-            print("  ⚠ Fallback city selected")
+        if not city_clicked:
+            print(f"  ✗ City '{CL_CITY}' not found in dropdown — available: {[m.text.strip() for m in menu_items[:5]]}")
+            # Try partial match more aggressively
+            for item in menu_items:
+                txt = (item.text or '').strip().lower()
+                if any(word in txt for word in target.split() if len(word) > 3):
+                    driver.execute_script("arguments[0].click();", item)
+                    city_clicked = True
+                    print(f"  ✓ Partial match city: {item.text.strip()}")
+                    break
+            if not city_clicked and menu_items:
+                # Last resort: pick first but warn loudly
+                first_txt = menu_items[0].text.strip()
+                print(f"  ⚠ USING FIRST CITY AS FALLBACK: '{first_txt}' — set CL_CITY correctly!")
+                driver.execute_script("arguments[0].click();", menu_items[0])
         human_delay(2, 3)
         continue_btn = WebDriverWait(driver, 10).until(
             EC.element_to_be_clickable((By.CSS_SELECTOR,
