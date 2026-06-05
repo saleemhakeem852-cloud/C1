@@ -1032,7 +1032,7 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     # ── Strategy 0: form.requestSubmit (CL's native handler) ───────────────
     submitted = False
     if not _ensure_fields_intact(driver, _field_map):
-        _resolve_autofill_errors(driver, _field_map, max_rounds=2)
+        _verify_and_refill(driver, _field_map)
     try:
         result = _native_request_submit(driver)
         print(f"  [submit] requestSubmit → {result}")
