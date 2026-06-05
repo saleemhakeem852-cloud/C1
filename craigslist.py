@@ -489,10 +489,13 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
             break
 
     # Always include required checkboxes — they are missing when unchecked
-    for cb in ['contact_phone_ok', 'contact_text_ok', 'show_phone_ok',
-               'crypto_currency_ok', 'delivery_available', 'see_my_other',
+    for cb in ['crypto_currency_ok', 'delivery_available', 'see_my_other',
                'show_address_ok', 'save_contact_preferences']:
         form_dict[cb] = '1'
+
+    form_dict['show_phone_ok'] = '0'
+    form_dict['contact_phone_ok'] = '0'
+    form_dict['contact_text_ok'] = '0'
 
     # Remove empty optional fields that confuse CL's validator
     for optional in ['contact_phone', 'contact_phone_extension', 'contact_name',
