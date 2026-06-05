@@ -462,7 +462,7 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     # postal — fill last with real keys, no TAB (skip if empty for non-US accounts)
     print("  Filling postal (last, no TAB)...")
     if zip_code:
-        real_fill("[name='postal']", zip_code, use_tab=False)
+        real_fill("[name='postal']", zip_code, use_tab=True)
         time.sleep(0.5)
     else:
         print("  ⚠ No ZIP/postal code for this city — skipping postal field")
@@ -548,46 +548,22 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     for k, v in sorted(form_dict.items()):
         print(f"  [post-field] {k}={str(v)[:50]}")
 
-    # Build requests session from Selenium cookies
-    sess = requests.Session()
-    sess.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                      "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Referer": driver.current_url,
-        "Origin": "https://post.craigslist.org",
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-    })
-    for cookie in driver.get_cookies():
-        sess.cookies.set(cookie['name'], cookie['value'])
-
-    # Route POST through residential proxy (Chrome can't use it, requests can)
-    proxy_url = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
-    proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
-    if proxies:
-        print(f"  [post] Via proxy: {proxy_url.split('@')[-1] if '@' in proxy_url else proxy_url}")
-    else:
-        print("  [post] No proxy — using Railway IP (add HTTPS_PROXY env var to fix)")
-
+    print("  [submit] Clicking browser submit button...")
     try:
-        resp = sess.post(form_action, data=form_dict,
-                         proxies=proxies, allow_redirects=True, timeout=30)
-        print(f"  [post] Response: {resp.status_code} → {resp.url}")
-
-        if "s=edit" not in resp.url:
-            driver.get(resp.url)
-            time.sleep(2)
-            return resp.url
-
-        # Still on edit — show what server said
-        err_matches = re.findall(r'<li>([^<]{4,120})</li>', resp.text)
-        for e in err_matches[:6]:
-            print(f"  [post] Server error: {e.strip()}")
-        return resp.url
-
+        submit_btn = WebDriverWait(driver, 10).until(
+            EC.element_to_be_clickable((By.CSS_SELECTOR, "button[type='submit']"))
+        )
+        submit_btn.click()
+        time.sleep(5)
     except Exception as e:
-        print(f"  [post] Request failed: {e}")
+        print(f"  ✗ Submit button click failed: {e}")
+        return None
+
+    if "s=edit" not in driver.current_url:
+        print("  ✅ Posted successfully")
+        return driver.current_url
+    else:
+        print("  ❌ Still on edit page")
         return None
 
 
