@@ -32,6 +32,12 @@ try:
 except ImportError:
     CAPTCHA_SOLVER_AVAILABLE = False
 
+try:
+    import pyperclip
+    PYPERCLIP_AVAILABLE = True
+except ImportError:
+    PYPERCLIP_AVAILABLE = False
+
 TWO_CAPTCHA_API_KEY = os.environ.get("TWO_CAPTCHA_KEY", "YOUR_2CAPTCHA_API_KEY")
 LISTINGS_JSON       = "posted_listings.json"
 CL_CITY             = os.environ.get("CL_CITY", "losangeles")
@@ -345,20 +351,89 @@ def _react_set_value(driver, element, value):
 
 
 def _disable_form_autofill(driver):
-    """Tell Chrome and CL not to autofill posting fields."""
+    """Block browser autofill and CL prefills before we type."""
     try:
         driver.execute_script("""
             var form = document.getElementById('postingForm');
             if (!form) return;
             form.setAttribute('autocomplete', 'off');
             form.querySelectorAll('input,textarea').forEach(function(el) {
-                el.setAttribute('autocomplete', 'off');
+                el.setAttribute('autocomplete', 'one-time-code');
                 el.setAttribute('data-lpignore', 'true');
                 el.setAttribute('data-form-type', 'other');
+                el.setAttribute('readonly', 'readonly');
+                el.addEventListener('focus', function onFocus() {
+                    el.removeAttribute('readonly');
+                    el.removeEventListener('focus', onFocus);
+                });
             });
         """)
     except Exception:
         pass
+
+
+_ACKNOWLEDGE_FIELD_JS = """
+var el = arguments[0];
+var value = String(arguments[1]);
+function walkFiber(f, d) {
+    if (!f || d > 22) return;
+    var s = f.memoizedState;
+    while (s) {
+        var m = s.memoizedState;
+        if (m && typeof m === 'object') {
+            Object.keys(m).forEach(function(k) {
+                if (/autofill/i.test(k)) m[k] = false;
+                if (/userEdited|userModified|manuallyEdited|touched|dirty/i.test(k)) m[k] = true;
+            });
+        }
+        s = s.next;
+    }
+    walkFiber(f.child, d + 1);
+    walkFiber(f.sibling, d + 1);
+}
+el.dispatchEvent(new FocusEvent('focusin', {bubbles: true}));
+el.focus();
+if (el._valueTracker) el._valueTracker.setValue('');
+var proto = el.tagName === 'TEXTAREA'
+    ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+var desc = Object.getOwnPropertyDescriptor(proto, 'value');
+if (desc && desc.set) desc.set.call(el, value);
+else el.value = value;
+try {
+    el.dispatchEvent(new InputEvent('beforeinput', {
+        bubbles: true, cancelable: true, inputType: 'insertFromPaste', data: value
+    }));
+} catch (e) {}
+el.dispatchEvent(new InputEvent('input', {bubbles: true, inputType: 'insertFromPaste', data: value}));
+el.dispatchEvent(new Event('change', {bubbles: true}));
+var fk = Object.keys(el).find(function(k) { return k.indexOf('__reactFiber') === 0; });
+if (fk) walkFiber(el[fk], 0);
+el.dispatchEvent(new FocusEvent('blur', {bubbles: true}));
+el.dispatchEvent(new FocusEvent('focusout', {bubbles: true}));
+return el.value;
+"""
+
+
+def _acknowledge_field(driver, element, value):
+    """Mark a field user-edited in React so CL clears the autofilled flag."""
+    try:
+        return driver.execute_script(_ACKNOWLEDGE_FIELD_JS, element, str(value)) or ""
+    except Exception:
+        return ""
+
+
+def _cdp_click_element(driver, element):
+    rect = element.rect
+    x = rect['x'] + rect['width'] / 2
+    y = rect['y'] + rect['height'] / 2
+    for event_type in ('mousePressed', 'mouseReleased'):
+        driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
+            "type": event_type,
+            "x": x, "y": y,
+            "buttons": 1,
+            "button": "left",
+            "clickCount": 1,
+        })
 
 
 # Only these fields accept text entry — never "re-type" hidden inputs or checkboxes
@@ -394,15 +469,62 @@ def _type_with_send_keys(driver, element, value):
         time.sleep(random.uniform(0.04, 0.11))
 
 
-def _reliable_fill(driver, element, value):
-    """Focus, type with send_keys, sync React state, blur."""
+def _paste_fill(driver, element, value):
+    """Paste via clipboard — CL treats paste as a manual user edit."""
+    value = str(value)
     _focus_field(driver, element)
-    _type_with_send_keys(driver, element, value)
-    time.sleep(0.1)
-    _react_set_value(driver, element, value)
-    time.sleep(0.1)
-    element.send_keys(Keys.TAB)
-    time.sleep(0.3)
+    pasted = False
+    if PYPERCLIP_AVAILABLE:
+        try:
+            pyperclip.copy(value)
+            element.send_keys(Keys.CONTROL + "a")
+            time.sleep(0.05)
+            element.send_keys(Keys.DELETE)
+            time.sleep(0.08)
+            element.send_keys(Keys.CONTROL + "v")
+            time.sleep(0.25)
+            if (element.get_attribute("value") or "").strip() == value.strip():
+                pasted = True
+        except Exception as e:
+            print(f"  [paste] clipboard failed: {e}")
+    if not pasted:
+        try:
+            element.send_keys(Keys.CONTROL + "a")
+            time.sleep(0.05)
+            element.send_keys(Keys.DELETE)
+            time.sleep(0.08)
+            _cdp_click_element(driver, element)
+            time.sleep(0.1)
+            driver.execute_cdp_cmd("Input.insertText", {"text": value})
+            time.sleep(0.2)
+            if (element.get_attribute("value") or "").strip() == value.strip():
+                pasted = True
+        except Exception:
+            pass
+    if not pasted:
+        _type_with_send_keys(driver, element, value)
+    _acknowledge_field(driver, element, value)
+    time.sleep(0.15)
+
+
+def _reliable_fill(driver, element, value, use_paste=False, use_tab=True):
+    """Focus, fill (paste or keys), acknowledge for CL, blur."""
+    if use_paste:
+        _paste_fill(driver, element, value)
+    else:
+        _focus_field(driver, element)
+        _type_with_send_keys(driver, element, value)
+        _acknowledge_field(driver, element, value)
+    if use_tab:
+        try:
+            element.send_keys(Keys.TAB)
+        except Exception:
+            driver.execute_script(
+                "arguments[0].dispatchEvent(new Event('blur',{bubbles:true}));", element)
+    else:
+        driver.execute_script(
+            "arguments[0].dispatchEvent(new Event('blur',{bubbles:true}));", element)
+    time.sleep(0.35)
 
 
 def _ensure_field_value(driver, name, expected):
@@ -416,9 +538,7 @@ def _ensure_field_value(driver, name, expected):
         if actual == expected:
             return True
         print(f"  [fix] {name}: got '{actual[:40]}' want '{expected[:40]}'")
-        _focus_field(driver, el)
-        _type_with_send_keys(driver, el, expected)
-        _react_set_value(driver, el, expected)
+        _paste_fill(driver, el, expected)
         actual = (el.get_attribute("value") or "").strip()
         ok = actual == expected
         if not ok:
@@ -481,10 +601,8 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
         return None
 
     handle_captcha_if_present(driver)
-    # Let CL finish prefilling account fields before we clear and type
-    time.sleep(4)
     _disable_form_autofill(driver)
-    time.sleep(0.5)
+    time.sleep(1.5)
 
     title = (product.get("title") or product.get("name") or "Quality Item For Sale").strip()
     description = (product.get("description") or (
@@ -497,6 +615,9 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     except Exception:
         price = "1"
 
+    # Fields CL most often flags as browser-autofilled — use paste + acknowledge
+    _PASTE_FIELDS = frozenset({"PostingTitle", "postal", "FromEMail"})
+
     def real_fill(selector, value, use_tab=True):
         value = str(value).strip()
         if not value:
@@ -504,26 +625,13 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
         try:
             el = WebDriverWait(driver, 8).until(
                 EC.presence_of_element_located((By.CSS_SELECTOR, selector)))
-            _focus_field(driver, el)
-            _type_with_send_keys(driver, el, value)
-            _react_set_value(driver, el, value)
-            if use_tab:
-                try:
-                    el.send_keys(Keys.TAB)
-                except Exception:
-                    driver.execute_script(
-                        "arguments[0].dispatchEvent(new Event('blur',{bubbles:true}));", el)
-                time.sleep(0.35)
-            else:
-                driver.execute_script(
-                    "arguments[0].dispatchEvent(new Event('blur',{bubbles:true}));", el)
-                time.sleep(0.2)
+            name = el.get_attribute("name") or ""
+            use_paste = name in _PASTE_FIELDS
+            _reliable_fill(driver, el, value, use_paste=use_paste, use_tab=use_tab)
             actual = (el.get_attribute("value") or "").strip()
             if actual != value:
-                print(f"  ⚠ {selector} mismatch — retrying")
-                _focus_field(driver, el)
-                _type_with_send_keys(driver, el, value)
-                _react_set_value(driver, el, value)
+                print(f"  ⚠ {selector} mismatch — retrying with paste")
+                _paste_fill(driver, el, value)
                 actual = (el.get_attribute("value") or "").strip()
             print(f"  ✓ {selector} = '{actual[:50]}'")
             return actual
@@ -552,7 +660,7 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
                 continue
             try:
                 el = driver.find_element(By.CSS_SELECTOR, f"[name='{name}']")
-                _reliable_fill(driver, el, val)
+                _reliable_fill(driver, el, val, use_paste=True)
             except Exception as e:
                 print(f"  [retry] Could not re-fill {name}: {e}")
 
@@ -597,6 +705,18 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
         time.sleep(0.5)
     else:
         print("  ⚠ No ZIP/postal code for this city — skipping postal field")
+
+    print("  Acknowledging title + ZIP for CL autofill check...")
+    for ack_name in ("PostingTitle", "postal"):
+        ack_val = _field_map.get(ack_name)
+        if not ack_val:
+            continue
+        try:
+            el = driver.find_element(By.CSS_SELECTOR, f"[name='{ack_name}']")
+            _paste_fill(driver, el, ack_val)
+            time.sleep(0.4)
+        except Exception as e:
+            print(f"  [ack] {ack_name}: {e}")
 
     print("  Verifying field values...")
     for fname, fval in _field_map.items():
@@ -725,6 +845,18 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     # Print every field name and value so we can see exactly what's being sent
     for k, v in sorted(form_dict.items()):
         print(f"  [post-field] {k}={str(v)[:50]}")
+
+    # Last chance: re-acknowledge autofilled fields before browser submit
+    for ack_name in ("PostingTitle", "postal"):
+        ack_val = _field_map.get(ack_name)
+        if not ack_val:
+            continue
+        try:
+            el = driver.find_element(By.CSS_SELECTOR, f"[name='{ack_name}']")
+            _acknowledge_field(driver, el, ack_val)
+        except Exception:
+            pass
+    time.sleep(0.5)
 
     print("  [submit] Attempting form submission (multi-strategy)...")
 

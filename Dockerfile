@@ -27,6 +27,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxrandr2 \
     libgbm1 \
     libasound2 \
+    xclip \
     && rm -rf /var/lib/apt/lists/*
 
 # Wrapper script so chromedriver always starts with --allowed-origins=*
