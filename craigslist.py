@@ -615,11 +615,19 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
         "Accept-Encoding": "gzip, deflate, br",
     }
 
+    # Log ALL hidden fields for diagnosis
+    hidden_keys = [k for k,v in post_data.items() if k not in (
+        'PostingTitle','PostingBody','price','postal','geographic_area','FromEMail','go')]
     print(f"  [post-data] postal={post_data.get('postal')} "
           f"title={post_data.get('PostingTitle','')[:30]}")
     print(f"  [post-data] cryptedStepCheck="
           f"{'YES' if post_data.get('cryptedStepCheck') else 'MISSING'}")
     print(f"  [post-data] action={action_url}")
+    print(f"  [post-data] hidden_fields={hidden_keys}")
+    print(f"  [post-data] region={post_data.get('region','MISSING')} "
+          f"subregion={post_data.get('subregion','MISSING')} "
+          f"category={post_data.get('category','MISSING')} "
+          f"catAbb={post_data.get('catAbb','MISSING')}")
 
     try:
         resp = session.post(
@@ -632,13 +640,12 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
         print(f"  [submit-result] {resp.status_code} → {resp.url}")
 
         if "s=edit" not in resp.url and resp.status_code == 200:
-            # Success — load the new page in browser to continue the flow
             driver.get(resp.url)
             time.sleep(2)
             print(f"  ✅ Form submitted → {resp.url}")
             return resp.url
 
-        # Failed — show CL's error message
+        # requests POST failed — parse CL error and try browser click fallback
         try:
             from html.parser import HTMLParser
 
@@ -671,16 +678,71 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
             if p.msgs:
                 print(f"  [cl-errors] {p.msgs[:5]}")
             else:
-                # Show a raw snippet so we can diagnose
-                snippet = resp.text.replace("\n", " ").replace("\r", "")
-                # Find the breadcrumb area which tells us what city/category CL thinks this is
-                bc_start = resp.text.find('breadcrumbs')
+                bc_start = resp.text.find("breadcrumbs")
                 if bc_start != -1:
                     print(f"  [resp-breadcrumb] {resp.text[bc_start:bc_start+120]}")
                 else:
+                    snippet = resp.text.replace("\n", " ").replace("\r", "")
                     print(f"  [resp-snippet] {snippet[100:400]}")
         except Exception:
             pass
+
+        # ── FALLBACK: retype postal fresh and click Continue in the browser ──
+        # The requests POST failed on ZIP. Let CL's own browser submit handle it —
+        # but first re-type postal right now so the DOM is fresh.
+        print("  [fallback] Trying browser Continue click after re-typing postal...")
+        try:
+            # Re-type postal as very last action
+            if zip_code:
+                postal_el = WebDriverWait(driver, 5).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, "[name='postal']")))
+                driver.execute_script(
+                    "arguments[0].scrollIntoView({block:'center'});", postal_el)
+                time.sleep(0.3)
+                postal_el.click()
+                postal_el.send_keys(Keys.CONTROL + "a")
+                time.sleep(0.1)
+                postal_el.send_keys(Keys.DELETE)
+                time.sleep(0.1)
+                for ch in zip_code:
+                    postal_el.send_keys(ch)
+                    time.sleep(random.uniform(0.08, 0.15))
+                time.sleep(0.4)
+                actual = (postal_el.get_attribute("value") or "").strip()
+                print(f"  [fallback] postal re-typed='{actual}'")
+
+            # Use requestSubmit — triggers CL's own validation + submit pipeline
+            # but with the postal field freshly typed so CL won't flag it
+            result = driver.execute_script("""
+                var form = document.getElementById('postingForm');
+                if (!form) return 'no-form';
+                var btn = form.querySelector(
+                    'button.go, button[type="submit"], input[type="submit"]');
+                if (!btn) return 'no-btn';
+                btn.scrollIntoView({block: 'center'});
+                try {
+                    if (typeof form.requestSubmit === 'function') {
+                        form.requestSubmit(btn);
+                        return 'requestSubmit';
+                    }
+                } catch(e) {}
+                btn.click();
+                return 'click';
+            """)
+            print(f"  [fallback] submit method={result}")
+
+            # Wait up to 20s to leave edit page
+            deadline = time.time() + 20
+            while time.time() < deadline:
+                cur = driver.current_url
+                if "s=edit" not in cur:
+                    print(f"  ✅ [fallback] Left edit page → {cur}")
+                    return cur
+                time.sleep(0.5)
+
+            print("  [fallback] Still on edit page after 20s")
+        except Exception as fe:
+            print(f"  [fallback] error: {fe}")
 
         return None
 
