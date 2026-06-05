@@ -160,6 +160,14 @@ def make_driver():
         "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     )
+    # Residential proxy to bypass CL's cloud IP blocks
+    proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
+    if proxy:
+        options.add_argument(f"--proxy-server={proxy}")
+        print(f"  [driver] Using proxy: {proxy.split('@')[-1]}")
+    else:
+        print("  [driver] No proxy configured")
+
     chromium_bin = _find_binary(
         ["chromium", "chromium-browser", "google-chrome"],
         ["/usr/bin/chromium", "/usr/bin/chromium-browser"])
