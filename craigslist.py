@@ -136,10 +136,14 @@ def _find_binary(names, fallback_paths):
             return p
     return None
 
-def make_driver():
+def make_driver(proxy_url=None):
     from selenium.webdriver.chrome.service import Service as ChromeService
     os.environ["SE_MANAGER_PATH"] = ""
     os.environ["WDM_SKIP_DOWNLOAD"] = "1"
+
+    # Use proxy from argument or environment
+    if not proxy_url:
+        proxy_url = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
 
     options = webdriver.ChromeOptions()
     for arg in [
@@ -157,6 +161,15 @@ def make_driver():
         "--shm-size=256m",
     ]:
         options.add_argument(arg)
+
+    # Apply proxy to Chrome so login + navigation use the same IP as the POST request
+    if proxy_url:
+        # Strip scheme for --proxy-server (Chrome accepts http:// or just host:port)
+        proxy_for_chrome = proxy_url
+        print(f"  [driver] Proxy: {proxy_for_chrome.split('@')[-1] if '@' in proxy_for_chrome else proxy_for_chrome}")
+        options.add_argument(f"--proxy-server={proxy_for_chrome}")
+        # Bypass proxy for localhost only
+        options.add_argument("--proxy-bypass-list=localhost,127.0.0.1")
     fresh_profile = tempfile.mkdtemp(prefix="clblast_chrome_")
     options.add_argument(f"--user-data-dir={fresh_profile}")
     options.add_argument(
@@ -330,75 +343,81 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     # Fill using CDP Input.dispatchMouseEvent + Input.insertText
     # This is the lowest level possible — indistinguishable from real user input
     def real_fill(selector, value, use_tab=True):
+        """
+        Fill a field reliably:
+        1. Scroll into view + JS click to focus
+        2. Select-all + delete existing content
+        3. send_keys character by character (CL's JS event listeners fire)
+        4. JS force-set as backup (ensures value is in DOM regardless)
+        5. Dispatch input+change events so CL's framework registers the value
+        6. Optional Tab to trigger blur/validation
+        """
         try:
             el = WebDriverWait(driver, 8).until(
-                EC.element_to_be_clickable((By.CSS_SELECTOR, selector)))
+                EC.presence_of_element_located((By.CSS_SELECTOR, selector)))
             driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+            time.sleep(0.3)
+
+            # Try ActionChains click first, fall back to JS click
+            try:
+                ActionChains(driver).move_to_element(el).click().perform()
+            except Exception:
+                driver.execute_script("arguments[0].focus(); arguments[0].click();", el)
             time.sleep(0.2)
 
-            # Get element center coordinates for CDP mouse click
-            rect = driver.execute_script(
-                "var r=arguments[0].getBoundingClientRect();"
-                "return {x:r.left+r.width/2, y:r.top+r.height/2};", el)
-            x, y = rect["x"], rect["y"]
-
-            # CDP mouse click to focus
-            driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
-                "type": "mousePressed", "x": x, "y": y,
-                "button": "left", "clickCount": 1})
-            driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
-                "type": "mouseReleased", "x": x, "y": y,
-                "button": "left", "clickCount": 1})
-            time.sleep(0.2)
-
-            # Select all existing text and delete it
-            driver.execute_cdp_cmd("Input.dispatchKeyEvent", {
-                "type": "keyDown", "modifiers": 2, "key": "a", "code": "KeyA"})
-            driver.execute_cdp_cmd("Input.dispatchKeyEvent", {
-                "type": "keyUp", "modifiers": 2, "key": "a", "code": "KeyA"})
-            driver.execute_cdp_cmd("Input.dispatchKeyEvent", {
-                "type": "keyDown", "key": "Delete", "code": "Delete"})
-            driver.execute_cdp_cmd("Input.dispatchKeyEvent", {
-                "type": "keyUp", "key": "Delete", "code": "Delete"})
+            # Clear existing content
+            el.send_keys(Keys.CONTROL + "a")
+            time.sleep(0.1)
+            el.send_keys(Keys.DELETE)
             time.sleep(0.1)
 
-            # Type the value via CDP insertText (fires all browser input events)
-            driver.execute_cdp_cmd("Input.insertText", {"text": str(value)})
+            # Type the value with realistic keystroke delays
+            for ch in str(value):
+                el.send_keys(ch)
+                time.sleep(random.uniform(0.04, 0.10))
+
+            # JS force-set to guarantee value is present (handles React controlled inputs)
+            driver.execute_script("""
+                var el = document.querySelector(arguments[0]);
+                if (!el) return;
+                var proto = el.tagName === 'TEXTAREA'
+                    ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+                var setter = Object.getOwnPropertyDescriptor(proto, 'value');
+                if (setter && setter.set) setter.set.call(el, arguments[1]);
+                else el.value = arguments[1];
+                el.dispatchEvent(new Event('input',  {bubbles:true}));
+                el.dispatchEvent(new Event('change', {bubbles:true}));
+                el.dispatchEvent(new Event('blur',   {bubbles:true}));
+            """, selector, str(value))
             time.sleep(0.15)
 
             if use_tab:
-                driver.execute_cdp_cmd("Input.dispatchKeyEvent", {
-                    "type": "keyDown", "key": "Tab", "code": "Tab"})
-                driver.execute_cdp_cmd("Input.dispatchKeyEvent", {
-                    "type": "keyUp", "key": "Tab", "code": "Tab"})
+                el.send_keys(Keys.TAB)
                 time.sleep(0.3)
 
-            actual = el.get_attribute("value") or ""
-            if actual:
-                print(f"  ✓ {selector} = '{actual[:50]}'")
-            else:
-                # CDP insertText worked but getter may be masked — check via JS
-                actual = driver.execute_script(
-                    "var el=document.querySelector(arguments[0]);"
-                    "var p=el.tagName==='TEXTAREA'?HTMLTextAreaElement.prototype:HTMLInputElement.prototype;"
-                    "var d=Object.getOwnPropertyDescriptor(p,'value');"
-                    "return d&&d.get?d.get.call(el):el.value;", selector) or ""
-                print(f"  ✓ {selector} = '{actual[:50]}' (native getter)")
+            # Verify
+            actual = el.get_attribute("value") or driver.execute_script(
+                "var el=document.querySelector(arguments[0]);"
+                "var p=el.tagName==='TEXTAREA'?HTMLTextAreaElement.prototype:HTMLInputElement.prototype;"
+                "var d=Object.getOwnPropertyDescriptor(p,'value');"
+                "return d&&d.get?d.get.call(el):el.value;", selector) or ""
+            print(f"  ✓ {selector} = '{str(actual)[:50]}'")
             return actual
         except Exception as e:
-            print(f"  ⚠ real_fill({selector}): {e}")
-            # Fallback to send_keys
+            print(f"  ✗ real_fill({selector}): {e}")
+            # Last-resort fallback: pure JS set
             try:
-                el = driver.find_element(By.CSS_SELECTOR, selector)
-                el.click()
-                el.send_keys(Keys.CONTROL + "a")
-                el.send_keys(Keys.DELETE)
-                el.send_keys(str(value))
-                if use_tab:
-                    el.send_keys(Keys.TAB)
-                return el.get_attribute("value") or ""
+                driver.execute_script("""
+                    var el = document.querySelector(arguments[0]);
+                    if (!el) return;
+                    el.value = arguments[1];
+                    el.dispatchEvent(new Event('input',  {bubbles:true}));
+                    el.dispatchEvent(new Event('change', {bubbles:true}));
+                """, selector, str(value))
+                print(f"  ✓ {selector} set via JS fallback")
+                return str(value)
             except Exception as e2:
-                print(f"  ✗ fallback also failed: {e2}")
+                print(f"  ✗ JS fallback also failed for {selector}: {e2}")
                 return ""
 
     print("  Filling title...")
@@ -440,10 +459,13 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     except Exception:
         pass
 
-    # postal — fill last with real keys, no TAB
+    # postal — fill last with real keys, no TAB (skip if empty for non-US accounts)
     print("  Filling postal (last, no TAB)...")
-    real_fill("[name='postal']", zip_code, use_tab=False)
-    time.sleep(0.5)
+    if zip_code:
+        real_fill("[name='postal']", zip_code, use_tab=False)
+        time.sleep(0.5)
+    else:
+        print("  ⚠ No ZIP/postal code for this city — skipping postal field")
 
     # Extract form + POST via requests with residential proxy
     time.sleep(1)
@@ -476,8 +498,11 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     # Ensure our filled values are in the POST
     form_dict['PostingTitle'] = title
     form_dict['PostingBody'] = description
-    form_dict['postal'] = zip_code
     form_dict['geographic_area'] = city_name
+    if zip_code and re.match(r'^\d{5}$', zip_code):
+        form_dict['postal'] = zip_code
+    else:
+        form_dict.pop('postal', None)  # Don't send invalid/empty postal
     if cl_email:
         form_dict['FromEMail'] = cl_email
     for pf in ['price', 'AskingPrice', 'AskPrice']:
@@ -485,17 +510,36 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
             form_dict[pf] = price
             break
 
-    # Always include required checkboxes — they are missing when unchecked
-    for cb in ['contact_phone_ok', 'contact_text_ok', 'show_phone_ok',
-               'crypto_currency_ok', 'delivery_available', 'see_my_other',
+    # Only include phone-related checkboxes if a phone number is actually provided
+    contact_phone = (product.get("phone") or product.get("contact_phone") or
+                     os.environ.get("CL_PHONE", "")).strip()
+    if contact_phone:
+        form_dict['contact_phone_ok'] = '1'
+        form_dict['contact_text_ok'] = '1'
+        form_dict['show_phone_ok'] = '1'
+        form_dict['contact_phone'] = contact_phone
+    else:
+        # Explicitly remove all phone fields so CL doesn't require a number
+        for pf in ['contact_phone_ok', 'contact_text_ok', 'show_phone_ok',
+                   'contact_phone', 'contact_phone_extension', 'contact_name']:
+            form_dict.pop(pf, None)
+
+    # Non-phone optional checkboxes — safe to include
+    for cb in ['crypto_currency_ok', 'delivery_available', 'see_my_other',
                'show_address_ok', 'save_contact_preferences']:
         form_dict[cb] = '1'
 
     # Remove empty optional fields that confuse CL's validator
-    for optional in ['contact_phone', 'contact_phone_extension', 'contact_name',
-                     'xstreet0', 'xstreet1', 'city', 'sale_manufacturer',
-                     'sale_model', 'sale_size', 'condition']:
+    for optional in ['xstreet0', 'xstreet1', 'city',
+                     'sale_manufacturer', 'sale_model', 'sale_size', 'condition']:
         form_dict.pop(optional, None)
+
+    # For non-US accounts (e.g. Chandigarh), postal/ZIP may not be needed or uses local format
+    # If zip_code looks non-US (not 5 digits), remove it to avoid CL's ZIP validator
+    if zip_code and not re.match(r'^\d{5}$', zip_code):
+        form_dict.pop('postal', None)
+    elif not zip_code:
+        form_dict.pop('postal', None)
 
     print(f"  [post] {len(form_dict)} fields → {form_action}")
     print(f"  [post] postal={form_dict.get('postal')} title={form_dict.get('PostingTitle','')[:25]}")
@@ -549,6 +593,7 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
 
 def fill_listing_details(driver, product: dict):
     _ZIPS = {
+        # US cities
         "losangeles": "90001", "newyork": "10001", "chicago": "60601",
         "houston": "77001", "phoenix": "85001", "sfbay": "94102",
         "sandiego": "92101", "seattle": "98101", "miami": "33101",
@@ -561,11 +606,15 @@ def fill_listing_details(driver, product: dict):
         "albuquerque": "87108", "brooklyn": "11206", "raleigh": "27604",
         "fargo": "58102", "columbus": "43211", "philadelphia": "19019",
         "nashville": "37205", "saltlakecity": "84118", "milwaukee": "53221",
+        # India / non-US (CL India uses area name instead of postal code — leave blank)
+        "chandigarh": "", "delhi": "", "mumbai": "", "bangalore": "",
+        "hyderabad": "", "chennai": "", "kolkata": "", "pune": "",
+        "ahmedabad": "", "jaipur": "", "lucknow": "", "surat": "",
     }
     zip_code = (product.get("zip_code") or product.get("postal_code") or "").strip()
     if not zip_code:
         _ck = CL_CITY.lower().replace(" ", "").replace("-", "")
-        zip_code = _ZIPS.get(_ck, "90001")
+        zip_code = _ZIPS.get(_ck, "")  # Default empty for unknown cities
 
     _CITY_NAMES = {
         "losangeles": "Los Angeles", "newyork": "New York", "chicago": "Chicago",
@@ -573,6 +622,10 @@ def fill_listing_details(driver, product: dict):
         "sandiego": "San Diego", "seattle": "Seattle", "miami": "Miami",
         "dallas": "Dallas", "denver": "Denver", "atlanta": "Atlanta",
         "boston": "Boston", "portland": "Portland",
+        # India
+        "chandigarh": "Chandigarh", "delhi": "Delhi", "mumbai": "Mumbai",
+        "bangalore": "Bangalore", "hyderabad": "Hyderabad", "chennai": "Chennai",
+        "kolkata": "Kolkata", "pune": "Pune",
     }
     _ck = CL_CITY.lower().replace(" ", "").replace("-", "")
     city_name = _CITY_NAMES.get(_ck, CL_CITY.title())
@@ -890,7 +943,8 @@ def main():
     _load_existing_listings()
 
     vdisplay = None
-    driver = make_driver()
+    proxy_url = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
+    driver = make_driver(proxy_url=proxy_url)
     if not craigslist_login(driver, email):
         driver.quit()
         return
