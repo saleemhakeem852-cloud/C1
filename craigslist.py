@@ -244,21 +244,89 @@ def craigslist_login(driver, email, password):
     human_delay(2, 4)
     handle_captcha_if_present(driver)
     try:
-        ef = WebDriverWait(driver, 15).until(
-            EC.presence_of_element_located((By.ID, "inputEmailHandle")))
+        # Try multiple selectors - CL periodically changes their login form IDs
+        email_selectors = [
+            (By.ID, "inputEmailHandle"),
+            (By.NAME, "inputEmailHandle"),
+            (By.CSS_SELECTOR, "input[type='email']"),
+            (By.CSS_SELECTOR, "input[name*='mail']"),
+            (By.CSS_SELECTOR, "input[id*='mail']"),
+            (By.CSS_SELECTOR, "input[placeholder*='mail']"),
+            (By.CSS_SELECTOR, "input[placeholder*='Email']"),
+        ]
+        ef = None
+        for by, sel in email_selectors:
+            try:
+                ef = WebDriverWait(driver, 5).until(
+                    EC.presence_of_element_located((by, sel)))
+                print(f"  [login] Found email field: {sel}")
+                break
+            except Exception:
+                continue
+
+        if ef is None:
+            print("  [login] Could not find email field. Page title:", driver.title)
+            print("  [login] URL:", driver.current_url)
+            inputs = driver.find_elements(By.TAG_NAME, "input")
+            for i, inp in enumerate(inputs):
+                print(f"  [login] Input {i}: type={inp.get_attribute('type')} name={inp.get_attribute('name')} id={inp.get_attribute('id')} placeholder={inp.get_attribute('placeholder')}")
+            raise TimeoutException("No email field found")
+
         send_keys_slow(driver, ef, email)
         human_delay()
-        pf = driver.find_element(By.ID, "inputPassword")
+
+        pw_selectors = [
+            (By.ID, "inputPassword"),
+            (By.NAME, "inputPassword"),
+            (By.CSS_SELECTOR, "input[type='password']"),
+            (By.CSS_SELECTOR, "input[name*='pass']"),
+            (By.CSS_SELECTOR, "input[id*='pass']"),
+        ]
+        pf = None
+        for by, sel in pw_selectors:
+            try:
+                pf = driver.find_element(by, sel)
+                print(f"  [login] Found password field: {sel}")
+                break
+            except Exception:
+                continue
+        if pf is None:
+            raise TimeoutException("No password field found")
+
         send_keys_slow(driver, pf, password)
         human_delay()
-        btn = driver.find_element(By.CSS_SELECTOR, "button[type='submit']")
+
+        btn_selectors = [
+            (By.CSS_SELECTOR, "button[type='submit']"),
+            (By.CSS_SELECTOR, "input[type='submit']"),
+            (By.XPATH, "//button[contains(translate(text(),'LOGIN','login'),'login')]"),
+            (By.XPATH, "//button[contains(translate(text(),'SIGN IN','sign in'),'sign in')]"),
+        ]
+        btn = None
+        for by, sel in btn_selectors:
+            try:
+                btn = driver.find_element(by, sel)
+                print(f"  [login] Found submit button: {sel}")
+                break
+            except Exception:
+                continue
+        if btn is None:
+            raise TimeoutException("No submit button found")
+
         safe_click(driver, btn)
-        WebDriverWait(driver, 15).until(EC.url_contains("craigslist.org"))
+        WebDriverWait(driver, 20).until(
+            lambda d: "login" not in d.current_url.lower() or "home" in d.current_url.lower()
+        )
         handle_captcha_if_present(driver)
+        if "login" in driver.current_url.lower() and "home" not in driver.current_url.lower():
+            print(f"  [login] Still on login page. URL: {driver.current_url}")
+            return False
         print("Logged in to Craigslist ✓")
         return True
-    except TimeoutException:
-        print("Login failed.")
+    except TimeoutException as e:
+        print(f"Login failed: {e}")
+        print(f"  URL: {driver.current_url}")
+        print(f"  Title: {driver.title}")
         return False
 
 def click_relocation_if_needed(driver, ad_name):
