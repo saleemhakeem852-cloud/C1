@@ -541,11 +541,136 @@ def _blur_by_clicking_elsewhere(driver, skip_element):
         pass
 
 
+try:
+    import pyperclip
+    PYPERCLIP_OK = True
+except ImportError:
+    PYPERCLIP_OK = False
+
+
+_PATCH_ALL_FORM_JS = """
+var form = document.getElementById('postingForm');
+if (!form) return {patched: 0};
+var count = 0;
+function walk(node, d) {
+    if (!node || d > 45) return;
+    var s = node.memoizedState;
+    while (s) {
+        var m = s.memoizedState;
+        if (m && typeof m === 'object' && !Array.isArray(m)) {
+            Object.keys(m).forEach(function(k) {
+                if (/autofill/i.test(k)) { m[k] = false; count++; }
+                if (/userEdited|userModified|touched|dirty|manual|edited/i.test(k)) { m[k] = true; count++; }
+            });
+        }
+        s = s.next;
+    }
+    if (node.memoizedProps && typeof node.memoizedProps === 'object') {
+        Object.keys(node.memoizedProps).forEach(function(k) {
+            if (/autofill/i.test(k) && node.memoizedProps[k]) {
+                node.memoizedProps[k] = false; count++;
+            }
+        });
+    }
+    walk(node.child, d + 1);
+    walk(node.sibling, d + 1);
+}
+form.querySelectorAll('input,textarea').forEach(function(el) {
+    var fk = Object.keys(el).find(function(k) { return k.indexOf('__reactFiber') === 0; });
+    if (fk) walk(el[fk], 0);
+    el.dispatchEvent(new FocusEvent('focusout', {bubbles: true}));
+});
+return {patched: count};
+"""
+
+
+def _patch_entire_form(driver):
+    try:
+        r = driver.execute_script(_PATCH_ALL_FORM_JS) or {}
+        if r.get("patched"):
+            print(f"  [react] patched {r.get('patched')} autofill state(s)")
+        return r
+    except Exception as e:
+        print(f"  [react] patch failed: {e}")
+        return {}
+
+
+def _fields_ok_for_submit(driver):
+    """DOM + aria-invalid check — ignore stale autofill banner text."""
+    try:
+        return driver.execute_script("""
+            var form = document.getElementById('postingForm');
+            if (!form) return false;
+            if (form.querySelector('[aria-invalid="true"]')) return false;
+            var req = ['PostingTitle','PostingBody','postal','price'];
+            for (var i = 0; i < req.length; i++) {
+                var el = form.querySelector('[name="'+req[i]+'"]');
+                if (!el || !(el.value || '').trim()) return false;
+            }
+            return true;
+        """)
+    except Exception:
+        return False
+
+
+def _click_field_label(driver, name):
+    try:
+        driver.execute_script("""
+            var el = document.querySelector('[name="'+arguments[0]+'"]');
+            if (!el) return;
+            var row = el.closest('p, li, .formrow, .row, div');
+            for (var i = 0; i < 6 && row; i++) {
+                var label = row.querySelector('label');
+                if (label) { label.click(); return; }
+                row = row.parentElement;
+            }
+            el.click();
+        """, name)
+        time.sleep(0.25)
+    except Exception:
+        pass
+
+
+def _paste_fill(driver, element, value):
+    """Paste via clipboard (xclip on Railway) — CL treats paste as user edit."""
+    value = str(value).strip()
+    _focus_field(driver, element)
+    element.send_keys(Keys.CONTROL + "a")
+    time.sleep(0.06)
+    element.send_keys(Keys.DELETE)
+    time.sleep(0.12)
+    filled = False
+    if PYPERCLIP_OK:
+        try:
+            pyperclip.copy(value)
+            element.send_keys(Keys.CONTROL + "v")
+            time.sleep(0.35)
+            if (element.get_attribute("value") or "").strip() == value:
+                filled = True
+                print("  [paste] clipboard ok")
+        except Exception as e:
+            print(f"  [paste] clipboard failed: {e}")
+    if not filled:
+        for ch in value:
+            element.send_keys(ch)
+            time.sleep(random.uniform(0.08, 0.14))
+    # Acknowledge edit: backspace + retype last char
+    if value:
+        element.send_keys(Keys.END)
+        time.sleep(0.08)
+        element.send_keys(Keys.BACKSPACE)
+        time.sleep(0.08)
+        element.send_keys(value[-1])
+        time.sleep(0.1)
+    _blur_by_clicking_elsewhere(driver, element)
+    _react_clear_autofill_flag(driver, element)
+    return (element.get_attribute("value") or "").strip()
+
+
 def _clear_and_type(driver, element, value):
-    """
-    Trusted keystrokes only. CL React tracks isTrusted input — synthetic JS
-    input/change events after send_keys re-flag fields as autofilled.
-    """
+    """Prefer clipboard paste on Railway; fall back to keystrokes."""
+    if IS_RAILWAY or os.environ.get("DISPLAY"):
+        return _paste_fill(driver, element, value)
     value = str(value).strip()
     _focus_field(driver, element)
     element.send_keys(Keys.CONTROL + "a")
@@ -602,72 +727,65 @@ def _click_autofill_banner_links(driver):
         pass
 
 
-def _clear_autofill_before_submit(driver, field_map, max_attempts=2):
-    """
-    CL's Continue button runs React validation that blocks while internal
-    autofill flags are set — DOM values can be correct but submit still fails.
-    """
-    for attempt in range(1, max_attempts + 1):
-        flagged = _autofill_banner_fields(driver)
-        if not flagged:
-            if attempt > 1:
-                print(f"  [autofill] cleared on attempt {attempt}")
-            return True
-
-        print(f"  [autofill] attempt {attempt}/{max_attempts}: {flagged}")
-        _click_autofill_banner_links(driver)
-
-        for name in flagged:
-            val = field_map.get(name)
-            try:
-                el = driver.find_element(By.CSS_SELECTOR, f"[name='{name}']")
-            except NoSuchElementException:
-                continue
-            if name == "FromEMail" or not val:
-                _user_nudge_field(driver, name)
-            else:
-                actual = (el.get_attribute("value") or "").strip()
-                if actual != str(val).strip():
-                    _clear_and_type(driver, el, val)
-                else:
-                    _user_nudge_field(driver, name)
-            _react_clear_autofill_flag(driver, el)
-
-        time.sleep(0.5)
-        still = _autofill_banner_fields(driver)
-        print(f"  [autofill] after attempt {attempt}: still flagged={still}")
-
-    return not _autofill_banner_fields(driver)
-
-
-def _human_fill(driver, element, value, use_tab=False):
-    return _clear_and_type(driver, element, value)
-
-
 def _autofill_banner_fields(driver):
     """
-    Parse ONLY short error-banner lines like 'posting title • autofilled'.
-    Do NOT walk parent DOM — that falsely flags every field on the page.
+    Fields in autofill error banner. Returns [] when DOM fields are already OK
+    (stale pre-fill banner text is ignored).
     """
+    if _fields_ok_for_submit(driver):
+        return []
     try:
         return driver.execute_script("""
             var names = [];
             var form = document.getElementById('postingForm');
             if (!form) return names;
             function add(n) { if (n && names.indexOf(n) === -1) names.push(n); }
-            form.querySelectorAll('li, span, p, a, label').forEach(function(el) {
+            form.querySelectorAll('li').forEach(function(el) {
                 var t = (el.textContent || '').replace(/\\s+/g, ' ').trim().toLowerCase();
                 if (t.indexOf('autofill') === -1) return;
-                if (t.length > 55 || t.length < 8) return;
+                if (t.length > 50 || t.length < 12) return;
                 if (t.indexOf('title') !== -1) add('PostingTitle');
                 if (t.indexOf('zip') !== -1) add('postal');
                 if (t.indexOf('description') !== -1) add('PostingBody');
                 if (t.indexOf('email') !== -1) add('FromEMail');
+                if (t.indexOf('price') !== -1) add('price');
             });
             return names;
         """) or []
     except Exception:
         return []
+
+
+def _prepare_form_for_submit(driver, field_map):
+    """Click label → paste fill → patch React so Continue validation passes."""
+    order = ("PostingTitle", "price", "geographic_area", "postal", "PostingBody", "FromEMail")
+    print("  [prepare] Final user-edit pass before Continue...")
+    for name in order:
+        val = field_map.get(name)
+        try:
+            el = driver.find_element(By.CSS_SELECTOR, f"[name='{name}']")
+        except NoSuchElementException:
+            continue
+        if name == "FromEMail":
+            if not _field_editable(driver, "FromEMail"):
+                _user_nudge_field(driver, name)
+                continue
+            val = val or (el.get_attribute("value") or "").strip()
+        if not val:
+            continue
+        _click_field_label(driver, name)
+        actual = _paste_fill(driver, el, str(val))
+        print(f"  [prepare] {name} → '{actual[:40]}'")
+    _patch_entire_form(driver)
+    time.sleep(0.5)
+    ok = _fields_ok_for_submit(driver)
+    banner = _autofill_banner_fields(driver)
+    print(f"  [prepare] fields_ok={ok} banner_flags={banner}")
+    return ok
+
+
+def _human_fill(driver, element, value, use_tab=False):
+    return _clear_and_type(driver, element, value)
 
 
 def _nudge_autofill_field(driver, name):
@@ -963,8 +1081,7 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
         print("  [verify] Some fields failed verification")
 
     print("  Clearing CL autofill flags (required before Continue works)...")
-    if not _clear_autofill_before_submit(driver, _field_map, max_attempts=2):
-        print("  [autofill] Warning: autofill banner may still block Continue")
+    _prepare_form_for_submit(driver, _field_map)
 
     status = _field_status(driver)
     for fname, st in status.items():
@@ -1084,14 +1201,13 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
 
     print("  [submit] Attempting form submission (multi-strategy)...")
 
-    # Continue is rejected by CL React while autofill flags are set — clear first
-    if _autofill_banner_fields(driver):
-        print("  [submit] autofill banner still visible — clearing before click")
-        _clear_autofill_before_submit(driver, _field_map, max_attempts=2)
+    # Final paste + React patch immediately before Continue
+    _prepare_form_for_submit(driver, _field_map)
 
-    if _autofill_banner_fields(driver):
-        print("  [submit] Continue will fail: CL still marks fields as autofilled")
-        print("  [submit] (DOM values are filled — React internal flags block validation)")
+    if not _fields_ok_for_submit(driver):
+        print("  [submit] Required fields empty/invalid — cannot Continue")
+    elif _autofill_banner_fields(driver):
+        print("  [submit] Stale autofill banner visible but DOM fields OK — clicking Continue anyway")
 
     # Diagnostic: show what submit buttons are available
     try:
@@ -1139,8 +1255,9 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
 
     # ── Strategy 0: form.requestSubmit (CL's native handler) ───────────────
     submitted = False
+    _patch_entire_form(driver)
     if not _ensure_fields_intact(driver, _field_map):
-        _clear_autofill_before_submit(driver, _field_map, max_attempts=1)
+        _prepare_form_for_submit(driver, _field_map)
     try:
         result = _native_request_submit(driver)
         print(f"  [submit] requestSubmit → {result}")
@@ -1191,7 +1308,8 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
             EC.presence_of_element_located((By.CSS_SELECTOR, _SUBMIT_SEL))
         )
         if not submitted:
-            _ensure_fields_intact(driver, _field_map)
+            _patch_entire_form(driver)
+            _prepare_form_for_submit(driver, _field_map)
         print("  [submit] ActionChains click sent")
         if _try_click_submit_buttons() or _submission_succeeded(10):
             submitted = True
@@ -1221,58 +1339,59 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
         except Exception as e:
             print(f"  [submit] Strategy 2 failed: {e}")
 
-    # ── Strategy 5: requests POST using cookies from browser session ───────
+    # ── Strategy 5: requests POST (always try — DOM may be valid even if banner stale)
     if not submitted:
-        if _autofill_banner_fields(driver):
-            print("  [submit] Strategy 5 skipped — autofill errors still present")
-        else:
-            print("  [submit] Strategy 5: requests POST with browser cookies...")
-            try:
-                _ensure_fields_intact(driver, _field_map)
-                live_dict, live_action = _extract_live_form(driver)
-                post_data = live_dict if live_dict else form_dict
-                post_url = live_action if live_action else form_action
-                if live_dict:
-                    print(f"  [submit] Strategy 5 using live DOM ({len(post_data)} fields)")
-                session = requests.Session()
-                for cookie in driver.get_cookies():
-                    session.cookies.set(cookie['name'], cookie['value'],
-                                        domain=cookie.get('domain', ''))
-                headers = {
-                    'Content-Type': 'application/x-www-form-urlencoded',
-                    'Referer': driver.current_url,
-                    'Origin': 'https://post.craigslist.org',
-                    'User-Agent': (
-                        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                        'AppleWebKit/537.36 (KHTML, like Gecko) '
-                        'Chrome/124.0.0.0 Safari/537.36'
-                    ),
-                }
-                resp = session.post(
-                    post_url,
-                    data=post_data,
-                    headers=headers,
-                    allow_redirects=True,
-                    timeout=30,
-                )
-                print(f"  [submit] requests POST → {resp.status_code} → {resp.url}")
-                resp_has_form = (
-                    'id="postingForm"' in resp.text
-                    or "name=\"cryptedStepCheck\"" in resp.text
-                )
-                if resp.status_code == 200 and "s=edit" not in resp.url and not resp_has_form:
-                    driver.get(resp.url)
-                    time.sleep(3)
-                    submitted = True
-                    print(f"  ✅ Strategy 5 (requests POST) succeeded → {resp.url}")
-                else:
-                    err_matches = re.findall(
-                        r'class="[^"]*err[^"]*"[^>]*>([^<]{5,})<', resp.text)
-                    if err_matches:
-                        print(f"  [submit] CL error(s): {err_matches[:3]}")
-                    print(f"  [submit] Strategy 5 rejected (form still present: {resp_has_form})")
-            except Exception as e:
-                print(f"  [submit] Strategy 5 failed: {e}")
+        print("  [submit] Strategy 5: requests POST with browser cookies...")
+        try:
+            _prepare_form_for_submit(driver, _field_map)
+            _patch_entire_form(driver)
+            live_dict, live_action = _extract_live_form(driver)
+            post_data = dict(live_dict if live_dict else form_dict)
+            post_url = live_action if live_action else form_action
+            for k, v in _field_map.items():
+                if v:
+                    post_data[k] = str(v)
+            if live_dict:
+                print(f"  [submit] Strategy 5 using live DOM ({len(post_data)} fields)")
+            session = requests.Session()
+            for cookie in driver.get_cookies():
+                session.cookies.set(cookie['name'], cookie['value'],
+                                    domain=cookie.get('domain', ''))
+            headers = {
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'Referer': driver.current_url,
+                'Origin': 'https://post.craigslist.org',
+                'User-Agent': (
+                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                    'AppleWebKit/537.36 (KHTML, like Gecko) '
+                    'Chrome/124.0.0.0 Safari/537.36'
+                ),
+            }
+            resp = session.post(
+                post_url,
+                data=post_data,
+                headers=headers,
+                allow_redirects=True,
+                timeout=30,
+            )
+            print(f"  [submit] requests POST → {resp.status_code} → {resp.url}")
+            resp_has_form = (
+                'id="postingForm"' in resp.text
+                or "name=\"cryptedStepCheck\"" in resp.text
+            )
+            if resp.status_code == 200 and "s=edit" not in resp.url and not resp_has_form:
+                driver.get(resp.url)
+                time.sleep(3)
+                submitted = True
+                print(f"  ✅ Strategy 5 (requests POST) succeeded → {resp.url}")
+            else:
+                err_matches = re.findall(
+                    r'class="[^"]*err[^"]*"[^>]*>([^<]{5,})<', resp.text)
+                if err_matches:
+                    print(f"  [submit] CL error(s): {err_matches[:3]}")
+                print(f"  [submit] Strategy 5 rejected (form still present: {resp_has_form})")
+        except Exception as e:
+            print(f"  [submit] Strategy 5 failed: {e}")
 
     if not submitted:
         print("  ❌ All submit strategies failed — still on edit page")
@@ -1470,6 +1589,8 @@ def complete_images_step(driver, product: dict):
         try:
             WebDriverWait(driver, 20).until(lambda d: (
                 "s=preview" in d.current_url
+                or d.find_elements(By.ID, "publish_bottom")
+                or d.find_elements(By.ID, "publish_top")
                 or d.find_elements(By.ID, "publish_button")
                 or "unpublished draft" in (d.page_source or "").lower()
             ))
@@ -1490,35 +1611,139 @@ def upload_photos(driver, product: dict):
     """Legacy wrapper — use complete_images_step."""
     return complete_images_step(driver, product)
 
-def publish_listing(driver, ad_name, product):
-    """
-    Draft preview step (screenshot 2): 'this is an unpublished draft' page.
-    Click publish to make the listing live.
-    """
-    handle_captcha_if_present(driver)
-    print("  [publish] Waiting for draft preview page...")
+def _wait_for_draft_preview(driver, timeout=20):
+    """Wait for unpublished draft page with publish form."""
     try:
-        WebDriverWait(driver, 20).until(lambda d: (
+        WebDriverWait(driver, timeout).until(lambda d: (
             "s=preview" in d.current_url
+            or d.find_elements(By.ID, "publish_bottom")
+            or d.find_elements(By.ID, "publish_top")
             or d.find_elements(By.ID, "publish_button")
             or "unpublished draft" in (d.page_source or "").lower()
         ))
         print(f"  [publish] Draft page ready → {driver.current_url}")
+        return True
     except TimeoutException:
         print(f"  [publish] ⚠ Draft page not detected — URL: {driver.current_url}")
-
-    human_delay(2, 4)
-    publish_selectors = [
-        (By.ID, "publish_button"),
-        (By.XPATH, "//button[contains(translate(normalize-space(.),'PUBLISH','publish'),'publish')]"),
-        (By.XPATH, "//input[@type='submit' and contains(translate(@value,'PUBLISH','publish'),'publish')]"),
-        (By.CSS_SELECTOR, "button.publish, input.publish, .publish_button"),
-    ]
-    if not _click_first(driver, publish_selectors, "publish"):
-        print(f"  [publish] ✗ Publish button not found for '{ad_name}'")
         return False
 
-    human_delay(5, 8)
+
+def _submit_publish_form(driver):
+    """
+    Final publish step — form#publish_bottom (or publish_top):
+      <form id="publish_bottom" method="post">
+        <input name="cryptedStepCheck" ...>
+        <input name="continue" value="y">
+        <button class="bigbutton" type="submit" name="go" value="Continue">publish</button>
+      </form>
+    """
+    publish_selectors = [
+        (By.CSS_SELECTOR, "#publish_bottom button.bigbutton[type='submit']"),
+        (By.CSS_SELECTOR, "#publish_bottom button[name='go']"),
+        (By.CSS_SELECTOR, "#publish_top button.bigbutton[type='submit']"),
+        (By.CSS_SELECTOR, "#publish_top button[name='go']"),
+        (By.ID, "publish_button"),
+        (By.XPATH, "//form[@id='publish_bottom']//button[@type='submit']"),
+        (By.XPATH, "//form[@id='publish_top']//button[@type='submit']"),
+        (By.XPATH, "//button[contains(translate(normalize-space(.),'PUBLISH','publish'),'publish')]"),
+        (By.XPATH, "//input[@type='submit' and contains(translate(@value,'PUBLISH','publish'),'publish')]"),
+    ]
+
+    # Strategy A: form.requestSubmit via publish_bottom / publish_top
+    try:
+        result = driver.execute_script("""
+            var form = document.getElementById('publish_bottom')
+                    || document.getElementById('publish_top');
+            if (!form) return {ok: false, reason: 'no-publish-form'};
+            var btn = form.querySelector('button.bigbutton[type="submit"], button[name="go"]');
+            if (!btn) return {ok: false, reason: 'no-publish-btn'};
+            btn.scrollIntoView({block: 'center'});
+            try {
+                if (typeof form.requestSubmit === 'function') {
+                    form.requestSubmit(btn);
+                    return {ok: true, method: 'requestSubmit', form: form.id};
+                }
+            } catch (e) {}
+            btn.click();
+            return {ok: true, method: 'click', form: form.id};
+        """) or {}
+        print(f"  [publish] form submit → {result}")
+        if result.get("ok"):
+            time.sleep(4)
+            if "s=preview" not in driver.current_url:
+                return True
+    except Exception as e:
+        print(f"  [publish] requestSubmit failed: {e}")
+
+    # Strategy B: Selenium click on publish button
+    if _click_first(driver, publish_selectors, "publish"):
+        time.sleep(4)
+        if "s=preview" not in driver.current_url:
+            return True
+
+    # Strategy C: requests POST from publish_bottom form fields
+    try:
+        form_data = driver.execute_script("""
+            var form = document.getElementById('publish_bottom')
+                    || document.getElementById('publish_top');
+            if (!form) return null;
+            var data = {};
+            form.querySelectorAll('input,button').forEach(function(el) {
+                if (!el.name) return;
+                if (el.type === 'submit' || el.tagName === 'BUTTON') {
+                    data[el.name] = el.value || el.textContent || 'Continue';
+                } else {
+                    data[el.name] = el.value || '';
+                }
+            });
+            data.__action__ = form.action || '';
+            return data;
+        """)
+        if not form_data:
+            return False
+        action = form_data.pop("__action__", "") or driver.current_url
+        if action.startswith("/"):
+            action = "https://post.craigslist.org" + action
+        session = requests.Session()
+        for cookie in driver.get_cookies():
+            session.cookies.set(cookie["name"], cookie["value"],
+                                domain=cookie.get("domain", ""))
+        resp = session.post(
+            action,
+            data=form_data,
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Referer": driver.current_url,
+                "Origin": "https://post.craigslist.org",
+            },
+            allow_redirects=True,
+            timeout=30,
+        )
+        print(f"  [publish] POST → {resp.status_code} → {resp.url}")
+        if resp.status_code == 200 and "s=preview" not in resp.url:
+            driver.get(resp.url)
+            time.sleep(3)
+            return True
+    except Exception as e:
+        print(f"  [publish] POST fallback failed: {e}")
+
+    return "s=preview" not in driver.current_url
+
+
+def publish_listing(driver, ad_name, product):
+    """
+    Draft preview: 'this is an unpublished draft' — submit form#publish_bottom.
+    """
+    handle_captcha_if_present(driver)
+    print("  [publish] Waiting for draft preview page...")
+    _wait_for_draft_preview(driver)
+    human_delay(2, 4)
+
+    if not _submit_publish_form(driver):
+        print(f"  [publish] ✗ Publish failed for '{ad_name}' — URL: {driver.current_url}")
+        return False
+
+    human_delay(3, 5)
     handle_captcha_if_present(driver)
 
     try:
