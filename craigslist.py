@@ -1321,105 +1321,20 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
             return 'submitted';
         """)
         print(f"  [submit] form.submit() → {result}")
-        # Wait to leave edit page
-        deadline = time.time() + 15
+        # Wait up to 20s to leave the edit page — form.submit() is async
+        deadline = time.time() + 20
         while time.time() < deadline:
-            if "s=edit" not in driver.current_url:
-                submitted = True
-                print(f"  ✅ Submitted via form.submit() → {driver.current_url}")
-                break
+            url = driver.current_url
+            if "s=edit" not in url:
+                print(f"  ✅ Submitted via form.submit() → {url}")
+                return url  # ← return immediately, never touch POST fallback
             time.sleep(0.5)
+        print("  [submit] form.submit() ran but stayed on edit page after 20s")
     except Exception as e:
         print(f"  [submit] form.submit() failed: {e}")
 
-    if submitted:
-        return driver.current_url
-
-    # ── Fallback: requests POST ───────────────────────────────────────────────
-    print("  [submit] Trying requests POST fallback...")
-    submitted = False
-
-    # ── requests POST: use cryptedStepCheck from DOM + our field values ──────────
-    print("  [submit] Sending POST with session cookies...")
-    try:
-        pairs = driver.execute_script("""
-            var form = document.getElementById('postingForm');
-            if (!form) return null;
-            var data = [];
-            form.querySelectorAll('input,textarea,select').forEach(function(el) {
-                if (!el.name) return;
-                if ((el.type === 'checkbox' || el.type === 'radio') && !el.checked) return;
-                data.push([el.name, el.value || '']);
-            });
-            data.push(['__action__', form.action || '']);
-            return data;
-        """)
-        if not pairs:
-            print("  ✗ Could not extract form data for POST fallback")
-            return None
-
-        form_dict = {}
-        form_action = driver.current_url
-        for pair in pairs:
-            if pair[0] == '__action__':
-                if pair[1]: form_action = pair[1]
-            else:
-                form_dict[pair[0]] = pair[1]
-
-        # Override with our values — ALWAYS use our zip_code directly (never trust DOM)
-        form_dict['PostingTitle'] = title
-        form_dict['PostingBody'] = description
-        form_dict['geographic_area'] = city_name
-        if zip_code:
-            form_dict['postal'] = zip_code  # force it — CL clears postal on submit click
-        else:
-            form_dict.pop('postal', None)
-        if cl_email:
-            form_dict['FromEMail'] = cl_email
-        form_dict['price'] = price
-        form_dict['Privacy'] = form_dict.get('Privacy', 'C')
-        form_dict['go'] = 'continue'
-        form_dict['language'] = form_dict.get('language', '5')
-        # Remove fields CL rejects if empty
-        for opt in ['xstreet0','xstreet1','city','sale_manufacturer','sale_model',
-                    'sale_size','condition','contact_phone_ok','contact_text_ok',
-                    'show_phone_ok','contact_phone']:
-            form_dict.pop(opt, None)
-
-        session = requests.Session()
-        for cookie in driver.get_cookies():
-            session.cookies.set(cookie['name'], cookie['value'],
-                                domain=cookie.get('domain', ''))
-        headers = {
-            'Content-Type': 'application/x-www-form-urlencoded',
-            'Referer': driver.current_url,
-            'Origin': 'https://post.craigslist.org',
-            'User-Agent': (
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                'AppleWebKit/537.36 (KHTML, like Gecko) '
-                'Chrome/124.0.0.0 Safari/537.36'
-            ),
-        }
-        # Log exactly what we're sending so we can debug if CL rejects it
-        print(f"  [post-data] postal={form_dict.get('postal')} title={form_dict.get('PostingTitle','')[:30]}")
-        print(f"  [post-data] cryptedStepCheck={'YES' if 'cryptedStepCheck' in form_dict else 'MISSING'}")
-
-        resp = session.post(form_action, data=form_dict, headers=headers,
-                            allow_redirects=True, timeout=30)
-        print(f"  [submit-fallback] POST → {resp.status_code} → {resp.url}")
-        if resp.status_code == 200 and "s=edit" not in resp.url and 'id="postingForm"' not in resp.text:
-            driver.get(resp.url)
-            time.sleep(2)
-            print(f"  ✅ POST succeeded → {resp.url}")
-            return resp.url
-        else:
-            errs = re.findall(r'class="[^"]*err[^"]*"[^>]*>([^<]{5,120})<', resp.text)
-            print(f"  ✗ POST rejected. Errors: {errs[:3]}")
-            # Print a snippet of the response to help diagnose
-            snippet = resp.text[resp.text.find('postingForm') - 200 : resp.text.find('postingForm') + 200] if 'postingForm' in resp.text else resp.text[:400]
-            print(f"  [resp-snippet] {snippet[:300]}")
-    except Exception as e:
-        print(f"  ✗ Fallback POST failed: {e}")
+    # form.submit() did not navigate away — give up cleanly
+    print("  [submit] form.submit() stayed on edit page — giving up")
 
     # Final diagnosis
     print("  ❌ All submit strategies failed")
