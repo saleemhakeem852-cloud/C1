@@ -239,7 +239,7 @@ def handle_captcha_if_present(driver):
         print("  Cloudflare — waiting 8s…")
         time.sleep(8)
 
-def craigslist_login(driver, email, password):
+def craigslist_login(driver, email):
     driver.get("https://accounts.craigslist.org/login")
     human_delay(2, 4)
     handle_captcha_if_present(driver)
@@ -247,9 +247,6 @@ def craigslist_login(driver, email, password):
         ef = WebDriverWait(driver, 15).until(
             EC.presence_of_element_located((By.ID, "inputEmailHandle")))
         send_keys_slow(driver, ef, email)
-        human_delay()
-        pf = driver.find_element(By.ID, "inputPassword")
-        send_keys_slow(driver, pf, password)
         human_delay()
         btn = driver.find_element(By.CSS_SELECTOR, "button[type='submit']")
         safe_click(driver, btn)
@@ -886,19 +883,15 @@ def update_ad_analytics_periodically():
 def main():
     global CL_CITY
     email    = os.environ.get("CL_EMAIL", "").strip()
-    password = os.environ.get("CL_PASSWORD", "").strip()
     if not email:
         print("✗ CL_EMAIL environment variable not set. Add it to Railway Variables.")
-        return
-    if not password:
-        print("✗ CL_PASSWORD environment variable not set. Add it to Railway Variables.")
         return
     CL_CITY  = os.environ.get("CL_CITY", CL_CITY)
     _load_existing_listings()
 
     vdisplay = None
     driver = make_driver()
-    if not craigslist_login(driver, email, password):
+    if not craigslist_login(driver, email):
         driver.quit()
         return
     products_file = os.environ.get("PRODUCTS_FILE", "products.json")

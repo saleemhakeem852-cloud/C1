@@ -221,7 +221,7 @@ def _run_bulk(body):
         
         env = os.environ.copy()
         env["CL_EMAIL"]        = email
-        env["CL_PASSWORD"]     = password
+        env["CL_PASSWORD"]     = password  # used by adlandpro/classifiedads only (not craigslist)
         env["TWO_CAPTCHA_KEY"] = two_captcha_key
         env["PRODUCTS_FILE"]   = str(SUBSET_JSON)
         if platform == "craigslist":
@@ -361,7 +361,7 @@ def launch_post():
         # Build execution environment
         env = os.environ.copy()
         env["CL_EMAIL"]        = body.get("email", "")
-        env["CL_PASSWORD"]     = body.get("password", "")
+        env["CL_PASSWORD"]     = body.get("password", "")  # used by adlandpro/classifiedads only
         env["TWO_CAPTCHA_KEY"] = body.get("two_captcha_key", "")
         env["PRODUCTS_FILE"]   = products_file
         if platform == "craigslist":
