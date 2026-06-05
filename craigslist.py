@@ -18,7 +18,7 @@ import urllib.request
 import requests
 from datetime import datetime
 
-from seleniumwire import webdriver
+from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait, Select
 from selenium.webdriver.support import expected_conditions as EC
@@ -141,11 +141,6 @@ def make_driver():
     os.environ["SE_MANAGER_PATH"] = ""
     os.environ["WDM_SKIP_DOWNLOAD"] = "1"
 
-    sw_options = {
-        "disable_encoding": True,
-        "suppress_connection_errors": True,
-    }
-
     options = webdriver.ChromeOptions()
     for arg in [
         "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
@@ -176,8 +171,7 @@ def make_driver():
         raise RuntimeError("chromedriver not found")
     print(f"  [driver] Using chromedriver: {chromedriver_bin}")
     service = ChromeService(executable_path=chromedriver_bin, log_output="/tmp/chromedriver.log")
-    driver = webdriver.Chrome(service=service, options=options,
-                               seleniumwire_options=sw_options)
+    driver = webdriver.Chrome(service=service, options=options)
     driver.execute_cdp_cmd(
         "Page.addScriptToEvaluateOnNewDocument",
         {"source": "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"}
@@ -323,29 +317,79 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     except Exception:
         price = "1"
 
-    # Fill each field using real key events so CL's JS state updates
+    # Fill using CDP Input.dispatchMouseEvent + Input.insertText
+    # This is the lowest level possible — indistinguishable from real user input
     def real_fill(selector, value, use_tab=True):
         try:
             el = WebDriverWait(driver, 8).until(
                 EC.element_to_be_clickable((By.CSS_SELECTOR, selector)))
             driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
             time.sleep(0.2)
-            el.click()
-            time.sleep(0.15)
-            el.send_keys(Keys.CONTROL + "a")
-            el.send_keys(Keys.DELETE)
+
+            # Get element center coordinates for CDP mouse click
+            rect = driver.execute_script(
+                "var r=arguments[0].getBoundingClientRect();"
+                "return {x:r.left+r.width/2, y:r.top+r.height/2};", el)
+            x, y = rect["x"], rect["y"]
+
+            # CDP mouse click to focus
+            driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
+                "type": "mousePressed", "x": x, "y": y,
+                "button": "left", "clickCount": 1})
+            driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
+                "type": "mouseReleased", "x": x, "y": y,
+                "button": "left", "clickCount": 1})
+            time.sleep(0.2)
+
+            # Select all existing text and delete it
+            driver.execute_cdp_cmd("Input.dispatchKeyEvent", {
+                "type": "keyDown", "modifiers": 2, "key": "a", "code": "KeyA"})
+            driver.execute_cdp_cmd("Input.dispatchKeyEvent", {
+                "type": "keyUp", "modifiers": 2, "key": "a", "code": "KeyA"})
+            driver.execute_cdp_cmd("Input.dispatchKeyEvent", {
+                "type": "keyDown", "key": "Delete", "code": "Delete"})
+            driver.execute_cdp_cmd("Input.dispatchKeyEvent", {
+                "type": "keyUp", "key": "Delete", "code": "Delete"})
             time.sleep(0.1)
-            for ch in str(value):
-                el.send_keys(ch)
-                time.sleep(random.uniform(0.04, 0.09))
+
+            # Type the value via CDP insertText (fires all browser input events)
+            driver.execute_cdp_cmd("Input.insertText", {"text": str(value)})
+            time.sleep(0.15)
+
             if use_tab:
-                el.send_keys(Keys.TAB)
+                driver.execute_cdp_cmd("Input.dispatchKeyEvent", {
+                    "type": "keyDown", "key": "Tab", "code": "Tab"})
+                driver.execute_cdp_cmd("Input.dispatchKeyEvent", {
+                    "type": "keyUp", "key": "Tab", "code": "Tab"})
                 time.sleep(0.3)
+
             actual = el.get_attribute("value") or ""
+            if actual:
+                print(f"  ✓ {selector} = '{actual[:50]}'")
+            else:
+                # CDP insertText worked but getter may be masked — check via JS
+                actual = driver.execute_script(
+                    "var el=document.querySelector(arguments[0]);"
+                    "var p=el.tagName==='TEXTAREA'?HTMLTextAreaElement.prototype:HTMLInputElement.prototype;"
+                    "var d=Object.getOwnPropertyDescriptor(p,'value');"
+                    "return d&&d.get?d.get.call(el):el.value;", selector) or ""
+                print(f"  ✓ {selector} = '{actual[:50]}' (native getter)")
             return actual
         except Exception as e:
             print(f"  ⚠ real_fill({selector}): {e}")
-            return ""
+            # Fallback to send_keys
+            try:
+                el = driver.find_element(By.CSS_SELECTOR, selector)
+                el.click()
+                el.send_keys(Keys.CONTROL + "a")
+                el.send_keys(Keys.DELETE)
+                el.send_keys(str(value))
+                if use_tab:
+                    el.send_keys(Keys.TAB)
+                return el.get_attribute("value") or ""
+            except Exception as e2:
+                print(f"  ✗ fallback also failed: {e2}")
+                return ""
 
     print("  Filling title...")
     real_fill("[name='PostingTitle']", title, use_tab=True)
@@ -391,8 +435,7 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     real_fill("[name='postal']", zip_code, use_tab=False)
     time.sleep(0.5)
 
-    # Clear any previously captured requests
-    del driver.requests
+    # (selenium-wire removed — no request interception)
 
     # Click submit — CL's own JS will validate and POST
     url_before = driver.current_url
@@ -428,20 +471,7 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     except TimeoutException:
         pass
 
-    # Page didn't change — check selenium-wire for the POST that was made
-    print("  ⚠ Page did not change — inspecting captured requests...")
-    post_requests = [r for r in driver.requests
-                     if r.method == "POST" and "craigslist.org" in r.url]
-    print(f"  [wire] Captured {len(post_requests)} POST request(s)")
-    for req in post_requests:
-        print(f"  [wire] POST {req.url}")
-        if req.response:
-            print(f"  [wire] Response: {req.response.status_code}")
-            body = req.response.body.decode("utf-8", errors="replace")
-            if "ZIP" in body or "postal" in body.lower():
-                zip_snippets = re.findall(r".{0,60}(?:zip|postal|ZIP).{0,60}", body, re.IGNORECASE)
-                for s in zip_snippets[:3]:
-                    print(f"  [wire] ZIP hint: {s.strip()}")
+    print("  ⚠ Page did not change after submit")
 
     # Check if CL rejected it client-side (still on edit page)
     try:
