@@ -470,58 +470,72 @@ def _focus_field(driver, element):
     time.sleep(0.25)
 
 
-def _backspace_clear(driver, element):
-    """Clear field with individual backspaces — React/CL track these as real edits."""
-    _focus_field(driver, element)
-    current = element.get_attribute("value") or ""
-    for _ in range(len(current) + 5):
-        element.send_keys(Keys.BACKSPACE)
-        time.sleep(0.04)
-    time.sleep(0.15)
+# Fields on CL edit page (s=edit) — see posting form screenshot
+_CL_FORM_FIELDS = {
+    "PostingTitle": "posting title",
+    "PostingBody": "description",
+    "postal": "ZIP code",
+    "geographic_area": "city or neighborhood",
+    "price": "price",
+    "FromEMail": "email",
+}
 
 
-def _click_field_by_name(driver, name):
-    """Click the label/row for a field so CL registers focus on account-prefilled inputs."""
+def _field_editable(driver, name):
     try:
-        driver.execute_script("""
-            var name = arguments[0];
-            var el = document.querySelector('[name="'+name+'"]');
+        return driver.execute_script("""
+            var el = document.querySelector('[name="'+arguments[0]+'"]');
             if (!el) return false;
-            var row = el.closest('li, .formrow, .form-row, .field, p, div');
-            if (row) {
-                var label = row.querySelector('label');
-                if (label) { label.click(); return true; }
-            }
-            el.click();
-            return true;
+            if (el.disabled || el.readOnly) return false;
+            var st = window.getComputedStyle(el);
+            if (st.display === 'none' || st.visibility === 'hidden') return false;
+            var r = el.getBoundingClientRect();
+            return r.width > 0 && r.height > 0;
         """, name)
-        time.sleep(0.3)
     except Exception:
-        pass
+        return False
 
 
-def _fields_with_autofill_errors(driver):
-    """Field names CL still marks as account-autofilled (must be manually edited)."""
+def _clear_and_type(driver, element, value):
+    """Ctrl+A clear then slow send_keys — works on CL React inputs when backspace fails."""
+    value = str(value).strip()
+    _focus_field(driver, element)
+    element.send_keys(Keys.CONTROL + "a")
+    time.sleep(0.08)
+    element.send_keys(Keys.DELETE)
+    time.sleep(0.12)
+    for ch in value:
+        element.send_keys(ch)
+        time.sleep(random.uniform(0.08, 0.15))
+    driver.execute_script(
+        "arguments[0].dispatchEvent(new Event('input',{bubbles:true}));"
+        "arguments[0].dispatchEvent(new Event('change',{bubbles:true}));"
+        "arguments[0].blur();", element)
+    time.sleep(0.35)
+    return (element.get_attribute("value") or "").strip()
+
+
+def _human_fill(driver, element, value, use_tab=False):
+    return _clear_and_type(driver, element, value)
+
+
+def _autofill_banner_fields(driver):
+    """
+    Parse ONLY short error-banner lines like 'posting title • autofilled'.
+    Do NOT walk parent DOM — that falsely flags every field on the page.
+    """
     try:
         return driver.execute_script("""
             var names = [];
             var form = document.getElementById('postingForm');
             if (!form) return names;
             function add(n) { if (n && names.indexOf(n) === -1) names.push(n); }
-            form.querySelectorAll('input,textarea').forEach(function(el) {
-                if (!el.name) return;
-                var p = el.closest('li, .formrow, .form-row, .field') || el.parentElement;
-                for (var i = 0; i < 8 && p; i++) {
-                    var blob = (p.textContent || '').toLowerCase();
-                    if (blob.indexOf('autofill') !== -1) { add(el.name); break; }
-                    p = p.parentElement;
-                }
-            });
-            form.querySelectorAll('.err, .error, li, span, p, a, button').forEach(function(el) {
+            form.querySelectorAll('li, span, p, a, label').forEach(function(el) {
                 var t = (el.textContent || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-                if (t.indexOf('autofill') === -1 || t.length > 80) return;
+                if (t.indexOf('autofill') === -1) return;
+                if (t.length > 55 || t.length < 8) return;
                 if (t.indexOf('title') !== -1) add('PostingTitle');
-                if (t.indexOf('zip') !== -1 || t.indexOf('postal') !== -1) add('postal');
+                if (t.indexOf('zip') !== -1) add('postal');
                 if (t.indexOf('description') !== -1) add('PostingBody');
                 if (t.indexOf('email') !== -1) add('FromEMail');
             });
@@ -531,59 +545,59 @@ def _fields_with_autofill_errors(driver):
         return []
 
 
-def _human_fill(driver, element, value, use_tab=False):
-    """Type value with backspace clear + slow keystrokes. No Ctrl+A (CL flags it)."""
-    value = str(value).strip()
-    _backspace_clear(driver, element)
-    for ch in value:
-        element.send_keys(ch)
-        time.sleep(random.uniform(0.10, 0.20))
-    if use_tab:
-        element.send_keys(Keys.TAB)
-    else:
+def _nudge_autofill_field(driver, name):
+    """One tiny edit at end of field — enough for CL to clear account-autofill flag."""
+    try:
+        el = driver.find_element(By.CSS_SELECTOR, f"[name='{name}']")
+        _focus_field(driver, el)
+        val = (el.get_attribute("value") or "").strip()
+        if not val:
+            return
+        el.send_keys(Keys.END)
+        time.sleep(0.08)
+        el.send_keys(" ")
+        time.sleep(0.08)
+        el.send_keys(Keys.BACKSPACE)
+        time.sleep(0.08)
         driver.execute_script(
-            "arguments[0].dispatchEvent(new Event('change',{bubbles:true}));"
-            "arguments[0].blur();", element)
-    time.sleep(0.4)
-    return (element.get_attribute("value") or "").strip()
+            "arguments[0].dispatchEvent(new Event('input',{bubbles:true}));"
+            "arguments[0].blur();", el)
+        time.sleep(0.25)
+    except Exception as e:
+        print(f"  [nudge] {name}: {e}")
 
 
-def _resolve_autofill_errors(driver, field_map, max_rounds=6):
-    """
-    CL blocks submit while account-prefilled fields show 'autofilled'.
-    Re-type each flagged field until errors clear.
-    """
-    for round_num in range(1, max_rounds + 1):
-        flagged = _fields_with_autofill_errors(driver)
-        missing = _missing_required_fields(driver)
-        if not flagged and not missing:
-            print(f"  [autofill] cleared after {round_num - 1} retype round(s)")
-            return True
-
-        targets = list(dict.fromkeys(flagged + [m.split(":")[0] for m in missing]))
-        print(f"  [autofill] round {round_num}: retyping {targets}")
-        for name in targets:
-            val = field_map.get(name)
-            if not val:
+def _verify_and_refill(driver, field_map):
+    """Ensure title, body, postal, price, city match expected — refill once if empty/wrong."""
+    ok = True
+    checks = {
+        "PostingTitle": field_map.get("PostingTitle"),
+        "PostingBody": field_map.get("PostingBody"),
+        "postal": field_map.get("postal"),
+        "geographic_area": field_map.get("geographic_area"),
+        "price": field_map.get("price"),
+    }
+    for name, expected in checks.items():
+        if not expected:
+            continue
+        try:
+            el = driver.find_element(By.CSS_SELECTOR, f"[name='{name}']")
+            actual = (el.get_attribute("value") or "").strip()
+            exp = str(expected).strip()
+            if actual == exp:
                 continue
-            try:
-                _click_field_by_name(driver, name)
-                el = driver.find_element(By.CSS_SELECTOR, f"[name='{name}']")
-                actual = _human_fill(driver, el, val, use_tab=False)
-                print(f"  [autofill] {name} → '{actual[:40]}'")
-            except Exception as e:
-                print(f"  [autofill] {name} failed: {e}")
-
-        time.sleep(0.6)
-        errs = _form_validation_errors(driver)
-        still_flagged = _fields_with_autofill_errors(driver)
-        still_missing = _missing_required_fields(driver)
-        print(f"  [autofill] after round {round_num}: "
-              f"flagged={still_flagged} missing={still_missing} errors={len(errs)}")
-        if not still_flagged and not still_missing:
-            return True
-
-    return not _fields_with_autofill_errors(driver) and not _missing_required_fields(driver)
+            print(f"  [verify] {name} mismatch/empty (got '{actual[:30]}') — refilling")
+            _clear_and_type(driver, el, exp)
+            actual = (el.get_attribute("value") or "").strip()
+            if actual != exp:
+                print(f"  [verify] {name} still wrong after refill: '{actual[:30]}'")
+                ok = False
+        except NoSuchElementException:
+            if name in ("postal", "geographic_area"):
+                continue
+            print(f"  [verify] {name} not found in form")
+            ok = False
+    return ok
 
 
 def _ensure_fields_intact(driver, field_map):
@@ -599,7 +613,7 @@ def _ensure_fields_intact(driver, field_map):
             continue
         try:
             el = driver.find_element(By.CSS_SELECTOR, f"[name='{name}']")
-            _human_fill(driver, el, val, use_tab=False)
+            _clear_and_type(driver, el, val)
         except Exception as e:
             print(f"  [repair] {name}: {e}")
     return not _missing_required_fields(driver)
@@ -764,7 +778,7 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     description = (product.get("description") or (
         f"{title} in excellent condition. Well maintained and ready for a new home. "
         f"Priced to sell. Local pickup preferred. Message for details.")).strip()
-    _pr = str(product.get("price", "")).strip().replace("$", "").replace(",", "")
+    _pr = str(product.get("price", "")).strip().replace("$", "").replace(",", "").replace("Rs", "").strip()
     try:
         price_f = float(_pr) if _pr else 1.0
         price = str(int(price_f)) if price_f == int(price_f) else str(price_f)
@@ -794,38 +808,41 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
         "price": price,
     }
 
-    # Account-prefilled fields first — CL requires manual edit on email/ZIP before submit
-    print("  Filling email...")
-    if cl_email:
-        real_fill("[name='FromEMail']", cl_email, use_tab=False)
-
-    print("  Filling postal...")
-    if zip_code:
-        real_fill("[name='postal']", zip_code, use_tab=False)
-    else:
-        print("  ⚠ No ZIP/postal code for this city — skipping postal field")
-
+    # Fill top-to-bottom matching CL form layout (see s=edit page)
     print("  Filling title...")
-    real_fill("[name='PostingTitle']", title, use_tab=False)
-
-    print("  Filling description...")
-    real_fill("[name='PostingBody']", description, use_tab=False)
+    real_fill("[name='PostingTitle']", title)
 
     print("  Filling price...")
     for price_sel in ["[name='price']", "[name='AskingPrice']", "[name='AskPrice']"]:
         try:
             driver.find_element(By.CSS_SELECTOR, price_sel)
-            real_fill(price_sel, price, use_tab=False)
+            real_fill(price_sel, price)
             break
         except Exception:
             continue
 
-    print("  Filling geographic_area...")
+    print("  Filling city/neighborhood...")
     try:
         driver.find_element(By.CSS_SELECTOR, "[name='geographic_area']")
-        real_fill("[name='geographic_area']", city_name, use_tab=False)
+        real_fill("[name='geographic_area']", city_name)
     except NoSuchElementException:
         pass
+
+    print("  Filling ZIP...")
+    if zip_code:
+        real_fill("[name='postal']", zip_code)
+    else:
+        print("  ⚠ No ZIP/postal code for this city — skipping postal field")
+
+    print("  Filling description...")
+    real_fill("[name='PostingBody']", description)
+
+    # Email is often account-prefilled + read-only (CL mail relay) — only fill if editable
+    if cl_email and _field_editable(driver, "FromEMail"):
+        print("  Filling email...")
+        real_fill("[name='FromEMail']", cl_email)
+    else:
+        print("  [email] Using account email (field not editable or relay mode)")
 
     try:
         cond_val = product.get("condition", "")
@@ -834,13 +851,21 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     except Exception:
         pass
 
-    print("  Resolving CL autofill flags...")
-    if not _resolve_autofill_errors(driver, _field_map):
-        print("  [autofill] Could not clear all autofill flags — aborting submit")
-        val_errs = _form_validation_errors(driver)
-        for err in val_errs[:5]:
-            print(f"  [validate] {err[:120]}")
-        return None
+    print("  Verifying fields match expected values...")
+    if not _verify_and_refill(driver, _field_map):
+        print("  [verify] Some fields failed verification")
+
+    flagged = _autofill_banner_fields(driver)
+    if flagged:
+        print(f"  [autofill] Banner flags: {flagged} — nudging once")
+        for name in flagged:
+            if name in _field_map and _field_map.get(name):
+                if (driver.find_element(By.CSS_SELECTOR, f"[name='{name}']").get_attribute("value") or "").strip() != str(_field_map[name]).strip():
+                    el = driver.find_element(By.CSS_SELECTOR, f"[name='{name}']")
+                    _clear_and_type(driver, el, _field_map[name])
+                else:
+                    _nudge_autofill_field(driver, name)
+        time.sleep(0.5)
 
     status = _field_status(driver)
     for fname, st in status.items():
@@ -1090,7 +1115,7 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
 
     # ── Strategy 5: requests POST using cookies from browser session ───────
     if not submitted:
-        if _fields_with_autofill_errors(driver):
+        if _autofill_banner_fields(driver):
             print("  [submit] Strategy 5 skipped — autofill errors still present")
         else:
             print("  [submit] Strategy 5: requests POST with browser cookies...")
