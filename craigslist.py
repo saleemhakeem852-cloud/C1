@@ -164,12 +164,14 @@ def make_driver():
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     )
     chromium_bin = _find_binary(
-        ["chromium", "chromium-browser", "google-chrome"],
-        ["/usr/bin/chromium", "/usr/bin/chromium-browser"])
+        ["google-chrome", "chromium", "chromium-browser"],
+        ["/usr/local/bin/google-chrome", "/usr/bin/chromium", "/usr/bin/chromium-browser"])
     if chromium_bin:
         print(f"  [driver] Using chromium: {chromium_bin}")
         options.binary_location = chromium_bin
-    chromedriver_bin = _find_binary(["chromedriver"], ["/usr/bin/chromedriver"])
+    chromedriver_bin = _find_binary(
+        ["chromedriver"],
+        ["/usr/local/bin/chromedriver", "/usr/bin/chromedriver"])
     if not chromedriver_bin:
         raise RuntimeError("chromedriver not found")
     print(f"  [driver] Using chromedriver: {chromedriver_bin}")
