@@ -422,50 +422,80 @@ def _focus_field(driver, element):
     time.sleep(0.25)
 
 
-def _type_with_send_keys(driver, element, value):
-    """Type with real send_keys — trusted events React/CL accept."""
-    driver.execute_script("""
-        var el = arguments[0];
-        if (el._valueTracker) { el._valueTracker.setValue(''); }
-    """, element)
-    element.send_keys(Keys.CONTROL + "a")
-    time.sleep(0.06)
-    element.send_keys(Keys.DELETE)
-    time.sleep(0.1)
+def _type_chars(element, value, delay=(0.06, 0.14)):
     for ch in str(value):
         element.send_keys(ch)
-        time.sleep(random.uniform(0.06, 0.14))
+        time.sleep(random.uniform(*delay))
 
 
 def _nudge_user_edited(element):
-    """Tiny edit at end-of-field via send_keys — clears CL 'autofilled' flag."""
+    """Minimal manual edit — CL requires this on account-autofilled fields."""
     element.click()
-    time.sleep(0.12)
+    time.sleep(0.15)
     element.send_keys(Keys.END)
     time.sleep(0.08)
-    val = (element.get_attribute("value") or "").strip()
-    ch = val[-1] if val else " "
-    element.send_keys(ch)
-    time.sleep(0.08)
-    element.send_keys(Keys.BACKSPACE)
+    element.send_keys("x")
     time.sleep(0.1)
+    element.send_keys(Keys.BACKSPACE)
+    time.sleep(0.12)
 
 
-def _cl_fill_field(driver, element, value, *, nudge=False, use_tab=True):
-    """Focus, type slowly, optional nudge for autofilled-sensitive fields."""
+def _edit_autofilled_field(driver, element, value, use_tab=True):
+    """
+    Edit a CL-prefilled field the way a human would:
+    never Ctrl+A; backspace existing chars, type new value, nudge.
+    """
+    value = str(value).strip()
     _focus_field(driver, element)
-    _type_with_send_keys(driver, element, value)
-    if nudge:
+    current = (element.get_attribute("value") or "").strip()
+    if current == value:
+        print(f"  [autofill] prefilled OK — nudging only")
+        _nudge_user_edited(element)
+    else:
+        if current:
+            print(f"  [autofill] editing '{current[:30]}' → '{value[:30]}'")
+            element.send_keys(Keys.END)
+            time.sleep(0.08)
+            for _ in range(len(current)):
+                element.send_keys(Keys.BACKSPACE)
+                time.sleep(random.uniform(0.04, 0.09))
+        _type_chars(element, value)
         _nudge_user_edited(element)
     if use_tab:
         element.send_keys(Keys.TAB)
     else:
         driver.execute_script(
             "arguments[0].dispatchEvent(new Event('blur',{bubbles:true}));", element)
-    time.sleep(0.4)
+    time.sleep(0.45)
 
 
-def _ensure_field_value(driver, name, expected, nudge=False):
+def _type_with_send_keys(driver, element, value):
+    """Type into an empty/non-autofilled field."""
+    _focus_field(driver, element)
+    current = (element.get_attribute("value") or "").strip()
+    if current:
+        element.send_keys(Keys.END)
+        time.sleep(0.08)
+        for _ in range(len(current)):
+            element.send_keys(Keys.BACKSPACE)
+            time.sleep(random.uniform(0.04, 0.08))
+    _type_chars(element, value)
+
+
+def _cl_fill_field(driver, element, value, *, autofill_sensitive=False, use_tab=True):
+    if autofill_sensitive:
+        _edit_autofilled_field(driver, element, value, use_tab=use_tab)
+    else:
+        _type_with_send_keys(driver, element, value)
+        if use_tab:
+            element.send_keys(Keys.TAB)
+        else:
+            driver.execute_script(
+                "arguments[0].dispatchEvent(new Event('blur',{bubbles:true}));", element)
+        time.sleep(0.4)
+
+
+def _ensure_field_value(driver, name, expected, autofill_sensitive=False):
     """Re-fill if DOM value does not match expected."""
     expected = str(expected).strip()
     if not expected:
@@ -476,7 +506,9 @@ def _ensure_field_value(driver, name, expected, nudge=False):
         if actual == expected:
             return True
         print(f"  [fix] {name}: got '{actual[:40]}' want '{expected[:40]}'")
-        _cl_fill_field(driver, el, expected, nudge=nudge, use_tab=True)
+        _cl_fill_field(
+            driver, el, expected,
+            autofill_sensitive=autofill_sensitive, use_tab=True)
         actual = (el.get_attribute("value") or "").strip()
         ok = actual == expected
         if not ok:
@@ -487,8 +519,8 @@ def _ensure_field_value(driver, name, expected, nudge=False):
         return False
 
 
-# CL flags these unless the user appears to have edited them manually
-_NUDGE_FIELDS = frozenset({"PostingTitle", "postal", "FromEMail"})
+# CL account-autofills these — must edit in-place, never Ctrl+A wipe
+_AUTOFILL_SENSITIVE = frozenset({"PostingTitle", "postal", "FromEMail"})
 
 
 def _autofill_fields_from_errors(errs):
@@ -544,7 +576,22 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
 
     handle_captcha_if_present(driver)
     _disable_form_autofill(driver)
-    time.sleep(1.5)
+    # Let CL finish account-autofilling title / ZIP / email before we touch fields
+    time.sleep(3.0)
+    try:
+        pre = driver.execute_script("""
+            var out = {};
+            ['PostingTitle','postal','FromEMail'].forEach(function(n) {
+                var el = document.querySelector('[name="'+n+'"]');
+                out[n] = el ? (el.value || '') : '';
+            });
+            return out;
+        """) or {}
+        for k, v in pre.items():
+            if v:
+                print(f"  [prefill] {k} = '{str(v)[:40]}'")
+    except Exception:
+        pass
 
     title = (product.get("title") or product.get("name") or "Quality Item For Sale").strip()
     description = (product.get("description") or (
@@ -567,13 +614,15 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
             name = el.get_attribute("name") or ""
             _cl_fill_field(
                 driver, el, value,
-                nudge=(name in _NUDGE_FIELDS),
+                autofill_sensitive=(name in _AUTOFILL_SENSITIVE),
                 use_tab=use_tab,
             )
             actual = (el.get_attribute("value") or "").strip()
             if actual != value:
                 print(f"  ⚠ {selector} mismatch — retrying")
-                _cl_fill_field(driver, el, value, nudge=True, use_tab=use_tab)
+                _cl_fill_field(
+                    driver, el, value,
+                    autofill_sensitive=True, use_tab=use_tab)
                 actual = (el.get_attribute("value") or "").strip()
             print(f"  ✓ {selector} = '{actual[:50]}'")
             return actual
@@ -604,15 +653,14 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
                 el = driver.find_element(By.CSS_SELECTOR, f"[name='{name}']")
                 _cl_fill_field(
                     driver, el, val,
-                    nudge=(name in _NUDGE_FIELDS),
+                    autofill_sensitive=(name in _AUTOFILL_SENSITIVE),
                     use_tab=True,
                 )
             except Exception as e:
                 print(f"  [retry] Could not re-fill {name}: {e}")
 
-    print("  Filling title...")
-    real_fill("[name='PostingTitle']", title, use_tab=True)
-
+    # Fill non-autofill fields first; leave title/ZIP/email for last so CL
+    # account-prefill completes, then we edit those in-place.
     print("  Filling description...")
     real_fill("[name='PostingBody']", description, use_tab=True)
 
@@ -625,10 +673,6 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
         except Exception:
             continue
 
-    print("  Filling email...")
-    if cl_email:
-        real_fill("[name='FromEMail']", cl_email, use_tab=True)
-
     print("  Filling geographic_area...")
     try:
         driver.find_element(By.CSS_SELECTOR, "[name='geographic_area']")
@@ -636,7 +680,6 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     except NoSuchElementException:
         pass
 
-    # Condition
     try:
         cond_val = product.get("condition", "")
         if cond_val:
@@ -644,31 +687,26 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     except Exception:
         pass
 
-    # postal — fill last, no TAB (TAB can clear React state on the last field)
-    print("  Filling postal (last, no TAB)...")
+    print("  Filling title (CL autofill-sensitive)...")
+    real_fill("[name='PostingTitle']", title, use_tab=True)
+
+    print("  Filling email (CL autofill-sensitive)...")
+    if cl_email:
+        real_fill("[name='FromEMail']", cl_email, use_tab=True)
+
+    print("  Filling postal (CL autofill-sensitive, last)...")
     if zip_code:
         real_fill("[name='postal']", zip_code, use_tab=False)
         time.sleep(0.5)
     else:
         print("  ⚠ No ZIP/postal code for this city — skipping postal field")
 
-    print("  Nudging title, email, ZIP (CL autofill check)...")
-    for nudge_name in _NUDGE_FIELDS:
-        nudge_val = _field_map.get(nudge_name)
-        if not nudge_val:
-            continue
-        try:
-            el = driver.find_element(By.CSS_SELECTOR, f"[name='{nudge_name}']")
-            _nudge_user_edited(el)
-            time.sleep(0.35)
-        except Exception as e:
-            print(f"  [nudge] {nudge_name}: {e}")
-
     print("  Verifying field values...")
     for fname, fval in _field_map.items():
         if fval:
             _ensure_field_value(
-                driver, fname, fval, nudge=(fname in _NUDGE_FIELDS))
+                driver, fname, fval,
+                autofill_sensitive=(fname in _AUTOFILL_SENSITIVE))
 
     time.sleep(0.5)
     val_errs = _form_validation_errors(driver)
@@ -679,12 +717,24 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
         err_fields = _autofill_fields_from_errors(val_errs)
         if not err_fields:
             err_fields = list(_field_map.keys())
-        _retry_fields(_field_map, err_fields)
+        if "autofill" in " ".join(val_errs).lower():
+            for name in ("PostingTitle", "postal", "FromEMail"):
+                val = _field_map.get(name)
+                if not val:
+                    continue
+                try:
+                    el = driver.find_element(By.CSS_SELECTOR, f"[name='{name}']")
+                    _edit_autofilled_field(driver, el, val, use_tab=True)
+                except Exception as e:
+                    print(f"  [autofill-retry] {name}: {e}")
+        else:
+            _retry_fields(_field_map, err_fields)
         time.sleep(0.8)
         for fname, fval in _field_map.items():
             if fval:
                 _ensure_field_value(
-                    driver, fname, fval, nudge=(fname in _NUDGE_FIELDS))
+                    driver, fname, fval,
+                    autofill_sensitive=(fname in _AUTOFILL_SENSITIVE))
         val_errs = _form_validation_errors(driver)
         for err in val_errs[:4]:
             print(f"  [validate] Still visible: {err[:120]}")
@@ -793,14 +843,6 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     # Print every field name and value so we can see exactly what's being sent
     for k, v in sorted(form_dict.items()):
         print(f"  [post-field] {k}={str(v)[:50]}")
-
-    for nudge_name in ("PostingTitle", "postal", "FromEMail"):
-        try:
-            el = driver.find_element(By.CSS_SELECTOR, f"[name='{nudge_name}']")
-            _nudge_user_edited(el)
-        except Exception:
-            pass
-    time.sleep(0.5)
 
     print("  [submit] Attempting form submission (multi-strategy)...")
 
