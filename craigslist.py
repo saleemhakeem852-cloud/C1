@@ -978,426 +978,300 @@ def _js_fill_field(driver, selector, value):
     _react_set_value(driver, el, value)
 
 
+def _type_into_field(driver, selector, value, label="field"):
+    """
+    Click a field, triple-click to select all, delete, then type char by char.
+    This is indistinguishable from real human typing — CL cannot flag it as autofill.
+    """
+    value = str(value).strip()
+    if not value:
+        return ""
+    try:
+        el = WebDriverWait(driver, 8).until(
+            EC.element_to_be_clickable((By.CSS_SELECTOR, selector)))
+    except Exception as e:
+        print(f"  ✗ [{label}] not found: {e}")
+        return ""
+
+    # Scroll into view
+    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+    time.sleep(0.3)
+
+    # Triple-click to select all existing text, then delete it
+    ActionChains(driver).move_to_element(el).triple_click(el).perform()
+    time.sleep(0.2)
+    el.send_keys(Keys.DELETE)
+    time.sleep(0.2)
+
+    # Type character by character like a human
+    for ch in value:
+        el.send_keys(ch)
+        time.sleep(random.uniform(0.04, 0.12))
+
+    # Tab away to trigger blur/change events
+    el.send_keys(Keys.TAB)
+    time.sleep(0.3)
+
+    actual = (el.get_attribute("value") or "").strip()
+    print(f"  ✓ [{label}] = '{actual[:60]}'")
+    return actual
+
+
 def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     """
-    Fill CL's React posting form, then submit via browser click (preferred)
-    or requests POST fallback. Returns the next-step URL on success.
+    Fill CL posting form with real human-like keystrokes, then click Continue.
+    No JS tricks, no React fiber patching — just click, clear, type, tab.
+    Returns the next-step URL on success, None on failure.
     """
     try:
         WebDriverWait(driver, 15).until(
             EC.presence_of_element_located((By.ID, "postingForm")))
     except TimeoutException:
-        print(f"  ✗ postingForm not found")
+        print("  ✗ postingForm not found")
         return None
 
     handle_captcha_if_present(driver)
-    time.sleep(3)
-    _disable_form_autofill(driver)
-    baseline_errs = _form_validation_errors(driver)
-    if baseline_errs:
-        print(f"  [validate] Baseline (before fill): {len(baseline_errs)} visible")
+    time.sleep(2)
 
+    # ── Prepare values ─────────────────────────────────────────────────────────
     title = (product.get("title") or product.get("name") or "Quality Item For Sale").strip()
     description = (product.get("description") or (
         f"{title} in excellent condition. Well maintained and ready for a new home. "
-        f"Priced to sell. Local pickup preferred. Message for details.")).strip()
+        "Priced to sell. Local pickup preferred. Message for details.")).strip()
     _pr = str(product.get("price", "")).strip().replace("$", "").replace(",", "").replace("Rs", "").strip()
     try:
-        price_f = float(_pr) if _pr else 1.0
-        price = str(int(round(price_f)))  # always strip decimals, e.g. 1129.99 → "1130"
+        price = str(round(float(_pr))) if _pr else "10"
     except Exception:
-        price = "1"
+        price = "10"
 
-    def real_fill(selector, value, use_tab=False):
-        value = str(value).strip()
-        if not value:
-            return ""
-        try:
-            el = WebDriverWait(driver, 8).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, selector)))
-            actual = _human_fill(driver, el, value, use_tab=use_tab)
-            print(f"  ✓ {selector} = '{actual[:50]}'")
-            return actual
-        except Exception as e:
-            print(f"  ✗ real_fill({selector}): {e}")
-            return ""
+    print(f"  [fill] title='{title[:50]}' price={price} zip={zip_code} city={city_name}")
 
-    _field_map = {
-        "PostingTitle": title,
-        "PostingBody": description,
-        "FromEMail": cl_email,
-        "postal": zip_code,
-        "geographic_area": city_name,
-        "price": price,
-    }
+    # ── Disable browser autofill on the form ──────────────────────────────────
+    try:
+        driver.execute_script("""
+            var f = document.getElementById('postingForm');
+            if (f) {
+                f.setAttribute('autocomplete','off');
+                f.querySelectorAll('input,textarea').forEach(function(el) {
+                    el.setAttribute('autocomplete','off');
+                    el.setAttribute('data-lpignore','true');
+                });
+            }
+        """)
+    except Exception:
+        pass
 
-    # Fill top-to-bottom matching CL form layout (see s=edit page)
-    print("  Filling title...")
-    real_fill("[name='PostingTitle']", title)
+    # ── Fill each field in order ───────────────────────────────────────────────
+    _type_into_field(driver, "[name='PostingTitle']", title, "title")
+    time.sleep(0.4)
 
-    print("  Filling price...")
+    # Price — try multiple field names CL uses
+    price_filled = False
     for price_sel in ["[name='price']", "[name='AskingPrice']", "[name='AskPrice']"]:
         try:
             driver.find_element(By.CSS_SELECTOR, price_sel)
-            real_fill(price_sel, price)
+            _type_into_field(driver, price_sel, price, "price")
+            price_filled = True
             break
         except Exception:
             continue
+    if not price_filled:
+        print("  ⚠ Price field not found")
 
-    print("  Filling city/neighborhood...")
+    # City / neighborhood (optional field)
     try:
         driver.find_element(By.CSS_SELECTOR, "[name='geographic_area']")
-        real_fill("[name='geographic_area']", city_name)
-    except NoSuchElementException:
+        _type_into_field(driver, "[name='geographic_area']", city_name, "city")
+    except Exception:
         pass
+    time.sleep(0.3)
 
-    print("  Filling ZIP...")
+    # ZIP — fill, then immediately verify it stuck
     if zip_code:
-        real_fill("[name='postal']", zip_code)
-    else:
-        print("  ⚠ No ZIP/postal code for this city — skipping postal field")
-
-    print("  Filling description...")
-    real_fill("[name='PostingBody']", description)
-
-    # Email is often account-prefilled + read-only (CL mail relay) — only fill if editable
-    if cl_email and _field_editable(driver, "FromEMail"):
-        print("  Filling email...")
-        real_fill("[name='FromEMail']", cl_email)
-    else:
-        print("  [email] Using account email (field not editable or relay mode)")
-
-    try:
-        cond_val = product.get("condition", "")
-        if cond_val:
-            Select(driver.find_element(By.NAME, "condition")).select_by_visible_text(cond_val)
-    except Exception:
-        pass
-
-    print("  Verifying fields match expected values...")
-    if not _verify_and_refill(driver, _field_map):
-        print("  [verify] Some fields failed verification")
-
-    # Patch React fiber state once (no re-paste — that corrupts fields)
-    _patch_entire_form(driver)
-    time.sleep(0.5)
-
-    status = _field_status(driver)
-    for fname, st in status.items():
-        print(f"  [field] {fname}: value='{st.get('value','')}' "
-              f"invalid={st.get('invalid')} autofilled={st.get('autofilled')}")
-
-    val_errs = _form_validation_errors(driver)
-    print(f"  [validate] visible_errors={len(val_errs)} missing={_missing_required_fields(driver)}")
-    if val_errs:
-        for err in val_errs[:4]:
-            print(f"  [validate] {err[:120]}")
-
-    # Extract form + POST via requests with residential proxy
-    time.sleep(0.5)
-
-    form_data = driver.execute_script("""
-        var form = document.getElementById('postingForm');
-        if (!form) return null;
-        var data = [];
-        form.querySelectorAll('input,textarea,select').forEach(function(el) {
-            if (!el.name) return;
-            if ((el.type === 'checkbox' || el.type === 'radio') && !el.checked) return;
-            data.push([el.name, el.value || '']);
-        });
-        data.push(['__action__', form.action || '']);
-        return data;
-    """)
-
-    if not form_data:
-        print("  ✗ Could not extract form data")
-        return None
-
-    form_dict = {}
-    form_action = driver.current_url
-    for pair in form_data:
-        if pair[0] == '__action__':
-            if pair[1]: form_action = pair[1]
-        else:
-            form_dict[pair[0]] = pair[1]
-
-    # Ensure our filled values are in the POST
-    form_dict['PostingTitle'] = title
-    form_dict['PostingBody'] = description
-    form_dict['geographic_area'] = city_name
-    if zip_code and re.match(r'^\d{5,6}$', zip_code):
-        form_dict['postal'] = zip_code
-    else:
-        form_dict.pop('postal', None)  # Don't send invalid/empty postal
-    if cl_email:
-        form_dict['FromEMail'] = cl_email
-
-    # Price: set in whichever field CL uses, AND always include 'price' as fallback
-    price_set = False
-    for pf in ['price', 'AskingPrice', 'AskPrice']:
-        if pf in form_dict:
-            form_dict[pf] = price
-            price_set = True
-    if not price_set:
-        form_dict['price'] = price  # Always include price
-
-    # Privacy field: CL requires 'C' (contact by email only) — preserve if already set
-    if 'Privacy' not in form_dict:
-        form_dict['Privacy'] = 'C'
-
-    # Language: preserve whatever the form has; default to English (5) if missing
-    if 'language' not in form_dict:
-        form_dict['language'] = '5'
-
-    # Only include phone-related checkboxes if a phone number is actually provided
-    contact_phone = (product.get("phone") or product.get("contact_phone") or
-                     os.environ.get("CL_PHONE", "")).strip()
-    if contact_phone:
-        form_dict['contact_phone_ok'] = '1'
-        form_dict['contact_text_ok'] = '1'
-        form_dict['show_phone_ok'] = '1'
-        form_dict['contact_phone'] = contact_phone
-    else:
-        # Explicitly remove all phone fields so CL doesn't require a number
-        for pf in ['contact_phone_ok', 'contact_text_ok', 'show_phone_ok',
-                   'contact_phone', 'contact_phone_extension', 'contact_name']:
-            form_dict.pop(pf, None)
-
-    # Non-phone optional checkboxes — safe to include
-    for cb in ['crypto_currency_ok', 'delivery_available', 'see_my_other',
-               'show_address_ok', 'save_contact_preferences']:
-        form_dict[cb] = '1'
-
-    # Remove empty optional fields that confuse CL's validator
-    for optional in ['xstreet0', 'xstreet1', 'city',
-                     'sale_manufacturer', 'sale_model', 'sale_size', 'condition']:
-        form_dict.pop(optional, None)
-
-    # For non-US accounts (e.g. Chandigarh), postal/ZIP may not be needed or uses local format
-    # If zip_code looks non-US (not 5 digits), remove it to avoid CL's ZIP validator
-    if zip_code and not re.match(r'^\d{5}$', zip_code):
-        form_dict.pop('postal', None)
-    elif not zip_code:
-        form_dict.pop('postal', None)
-
-    try:
-        for btn in driver.find_elements(By.CSS_SELECTOR,
-                "button.go, button[type='submit'], input[type='submit']"):
-            btn_name = (btn.get_attribute("name") or "").strip()
-            if btn_name:
-                form_dict[btn_name] = (
-                    btn.get_attribute("value") or btn.text or "continue").strip()
-                break
-    except Exception:
-        pass
-
-    print(f"  [post] {len(form_dict)} fields → {form_action}")
-    print(f"  [post] postal={form_dict.get('postal')} title={form_dict.get('PostingTitle','')[:25]}")
-    print(f"  [post] cryptedStepCheck={form_dict.get('cryptedStepCheck','')[:20]}...")
-    # Print every field name and value so we can see exactly what's being sent
-    for k, v in sorted(form_dict.items()):
-        print(f"  [post-field] {k}={str(v)[:50]}")
-
-    print("  [submit] Attempting form submission (multi-strategy)...")
-
-    if not _fields_ok_for_submit(driver):
-        print("  [submit] Required fields empty/invalid — attempting refill before Continue")
-        _verify_and_refill(driver, _field_map)
-        _patch_entire_form(driver)
-
-    # Diagnostic: show what submit buttons are available
-    try:
-        btns = driver.find_elements(By.CSS_SELECTOR, "button, input[type='submit']")
-        for b in btns:
-            btype = b.get_attribute('type') or ''
-            bcls = b.get_attribute('class') or ''
-            btxt = (b.text or b.get_attribute('value') or '')[:30]
-            bdis = b.get_attribute('disabled')
-            print(f"  [btn-scan] type={btype} class={bcls[:30]} text={btxt} disabled={bdis}")
-    except Exception:
-        pass
-
-    # Helper: detect whether submission actually succeeded
-    def _submission_succeeded(wait_secs=15):
-        """
-        Returns True if we've moved past the edit page.
-        CL can redirect to s=images, s=preview, s=confirm, s=success, etc.
-        """
-        deadline = time.time() + wait_secs
-        while time.time() < deadline:
-            url = driver.current_url
-            if "s=edit" not in url:
-                print(f"  [submit] left edit → {url}")
-                return True
-            try:
-                on_images = driver.execute_script("""
-                    return !!(document.getElementById('add_photos_button') ||
-                              document.getElementById('fileInput') ||
-                              document.querySelector('input[type="file"]'));
-                """)
-                if on_images:
-                    print("  [submit] images step detected")
-                    return True
-                form_gone = driver.execute_script(
-                    "return !document.getElementById('postingForm');")
-                if form_gone:
-                    time.sleep(1.5)
-                    if "s=edit" not in driver.current_url:
-                        return True
-            except Exception:
-                pass
-            time.sleep(0.75)
-        return False
-
-    # ── Strategy 0: form.requestSubmit (CL's native handler) ───────────────
-    submitted = False
-    _patch_entire_form(driver)
-    try:
-        result = _native_request_submit(driver)
-        print(f"  [submit] requestSubmit → {result}")
-        if result.get("ok") and _submission_succeeded(12):
-            submitted = True
-            print(f"  ✅ Strategy 0 (requestSubmit) succeeded → {driver.current_url}")
-        elif result.get("ok"):
-            print("  [submit] Strategy 0: still on edit page after requestSubmit")
-    except Exception as e:
-        print(f"  [submit] Strategy 0 failed: {e}")
-
-    # ── Strategy 1: ActionChains real click (most human-like) ──────────────
-    _SUBMIT_SEL = (
-        "button.go:not([disabled]), "
-        "button.continue:not([disabled]), "
-        "button[type='submit']:not([disabled]), "
-        "button.pickbutton:not([disabled]), "
-        "input[type='submit']:not([disabled])"
-    )
-    def _try_click_submit_buttons():
-        """Try clicking all submit buttons, return True if any navigation occurs."""
+        _type_into_field(driver, "[name='postal']", zip_code, "ZIP")
+        time.sleep(0.5)
+        # Verify ZIP is still there (CL sometimes clears it) — refill once if needed
         try:
-            all_btns = driver.find_elements(By.CSS_SELECTOR, _SUBMIT_SEL)
+            postal_el = driver.find_element(By.CSS_SELECTOR, "[name='postal']")
+            actual_zip = (postal_el.get_attribute("value") or "").strip()
+            if actual_zip != zip_code:
+                print(f"  [ZIP] Cleared by CL (got '{actual_zip}') — refilling")
+                _type_into_field(driver, "[name='postal']", zip_code, "ZIP-retry")
         except Exception:
-            return False
-        # Try last button first (CL's continue is at page bottom)
-        for btn in reversed(all_btns):
-            try:
-                driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
-                time.sleep(0.4)
-                ActionChains(driver).move_to_element(btn).pause(
-                    random.uniform(0.2, 0.5)).click().perform()
-                time.sleep(2)
-                if "s=edit" not in driver.current_url:
-                    return True
-                # Also try JS click on same button
-                driver.execute_script("arguments[0].click();", btn)
-                time.sleep(2)
-                if "s=edit" not in driver.current_url:
-                    return True
-            except Exception:
-                continue
-        return False
+            pass
+    else:
+        print("  ⚠ No ZIP code — skipping postal field")
 
+    # Description (longest field — type slowly)
+    _type_into_field(driver, "[name='PostingBody']", description, "description")
+    time.sleep(0.5)
+
+    # Email — only if editable (CL often pre-fills from account)
     try:
-        WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, _SUBMIT_SEL))
-        )
-        if not submitted:
-            _patch_entire_form(driver)
-        print("  [submit] ActionChains click sent")
-        if _try_click_submit_buttons() or _submission_succeeded(10):
-            submitted = True
-            print(f"  ✅ Strategy 1 (ActionChains) succeeded → {driver.current_url}")
+        email_el = driver.find_element(By.CSS_SELECTOR, "[name='FromEMail']")
+        if not email_el.get_attribute("disabled") and not email_el.get_attribute("readOnly"):
+            if cl_email:
+                _type_into_field(driver, "[name='FromEMail']", cl_email, "email")
         else:
-            print(f"  [submit] Strategy 1: still on edit page after click")
-    except Exception as e:
-        print(f"  [submit] Strategy 1 failed: {e}")
+            print("  [email] Pre-filled by account (not editable)")
+    except Exception:
+        pass
 
-    # ── Strategy 2: JS click on all buttons ───────────────────────────────
-    if not submitted:
+    time.sleep(0.8)
+
+    # ── Final ZIP check right before submit ────────────────────────────────────
+    if zip_code:
         try:
-            all_btns = driver.find_elements(By.CSS_SELECTOR, _SUBMIT_SEL)
-            for btn in reversed(all_btns):
-                driver.execute_script("arguments[0].click();", btn)
-                time.sleep(3)
+            postal_el = driver.find_element(By.CSS_SELECTOR, "[name='postal']")
+            actual_zip = (postal_el.get_attribute("value") or "").strip()
+            if actual_zip != zip_code:
+                print(f"  [ZIP-final] Still empty/wrong — refilling one last time")
+                ActionChains(driver).move_to_element(postal_el).triple_click(postal_el).perform()
+                time.sleep(0.2)
+                postal_el.send_keys(Keys.DELETE)
+                time.sleep(0.1)
+                for ch in zip_code:
+                    postal_el.send_keys(ch)
+                    time.sleep(0.08)
+                postal_el.send_keys(Keys.TAB)
+                time.sleep(0.4)
+            actual_zip2 = (postal_el.get_attribute("value") or "").strip()
+            print(f"  [ZIP-final] value='{actual_zip2}'")
+        except Exception as e:
+            print(f"  [ZIP-final] check failed: {e}")
+
+    # ── Log field state before submit ─────────────────────────────────────────
+    for fname in ["PostingTitle", "PostingBody", "postal", "price", "FromEMail"]:
+        try:
+            el = driver.find_element(By.CSS_SELECTOR, f"[name='{fname}']")
+            val = (el.get_attribute("value") or "")[:50]
+            invalid = el.get_attribute("aria-invalid")
+            print(f"  [pre-submit] {fname}: '{val}' invalid={invalid}")
+        except Exception:
+            print(f"  [pre-submit] {fname}: NOT FOUND")
+
+    # ── Submit: find the Continue button and click it ─────────────────────────
+    print("  [submit] Clicking Continue button...")
+    submitted = False
+
+    submit_selectors = [
+        "button.go.big-button",
+        "button.go",
+        "button[type='submit']",
+        "input[type='submit']",
+    ]
+
+    for sel in submit_selectors:
+        try:
+            btn = WebDriverWait(driver, 5).until(
+                EC.element_to_be_clickable((By.CSS_SELECTOR, sel)))
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
+            time.sleep(0.5)
+            ActionChains(driver).move_to_element(btn).pause(
+                random.uniform(0.2, 0.5)).click().perform()
+            print(f"  [submit] Clicked '{sel}'")
+            # Wait up to 15s to leave the edit page
+            deadline = time.time() + 15
+            while time.time() < deadline:
                 if "s=edit" not in driver.current_url:
+                    submitted = True
                     break
-            print("  [submit] JS click sent")
-            if _submission_succeeded(10):
-                submitted = True
-                print(f"  ✅ Strategy 2 (JS click) succeeded → {driver.current_url}")
+                time.sleep(0.75)
+            if submitted:
+                break
         except Exception as e:
-            print(f"  [submit] Strategy 2 failed: {e}")
+            print(f"  [submit] {sel} failed: {e}")
+            continue
 
-    # ── Strategy 5: requests POST (always try — server doesn't enforce client autofill flags)
-    if not submitted:
-        print("  [submit] Strategy 5: requests POST with browser cookies...")
-        try:
-            live_dict, live_action = _extract_live_form(driver)
-            post_data = dict(live_dict if live_dict else form_dict)
-            post_url = live_action if live_action else form_action
-            # Inject our field values — server validates these, not the autofill flag
-            for k, v in _field_map.items():
-                if v:
-                    post_data[k] = str(v)
-            # go=continue is required — must be lowercase for CL's server
-            post_data['go'] = 'continue'
-            if live_dict:
-                print(f"  [submit] Strategy 5 using live DOM ({len(post_data)} fields)")
-            session = requests.Session()
-            for cookie in driver.get_cookies():
-                session.cookies.set(cookie['name'], cookie['value'],
-                                    domain=cookie.get('domain', ''))
-            headers = {
-                'Content-Type': 'application/x-www-form-urlencoded',
-                'Referer': driver.current_url,
-                'Origin': 'https://post.craigslist.org',
-                'User-Agent': (
-                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                    'AppleWebKit/537.36 (KHTML, like Gecko) '
-                    'Chrome/124.0.0.0 Safari/537.36'
-                ),
-            }
-            resp = session.post(
-                post_url,
-                data=post_data,
-                headers=headers,
-                allow_redirects=True,
-                timeout=30,
-            )
-            print(f"  [submit] requests POST → {resp.status_code} → {resp.url}")
-            resp_has_form = (
-                'id="postingForm"' in resp.text
-                or "name=\"cryptedStepCheck\"" in resp.text
-            )
-            if resp.status_code == 200 and "s=edit" not in resp.url and not resp_has_form:
-                driver.get(resp.url)
-                time.sleep(3)
-                submitted = True
-                print(f"  ✅ Strategy 5 (requests POST) succeeded → {resp.url}")
+    if submitted:
+        print(f"  ✅ Submitted → {driver.current_url}")
+        return driver.current_url
+
+    # ── Fallback: requests POST using live form data + browser cookies ─────────
+    print("  [submit] Browser click failed — trying requests POST fallback...")
+    try:
+        pairs = driver.execute_script("""
+            var form = document.getElementById('postingForm');
+            if (!form) return null;
+            var data = [];
+            form.querySelectorAll('input,textarea,select').forEach(function(el) {
+                if (!el.name) return;
+                if ((el.type === 'checkbox' || el.type === 'radio') && !el.checked) return;
+                data.push([el.name, el.value || '']);
+            });
+            data.push(['__action__', form.action || '']);
+            return data;
+        """)
+        if not pairs:
+            print("  ✗ Could not extract form data for POST fallback")
+            return None
+
+        form_dict = {}
+        form_action = driver.current_url
+        for pair in pairs:
+            if pair[0] == '__action__':
+                if pair[1]: form_action = pair[1]
             else:
-                err_matches = re.findall(
-                    r'class="[^"]*err[^"]*"[^>]*>([^<]{5,})<', resp.text)
-                if err_matches:
-                    print(f"  [submit] CL error(s): {err_matches[:3]}")
-                print(f"  [submit] Strategy 5 rejected (form still present: {resp_has_form})")
-        except Exception as e:
-            print(f"  [submit] Strategy 5 failed: {e}")
+                form_dict[pair[0]] = pair[1]
 
-    if not submitted:
-        print("  ❌ All submit strategies failed — still on edit page")
-        fail_errs = _form_validation_errors(driver)
-        if fail_errs:
-            print(f"  [submit-fail] visible errors ({len(fail_errs)}):")
-            for err in fail_errs[:5]:
-                print(f"  [submit-fail] {err[:120]}")
-        fail_status = _field_status(driver)
-        for fname, st in fail_status.items():
-            print(f"  [submit-fail] {fname}: value='{st.get('value','')}' "
-                  f"invalid={st.get('invalid')}")
-        print(f"  [submit-fail] missing={_missing_required_fields(driver)}")
-        return None
+        # Override with our values
+        form_dict['PostingTitle'] = title
+        form_dict['PostingBody'] = description
+        form_dict['geographic_area'] = city_name
+        if zip_code and re.match(r'^\d{5}$', zip_code):
+            form_dict['postal'] = zip_code
+        else:
+            form_dict.pop('postal', None)
+        if cl_email:
+            form_dict['FromEMail'] = cl_email
+        form_dict['price'] = price
+        form_dict['Privacy'] = form_dict.get('Privacy', 'C')
+        form_dict['go'] = 'continue'
+        form_dict['language'] = form_dict.get('language', '5')
+        # Remove fields CL rejects if empty
+        for opt in ['xstreet0','xstreet1','city','sale_manufacturer','sale_model',
+                    'sale_size','condition','contact_phone_ok','contact_text_ok',
+                    'show_phone_ok','contact_phone']:
+            form_dict.pop(opt, None)
 
-    print(f"  ✅ Posted successfully → {driver.current_url}")
-    return driver.current_url
+        session = requests.Session()
+        for cookie in driver.get_cookies():
+            session.cookies.set(cookie['name'], cookie['value'],
+                                domain=cookie.get('domain', ''))
+        headers = {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Referer': driver.current_url,
+            'Origin': 'https://post.craigslist.org',
+            'User-Agent': (
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                'AppleWebKit/537.36 (KHTML, like Gecko) '
+                'Chrome/124.0.0.0 Safari/537.36'
+            ),
+        }
+        resp = session.post(form_action, data=form_dict, headers=headers,
+                            allow_redirects=True, timeout=30)
+        print(f"  [submit-fallback] POST → {resp.status_code} → {resp.url}")
+        if resp.status_code == 200 and "s=edit" not in resp.url and 'id="postingForm"' not in resp.text:
+            driver.get(resp.url)
+            time.sleep(2)
+            print(f"  ✅ Fallback POST succeeded → {resp.url}")
+            return resp.url
+        else:
+            errs = re.findall(r'class="[^"]*err[^"]*"[^>]*>([^<]{5,120})<', resp.text)
+            print(f"  ✗ Fallback POST rejected. Errors: {errs[:3]}")
+    except Exception as e:
+        print(f"  ✗ Fallback POST failed: {e}")
+
+    # Final diagnosis
+    print("  ❌ All submit strategies failed")
+    for fname in ["PostingTitle", "PostingBody", "postal", "price"]:
+        try:
+            el = driver.find_element(By.CSS_SELECTOR, f"[name='{fname}']")
+            print(f"  [fail] {fname}='{(el.get_attribute('value') or '')[:40]}' "
+                  f"invalid={el.get_attribute('aria-invalid')}")
+        except Exception:
+            print(f"  [fail] {fname}: NOT FOUND")
+    return None
 
 
 def fill_listing_details(driver, product: dict):
