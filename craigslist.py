@@ -757,27 +757,9 @@ def _autofill_banner_fields(driver):
 
 
 def _prepare_form_for_submit(driver, field_map):
-    """Click label → paste fill → patch React so Continue validation passes."""
-    order = ("PostingTitle", "price", "geographic_area", "postal", "PostingBody", "FromEMail")
-    print("  [prepare] Final user-edit pass before Continue...")
-    for name in order:
-        val = field_map.get(name)
-        try:
-            el = driver.find_element(By.CSS_SELECTOR, f"[name='{name}']")
-        except NoSuchElementException:
-            continue
-        if name == "FromEMail":
-            if not _field_editable(driver, "FromEMail"):
-                _user_nudge_field(driver, name)
-                continue
-            val = val or (el.get_attribute("value") or "").strip()
-        if not val:
-            continue
-        _click_field_label(driver, name)
-        actual = _paste_fill(driver, el, str(val))
-        print(f"  [prepare] {name} → '{actual[:40]}'")
+    """Patch React fiber state only — no re-paste (that corrupts fields on retry)."""
     _patch_entire_form(driver)
-    time.sleep(0.5)
+    time.sleep(0.3)
     ok = _fields_ok_for_submit(driver)
     banner = _autofill_banner_fields(driver)
     print(f"  [prepare] fields_ok={ok} banner_flags={banner}")
@@ -1080,8 +1062,9 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     if not _verify_and_refill(driver, _field_map):
         print("  [verify] Some fields failed verification")
 
-    print("  Clearing CL autofill flags (required before Continue works)...")
-    _prepare_form_for_submit(driver, _field_map)
+    # Patch React fiber state once (no re-paste — that corrupts fields)
+    _patch_entire_form(driver)
+    time.sleep(0.5)
 
     status = _field_status(driver)
     for fname, st in status.items():
@@ -1201,13 +1184,10 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
 
     print("  [submit] Attempting form submission (multi-strategy)...")
 
-    # Final paste + React patch immediately before Continue
-    _prepare_form_for_submit(driver, _field_map)
-
     if not _fields_ok_for_submit(driver):
-        print("  [submit] Required fields empty/invalid — cannot Continue")
-    elif _autofill_banner_fields(driver):
-        print("  [submit] Stale autofill banner visible but DOM fields OK — clicking Continue anyway")
+        print("  [submit] Required fields empty/invalid — attempting refill before Continue")
+        _verify_and_refill(driver, _field_map)
+        _patch_entire_form(driver)
 
     # Diagnostic: show what submit buttons are available
     try:
@@ -1256,8 +1236,6 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     # ── Strategy 0: form.requestSubmit (CL's native handler) ───────────────
     submitted = False
     _patch_entire_form(driver)
-    if not _ensure_fields_intact(driver, _field_map):
-        _prepare_form_for_submit(driver, _field_map)
     try:
         result = _native_request_submit(driver)
         print(f"  [submit] requestSubmit → {result}")
@@ -1266,7 +1244,6 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
             print(f"  ✅ Strategy 0 (requestSubmit) succeeded → {driver.current_url}")
         elif result.get("ok"):
             print("  [submit] Strategy 0: still on edit page after requestSubmit")
-            _ensure_fields_intact(driver, _field_map)
     except Exception as e:
         print(f"  [submit] Strategy 0 failed: {e}")
 
@@ -1309,21 +1286,18 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
         )
         if not submitted:
             _patch_entire_form(driver)
-            _prepare_form_for_submit(driver, _field_map)
         print("  [submit] ActionChains click sent")
         if _try_click_submit_buttons() or _submission_succeeded(10):
             submitted = True
             print(f"  ✅ Strategy 1 (ActionChains) succeeded → {driver.current_url}")
         else:
             print(f"  [submit] Strategy 1: still on edit page after click")
-            _ensure_fields_intact(driver, _field_map)
     except Exception as e:
         print(f"  [submit] Strategy 1 failed: {e}")
 
     # ── Strategy 2: JS click on all buttons ───────────────────────────────
     if not submitted:
         try:
-            _ensure_fields_intact(driver, _field_map)
             all_btns = driver.find_elements(By.CSS_SELECTOR, _SUBMIT_SEL)
             for btn in reversed(all_btns):
                 driver.execute_script("arguments[0].click();", btn)
@@ -1334,23 +1308,22 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
             if _submission_succeeded(10):
                 submitted = True
                 print(f"  ✅ Strategy 2 (JS click) succeeded → {driver.current_url}")
-            else:
-                _ensure_fields_intact(driver, _field_map)
         except Exception as e:
             print(f"  [submit] Strategy 2 failed: {e}")
 
-    # ── Strategy 5: requests POST (always try — DOM may be valid even if banner stale)
+    # ── Strategy 5: requests POST (always try — server doesn't enforce client autofill flags)
     if not submitted:
         print("  [submit] Strategy 5: requests POST with browser cookies...")
         try:
-            _prepare_form_for_submit(driver, _field_map)
-            _patch_entire_form(driver)
             live_dict, live_action = _extract_live_form(driver)
             post_data = dict(live_dict if live_dict else form_dict)
             post_url = live_action if live_action else form_action
+            # Inject our field values — server validates these, not the autofill flag
             for k, v in _field_map.items():
                 if v:
                     post_data[k] = str(v)
+            # go=continue is required — must be lowercase for CL's server
+            post_data['go'] = 'continue'
             if live_dict:
                 print(f"  [submit] Strategy 5 using live DOM ({len(post_data)} fields)")
             session = requests.Session()
