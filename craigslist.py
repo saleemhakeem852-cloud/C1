@@ -176,6 +176,12 @@ def make_driver(proxy_url=None):
         "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     )
+    options.add_experimental_option("prefs", {
+        "credentials_enable_service": False,
+        "profile.password_manager_enabled": False,
+        "autofill.profile_enabled": False,
+        "autofill.credit_card_enabled": False,
+    })
     chromium_bin = _find_binary(
         ["google-chrome", "chromium", "chromium-browser"],
         ["/usr/local/bin/google-chrome", "/usr/bin/chromium", "/usr/bin/chromium-browser"])
@@ -325,40 +331,102 @@ def _react_set_value(driver, element, value):
     return driver.execute_script(_REACT_SET_VALUE_JS, element, str(value)) or ""
 
 
-def _cdp_fill_field(driver, element, value):
-    """Fill via CDP keystrokes — triggers React change detection at engine level."""
-    rect = element.rect
-    x = rect['x'] + rect['width'] / 2
-    y = rect['y'] + rect['height'] / 2
-    for event_type in ('mousePressed', 'mouseReleased'):
-        driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
-            "type": event_type,
-            "x": x, "y": y,
-            "buttons": 1,
-            "button": "left",
-            "clickCount": 1,
-        })
+def _disable_form_autofill(driver):
+    """Tell Chrome and CL not to autofill posting fields."""
+    try:
+        driver.execute_script("""
+            var form = document.getElementById('postingForm');
+            if (!form) return;
+            form.setAttribute('autocomplete', 'off');
+            form.querySelectorAll('input,textarea').forEach(function(el) {
+                el.setAttribute('autocomplete', 'off');
+                el.setAttribute('data-lpignore', 'true');
+                el.setAttribute('data-form-type', 'other');
+            });
+        """)
+    except Exception:
+        pass
+
+
+def _autofilled_field_names(driver):
+    """Field names CL still marks as autofilled (must be user-edited)."""
+    try:
+        return driver.execute_script("""
+            var names = [];
+            var form = document.getElementById('postingForm');
+            if (!form) return names;
+            form.querySelectorAll('input,textarea').forEach(function(el) {
+                if (!el.name) return;
+                var blob = '';
+                var node = el;
+                for (var i = 0; i < 7 && node; i++) {
+                    blob += ' ' + (node.textContent || '');
+                    blob += ' ' + (node.className || '');
+                    blob += ' ' + (node.getAttribute('aria-describedby') || '');
+                    node = node.parentElement;
+                }
+                if (/autofill/i.test(blob)) names.push(el.name);
+            });
+            return [...new Set(names)];
+        """) or []
+    except Exception:
+        return []
+
+
+def _human_nudge_field(element):
+    """Extra keystroke + undo — CL treats the field as manually edited."""
+    element.send_keys(Keys.END)
+    time.sleep(0.06)
+    element.send_keys(" ")
+    time.sleep(0.08)
+    element.send_keys(Keys.BACKSPACE)
+    time.sleep(0.08)
+
+
+def _human_clear_and_type(driver, element, value):
+    """Clear then type char-by-char with real send_keys (not insertText)."""
+    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", element)
+    time.sleep(0.25)
+    try:
+        ActionChains(driver).move_to_element(element).click().perform()
+    except Exception:
+        driver.execute_script("arguments[0].focus(); arguments[0].click();", element)
+    time.sleep(0.2)
+    element.send_keys(Keys.CONTROL + "a")
+    time.sleep(0.08)
+    element.send_keys(Keys.BACKSPACE)
+    time.sleep(0.12)
+    for ch in str(value):
+        element.send_keys(ch)
+        time.sleep(random.uniform(0.05, 0.14))
+    _human_nudge_field(element)
+
+
+def _confirm_prefilled_field(driver, element):
+    """Acknowledge a CL-prefilled value so it is not rejected as autofilled."""
+    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", element)
+    time.sleep(0.2)
+    try:
+        ActionChains(driver).move_to_element(element).click().perform()
+    except Exception:
+        driver.execute_script("arguments[0].focus(); arguments[0].click();", element)
     time.sleep(0.15)
-    # Select all (Control+A on Linux/Windows headless)
-    driver.execute_cdp_cmd("Input.dispatchKeyEvent", {
-        "type": "keyDown", "key": "Control", "code": "ControlLeft", "modifiers": 2,
-    })
-    driver.execute_cdp_cmd("Input.dispatchKeyEvent", {
-        "type": "keyDown", "key": "a", "code": "KeyA", "modifiers": 2,
-    })
-    driver.execute_cdp_cmd("Input.dispatchKeyEvent", {
-        "type": "keyUp", "key": "a", "code": "KeyA", "modifiers": 2,
-    })
-    driver.execute_cdp_cmd("Input.dispatchKeyEvent", {
-        "type": "keyUp", "key": "Control", "code": "ControlLeft",
-    })
-    time.sleep(0.05)
-    for event_type in ('keyDown', 'keyUp'):
-        driver.execute_cdp_cmd("Input.dispatchKeyEvent", {
-            "type": event_type, "key": "Backspace", "code": "Backspace",
-        })
-    driver.execute_cdp_cmd("Input.insertText", {"text": str(value)})
-    time.sleep(0.15)
+    _human_nudge_field(element)
+
+
+def _autofill_fields_from_errors(errs):
+    """Map CL validation messages to field names that need re-typing."""
+    blob = " ".join(errs).lower()
+    names = []
+    if "title" in blob:
+        names.append("PostingTitle")
+    if "zip" in blob or "postal" in blob:
+        names.append("postal")
+    if "description" in blob:
+        names.append("PostingBody")
+    if "email" in blob:
+        names.append("FromEMail")
+    return names
 
 
 def _form_validation_errors(driver):
@@ -398,7 +466,10 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
         return None
 
     handle_captcha_if_present(driver)
-    time.sleep(3)
+    # Let CL finish prefilling account fields before we clear and type
+    time.sleep(4)
+    _disable_form_autofill(driver)
+    time.sleep(0.5)
 
     title = (product.get("title") or product.get("name") or "Quality Item For Sale").strip()
     description = (product.get("description") or (
@@ -411,31 +482,13 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     except Exception:
         price = "1"
 
-    # CL's posting form uses React controlled inputs — DOM .value alone is not enough.
+    # CL rejects fields flagged as "autofilled" — must clear and type with real keystrokes.
     def real_fill(selector, value, use_tab=True):
-        """
-        Fill a React controlled field:
-        1. CDP insertText (engine-level keystrokes — React picks these up)
-        2. React _valueTracker + native setter fallback
-        3. Tab blur so CL runs per-field validation
-        """
         value = str(value)
         try:
             el = WebDriverWait(driver, 8).until(
                 EC.presence_of_element_located((By.CSS_SELECTOR, selector)))
-            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
-            time.sleep(0.3)
-
-            actual = ""
-            try:
-                _cdp_fill_field(driver, el, value)
-                actual = (el.get_attribute("value") or "").strip()
-            except Exception as cdp_err:
-                print(f"  [fill] CDP failed for {selector}: {cdp_err}")
-
-            if actual != value.strip():
-                actual = (_react_set_value(driver, el, value) or "").strip()
-
+            _human_clear_and_type(driver, el, value)
             if use_tab:
                 try:
                     el.send_keys(Keys.TAB)
@@ -443,21 +496,52 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
                     driver.execute_script(
                         "arguments[0].dispatchEvent(new Event('blur',{bubbles:true}));", el)
                 time.sleep(0.35)
-
-            if not actual:
-                actual = (el.get_attribute("value") or value).strip()
-
+            actual = (el.get_attribute("value") or "").strip()
             print(f"  ✓ {selector} = '{actual[:50]}'")
             return actual
         except Exception as e:
             print(f"  ✗ real_fill({selector}): {e}")
             try:
-                _js_fill_field(driver, selector, value)
+                el = driver.find_element(By.CSS_SELECTOR, selector)
+                _react_set_value(driver, el, value)
                 print(f"  ✓ {selector} set via React fallback")
                 return value
             except Exception as e2:
                 print(f"  ✗ React fallback also failed for {selector}: {e2}")
                 return ""
+
+    _field_map = {
+        "PostingTitle": title,
+        "PostingBody": description,
+        "FromEMail": cl_email,
+        "postal": zip_code,
+        "geographic_area": city_name,
+        "price": price,
+    }
+
+    def _retry_autofilled_fields(field_map, reason="", force_names=None):
+        """Re-type fields CL still marks as autofilled."""
+        flagged = list(_autofilled_field_names(driver))
+        if force_names:
+            flagged = list(dict.fromkeys(flagged + list(force_names)))
+        if reason and "autofill" in reason.lower():
+            flagged = list(dict.fromkeys(
+                flagged + ["PostingTitle", "postal", "PostingBody", "FromEMail"]))
+        if not flagged:
+            return
+        print(f"  [autofill] Re-typing flagged fields: {flagged}")
+        for name in flagged:
+            val = field_map.get(name)
+            if not val:
+                continue
+            sel = f"[name='{name}']"
+            try:
+                el = driver.find_element(By.CSS_SELECTOR, sel)
+                _human_clear_and_type(driver, el, val)
+                el.send_keys(Keys.TAB)
+                time.sleep(0.35)
+            except Exception as e:
+                print(f"  [autofill] Could not re-type {name}: {e}")
 
     print("  Filling title...")
     real_fill("[name='PostingTitle']", title, use_tab=True)
@@ -478,7 +562,12 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     try:
         ef = driver.find_element(By.CSS_SELECTOR, "[name='FromEMail']")
         cur = (ef.get_attribute("value") or "").strip()
-        if not cur and cl_email:
+        if cur:
+            print(f"  ✓ [name='FromEMail'] prefilled — confirming")
+            _confirm_prefilled_field(driver, ef)
+            ef.send_keys(Keys.TAB)
+            time.sleep(0.35)
+        elif cl_email:
             real_fill("[name='FromEMail']", cl_email, use_tab=True)
     except NoSuchElementException:
         pass
@@ -507,34 +596,31 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
         print("  ⚠ No ZIP/postal code for this city — skipping postal field")
 
     time.sleep(0.5)
+    # CL most often rejects title + ZIP when still marked autofilled
+    _retry_autofilled_fields(_field_map, force_names=["PostingTitle", "postal"])
     val_errs = _form_validation_errors(driver)
     if val_errs:
-        print(f"  [validate] Errors after fill — re-syncing React state ({len(val_errs)} msg(s))")
+        err_blob = " ".join(val_errs).lower()
+        print(f"  [validate] Errors after fill ({len(val_errs)} msg(s))")
         for err in val_errs[:4]:
             print(f"  [validate] {err[:120]}")
-        _retry_fields = [
-            ("[name='PostingTitle']", title),
-            ("[name='PostingBody']", description),
-            ("[name='FromEMail']", cl_email),
-            ("[name='postal']", zip_code),
-            ("[name='geographic_area']", city_name),
-        ]
-        for price_sel in ["[name='price']", "[name='AskingPrice']", "[name='AskPrice']"]:
-            try:
-                driver.find_element(By.CSS_SELECTOR, price_sel)
-                _retry_fields.append((price_sel, price))
-                break
-            except Exception:
-                continue
-        for sel, val in _retry_fields:
-            if not val:
-                continue
-            try:
-                el = driver.find_element(By.CSS_SELECTOR, sel)
-                _react_set_value(driver, el, val)
-                time.sleep(0.2)
-            except Exception:
-                pass
+        if "autofill" in err_blob:
+            _retry_autofilled_fields(
+                _field_map,
+                reason=err_blob,
+                force_names=_autofill_fields_from_errors(val_errs),
+            )
+        else:
+            for name, val in _field_map.items():
+                if not val:
+                    continue
+                try:
+                    el = driver.find_element(By.CSS_SELECTOR, f"[name='{name}']")
+                    _human_clear_and_type(driver, el, val)
+                    el.send_keys(Keys.TAB)
+                    time.sleep(0.3)
+                except Exception:
+                    pass
         time.sleep(0.8)
         val_errs = _form_validation_errors(driver)
         for err in val_errs[:4]:
