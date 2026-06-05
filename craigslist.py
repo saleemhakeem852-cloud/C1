@@ -1004,7 +1004,7 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     _pr = str(product.get("price", "")).strip().replace("$", "").replace(",", "").replace("Rs", "").strip()
     try:
         price_f = float(_pr) if _pr else 1.0
-        price = str(int(price_f)) if price_f == int(price_f) else str(price_f)
+        price = str(int(round(price_f)))  # always strip decimals, e.g. 1129.99 → "1130"
     except Exception:
         price = "1"
 
