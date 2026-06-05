@@ -176,8 +176,9 @@ def make_driver():
     service = ChromeService(
         executable_path=chromedriver_bin,
         log_output="/tmp/chromedriver.log",
-        service_args=["--allowed-ips=", "--allowed-origins=*"],
     )
+    # ChromeDriver 115+ requires explicit allowed origins in newer builds
+    options.add_argument("--remote-allow-origins=*")
     driver = webdriver.Chrome(service=service, options=options)
     driver.execute_cdp_cmd(
         "Page.addScriptToEvaluateOnNewDocument",
