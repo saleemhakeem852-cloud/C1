@@ -143,15 +143,18 @@ def make_driver():
 
     options = webdriver.ChromeOptions()
     for arg in [
-        "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
-        "--disable-software-rasterizer", "--headless=new", "--window-size=1280,800",
-        "--memory-pressure-off", "--no-zygote", "--disable-setuid-sandbox",
-        "--disable-extensions", "--disable-plugins",
-        "--disable-background-networking", "--disable-default-apps",
-        "--disable-sync", "--disable-translate", "--mute-audio",
-        "--no-first-run", "--no-default-browser-check", "--shm-size=128m",
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--headless=new",
+        "--window-size=1280,800",
+        "--disable-setuid-sandbox",
         "--disable-blink-features=AutomationControlled",
         "--ignore-certificate-errors",
+        "--disable-extensions",
+        "--mute-audio",
+        "--no-first-run",
+        "--shm-size=256m",
     ]:
         options.add_argument(arg)
     fresh_profile = tempfile.mkdtemp(prefix="clblast_chrome_")
