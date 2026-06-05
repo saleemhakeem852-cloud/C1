@@ -160,11 +160,13 @@ def make_driver():
         "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     )
-    # Residential proxy to bypass CL's cloud IP blocks
-    proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
-    if proxy:
-        options.add_argument(f"--proxy-server={proxy}")
-        print(f"  [driver] Using proxy: {proxy.split('@')[-1]}")
+    # Route browser traffic through residential proxy
+    # Use --proxy-server only for web traffic, not for localhost chromedriver
+    proxy_url = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY") or ""
+    if proxy_url:
+        options.add_argument(f"--proxy-server={proxy_url}")
+        options.add_argument("--proxy-bypass-list=localhost,127.0.0.1")
+        print(f"  [driver] Using proxy: {proxy_url.split('@')[-1] if '@' in proxy_url else proxy_url}")
     else:
         print("  [driver] No proxy configured")
 
