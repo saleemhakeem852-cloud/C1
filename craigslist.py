@@ -526,19 +526,15 @@ def _react_clear_autofill_flag(driver, element):
 
 
 def _blur_by_clicking_elsewhere(driver, skip_element):
-    """Blur active field with a real click — no synthetic JS events on the input."""
+    """Blur active field safely — press Tab (moves focus without clicking React inputs)."""
     try:
-        for sel in ("#postingForm label", "[name='price']", "[name='language']"):
-            try:
-                el = driver.find_element(By.CSS_SELECTOR, sel)
-                if el != skip_element:
-                    ActionChains(driver).move_to_element(el).click().perform()
-                    time.sleep(0.2)
-                    return
-            except Exception:
-                continue
+        skip_element.send_keys(Keys.TAB)
+        time.sleep(0.15)
     except Exception:
-        pass
+        try:
+            driver.execute_script("arguments[0].blur();", skip_element)
+        except Exception:
+            pass
 
 
 try:
@@ -634,36 +630,56 @@ def _click_field_label(driver, name):
 def _paste_fill(driver, element, value):
     """Paste via clipboard (xclip on Railway) — CL treats paste as user edit."""
     value = str(value).strip()
+
+    # Step 1: clear existing value via JS native setter (removes 'Rs' prefix etc.)
+    try:
+        driver.execute_script("""
+            var el = arguments[0];
+            var proto = el.tagName === 'TEXTAREA'
+                ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+            var setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+            if (el._valueTracker) el._valueTracker.setValue('zzz');
+            setter.call(el, '');
+        """, element)
+    except Exception:
+        pass
+
+    # Step 2: focus + select-all + delete via keyboard
     _focus_field(driver, element)
     element.send_keys(Keys.CONTROL + "a")
-    time.sleep(0.06)
+    time.sleep(0.08)
     element.send_keys(Keys.DELETE)
-    time.sleep(0.12)
+    time.sleep(0.15)
+
+    # Step 3: paste from clipboard
     filled = False
     if PYPERCLIP_OK:
         try:
             pyperclip.copy(value)
             element.send_keys(Keys.CONTROL + "v")
-            time.sleep(0.35)
-            if (element.get_attribute("value") or "").strip() == value:
+            time.sleep(0.4)
+            actual = (element.get_attribute("value") or "").strip()
+            if actual == value:
                 filled = True
                 print("  [paste] clipboard ok")
+            else:
+                print(f"  [paste] mismatch after paste (got '{actual[:30]}')")
         except Exception as e:
             print(f"  [paste] clipboard failed: {e}")
+
+    # Step 4: fallback to slow send_keys
     if not filled:
+        element.send_keys(Keys.CONTROL + "a")
+        element.send_keys(Keys.DELETE)
+        time.sleep(0.1)
         for ch in value:
             element.send_keys(ch)
-            time.sleep(random.uniform(0.08, 0.14))
-    # Acknowledge edit: backspace + retype last char
-    if value:
-        element.send_keys(Keys.END)
-        time.sleep(0.08)
-        element.send_keys(Keys.BACKSPACE)
-        time.sleep(0.08)
-        element.send_keys(value[-1])
-        time.sleep(0.1)
-    _blur_by_clicking_elsewhere(driver, element)
-    _react_clear_autofill_flag(driver, element)
+            time.sleep(random.uniform(0.07, 0.12))
+
+    # Step 5: Tab away to trigger blur/change (do NOT click other form fields)
+    element.send_keys(Keys.TAB)
+    time.sleep(0.2)
+
     return (element.get_attribute("value") or "").strip()
 
 
@@ -700,8 +716,8 @@ def _user_nudge_field(driver, name):
         time.sleep(0.1)
         el.send_keys(val[-1])
         time.sleep(0.15)
-        _blur_by_clicking_elsewhere(driver, el)
-        _react_clear_autofill_flag(driver, el)
+        el.send_keys(Keys.TAB)
+        time.sleep(0.15)
     except Exception as e:
         print(f"  [nudge] {name}: {e}")
 
@@ -1062,55 +1078,10 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     if not _verify_and_refill(driver, _field_map):
         print("  [verify] Some fields failed verification")
 
-    # ── Click every '• autofilled' anchor in CL's error banner ──────────────
-    # These are React-wired links. Clicking them fires a handler that reissues
-    # cryptedStepCheck with those fields marked as user-edited server-side.
-    # JS .click() does NOT work — must be a real ActionChains mouse event.
-    old_token = driver.execute_script(
-        "var el=document.querySelector('[name=cryptedStepCheck]'); return el?el.value:'';"
-    ) or ""
-    print("  Clearing CL autofill flags (clicking banner links)...")
-    autofill_links = driver.execute_script("""
-        var els = [];
-        document.querySelectorAll('a, button, li, span').forEach(function(el) {
-            var t = (el.textContent || '').trim();
-            if (t.indexOf('\u2022 autofilled') !== -1 || t.toLowerCase() === 'autofilled') {
-                var r = el.getBoundingClientRect();
-                if (r.width > 0 && r.height > 0) els.push(el);
-            }
-        });
-        return els;
-    """) or []
-    if autofill_links:
-        print(f"  [autofill] Found {len(autofill_links)} autofill link(s) — clicking each")
-        for link in autofill_links:
-            try:
-                driver.execute_script("arguments[0].scrollIntoView({block:'center'});", link)
-                time.sleep(0.3)
-                ActionChains(driver).move_to_element(link).pause(
-                    random.uniform(0.15, 0.35)).click().perform()
-                time.sleep(0.5)
-                print(f"  [autofill] clicked: '{(link.text or '').strip()[:40]}'")
-            except Exception as e:
-                print(f"  [autofill] click failed: {e}")
-        # Wait up to 4s for cryptedStepCheck to refresh (server reissues token)
-        deadline = time.time() + 4
-        while time.time() < deadline:
-            new_token = driver.execute_script(
-                "var el=document.querySelector('[name=cryptedStepCheck]'); return el?el.value:'';"
-            ) or ""
-            if new_token and new_token != old_token:
-                print(f"  [autofill] cryptedStepCheck refreshed ✓")
-                break
-            time.sleep(0.4)
-        else:
-            print("  [autofill] token unchanged after clicking — server may not have re-issued")
-        # After clicking autofill links, fields may get cleared — restore them
-        _verify_and_refill(driver, _field_map)
-    else:
-        print("  [autofill] No visible autofill links found in banner")
-
+    # Patch React fiber state once (no re-paste — that corrupts fields)
+    _patch_entire_form(driver)
     time.sleep(0.5)
+
     status = _field_status(driver)
     for fname, st in status.items():
         print(f"  [field] {fname}: value='{st.get('value','')}' "
@@ -1154,7 +1125,7 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     form_dict['PostingTitle'] = title
     form_dict['PostingBody'] = description
     form_dict['geographic_area'] = city_name
-    if zip_code and re.match(r'^\d{5}$', zip_code):
+    if zip_code and re.match(r'^\d{5,6}$', zip_code):
         form_dict['postal'] = zip_code
     else:
         form_dict.pop('postal', None)  # Don't send invalid/empty postal
