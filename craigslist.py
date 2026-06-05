@@ -561,40 +561,103 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     except Exception:
         pass
 
-    print("  [submit] Clicking Craigslist continue/go button...")
+    print("  [submit] Attempting form submission (multi-strategy)...")
+
+    # ── Strategy 1: ActionChains real click (most human-like) ──────────────
+    submitted = False
     try:
         btn = WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((
+            EC.element_to_be_clickable((
                 By.CSS_SELECTOR,
                 "button.go, button.continue, button[type='submit'], button.pickbutton"
             ))
         )
         driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
-        time.sleep(0.5)
-        driver.execute_script("arguments[0].click();", btn)
-        time.sleep(6)
+        time.sleep(0.8)
+        ActionChains(driver).move_to_element(btn).pause(
+            random.uniform(0.3, 0.6)).click().perform()
+        print("  [submit] ActionChains click sent")
+        time.sleep(8)
+        if "s=edit" not in driver.current_url:
+            submitted = True
+            print("  ✅ Strategy 1 (ActionChains) succeeded")
     except Exception as e:
-        print(f"  ✗ Submit button click failed: {e}")
+        print(f"  [submit] Strategy 1 failed: {e}")
+
+    # ── Strategy 2: JS click ───────────────────────────────────────────────
+    if not submitted:
+        try:
+            btn = driver.find_element(
+                By.CSS_SELECTOR,
+                "button.go, button.continue, button[type='submit'], button.pickbutton"
+            )
+            driver.execute_script("arguments[0].click();", btn)
+            print("  [submit] JS click sent")
+            time.sleep(8)
+            if "s=edit" not in driver.current_url:
+                submitted = True
+                print("  ✅ Strategy 2 (JS click) succeeded")
+        except Exception as e:
+            print(f"  [submit] Strategy 2 failed: {e}")
+
+    # ── Strategy 3: JS form.submit() ──────────────────────────────────────
+    if not submitted:
+        try:
+            driver.execute_script(
+                "var f=document.getElementById('postingForm'); if(f) f.submit();"
+            )
+            print("  [submit] form.submit() sent")
+            time.sleep(8)
+            if "s=edit" not in driver.current_url:
+                submitted = True
+                print("  ✅ Strategy 3 (form.submit) succeeded")
+        except Exception as e:
+            print(f"  [submit] Strategy 3 failed: {e}")
+
+    # ── Strategy 4: requests POST using cookies from browser session ───────
+    if not submitted:
+        print("  [submit] Strategy 4: requests POST with browser cookies...")
+        try:
+            session = requests.Session()
+            # Copy all browser cookies into requests session
+            for cookie in driver.get_cookies():
+                session.cookies.set(cookie['name'], cookie['value'],
+                                    domain=cookie.get('domain', ''))
+            headers = {
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'Referer': driver.current_url,
+                'Origin': 'https://post.craigslist.org',
+                'User-Agent': (
+                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                    'AppleWebKit/537.36 (KHTML, like Gecko) '
+                    'Chrome/124.0.0.0 Safari/537.36'
+                ),
+            }
+            resp = session.post(
+                form_action,
+                data=form_dict,
+                headers=headers,
+                allow_redirects=True,
+                timeout=30,
+            )
+            print(f"  [submit] requests POST → {resp.status_code} → {resp.url}")
+            if resp.status_code == 200 and "s=edit" not in resp.url:
+                # Navigate driver to the response URL so publish step works
+                driver.get(resp.url)
+                time.sleep(3)
+                submitted = True
+                print("  ✅ Strategy 4 (requests POST) succeeded")
+            else:
+                print(f"  [submit] Strategy 4 response URL: {resp.url}")
+        except Exception as e:
+            print(f"  [submit] Strategy 4 failed: {e}")
+
+    if not submitted:
+        print("  ❌ All submit strategies failed — still on edit page")
         return None
 
-    # Force validation events after clicking
-    try:
-        driver.execute_script("""
-        document.querySelectorAll('input,textarea,select').forEach(el => {
-            el.dispatchEvent(new Event('input', {bubbles:true}));
-            el.dispatchEvent(new Event('change', {bubbles:true}));
-            el.dispatchEvent(new Event('blur', {bubbles:true}));
-        });
-        """)
-    except Exception:
-        pass
-
-    if "s=edit" not in driver.current_url:
-        print("  ✅ Posted successfully")
-        return driver.current_url
-    else:
-        print("  ❌ Still on edit page")
-        return None
+    print(f"  ✅ Posted successfully → {driver.current_url}")
+    return driver.current_url
 
 
 def fill_listing_details(driver, product: dict):
@@ -617,7 +680,14 @@ def fill_listing_details(driver, product: dict):
         "hyderabad": "", "chennai": "", "kolkata": "", "pune": "",
         "ahmedabad": "", "jaipur": "", "lucknow": "", "surat": "",
     }
-    zip_code = (product.get("zip_code") or product.get("postal_code") or "").strip()
+    # Priority: server-injected > product field > env var > city lookup
+    zip_code = (
+        product.get("_location_zip") or
+        os.environ.get("CL_ZIP") or
+        product.get("zip_code") or
+        product.get("postal_code") or
+        ""
+    ).strip()
     if not zip_code:
         _ck = CL_CITY.lower().replace(" ", "").replace("-", "")
         zip_code = _ZIPS.get(_ck, "")  # Default empty for unknown cities
@@ -634,7 +704,11 @@ def fill_listing_details(driver, product: dict):
         "kolkata": "Kolkata", "pune": "Pune",
     }
     _ck = CL_CITY.lower().replace(" ", "").replace("-", "")
-    city_name = _CITY_NAMES.get(_ck, CL_CITY.title())
+    city_name = (
+        product.get("_location_city") or
+        os.environ.get("CL_CITY_NAME") or
+        _CITY_NAMES.get(_ck, CL_CITY.title())
+    )
 
     cl_email = (os.environ.get("CL_EMAIL") or
                 product.get("contact_email") or product.get("email") or "").strip()
