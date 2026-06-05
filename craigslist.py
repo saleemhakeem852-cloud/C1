@@ -34,7 +34,6 @@ except ImportError:
 
 TWO_CAPTCHA_API_KEY = os.environ.get("TWO_CAPTCHA_KEY", "YOUR_2CAPTCHA_API_KEY")
 LISTINGS_JSON       = "posted_listings.json"
-COOKIES_FILE        = "cl_session_cookies.json"
 CL_CITY             = os.environ.get("CL_CITY", "losangeles")
 IS_FAST_MODE        = os.environ.get("FAST_MODE", "1") == "1"
 IS_RAILWAY          = any(os.path.exists(p) for p in [
@@ -117,35 +116,6 @@ def _save_listings():
         with open(tmp_path, "w") as f:
             json.dump(serialisable, f, indent=2)
         os.replace(tmp_path, LISTINGS_JSON)
-
-def save_cookies(driver):
-    cookies = driver.get_cookies()
-    with open(COOKIES_FILE, "w") as f:
-        json.dump(cookies, f)
-    print(f"  Session cookies saved ({len(cookies)} cookies)")
-
-def load_cookies(driver):
-    if not os.path.exists(COOKIES_FILE):
-        return False
-    try:
-        driver.get("https://accounts.craigslist.org")
-        with open(COOKIES_FILE) as f:
-            cookies = json.load(f)
-        for cookie in cookies:
-            try:
-                driver.add_cookie(cookie)
-            except Exception:
-                pass
-        driver.refresh()
-        time.sleep(3)
-        if "accounts.craigslist.org/login" not in driver.current_url:
-            print("Session restored from saved cookies ✓")
-            return True
-        print("Saved cookies expired.")
-        return False
-    except Exception as e:
-        print(f"Cookie load failed: {e}")
-        return False
 
 def _find_binary(names, fallback_paths):
     import shutil, subprocess
@@ -269,15 +239,52 @@ def handle_captcha_if_present(driver):
         print("  Cloudflare — waiting 8s…")
         time.sleep(8)
 
+COOKIES_FILE = "cl_session_cookies.json"
+
+def save_cookies(driver):
+    cookies = driver.get_cookies()
+    with open(COOKIES_FILE, "w") as f:
+        json.dump(cookies, f)
+    print(f"  Session cookies saved ({len(cookies)} cookies)")
+
+def load_cookies(driver):
+    if not os.path.exists(COOKIES_FILE):
+        return False
+    try:
+        driver.get("https://accounts.craigslist.org")
+        time.sleep(2)
+        with open(COOKIES_FILE) as f:
+            cookies = json.load(f)
+        for cookie in cookies:
+            try:
+                driver.add_cookie(cookie)
+            except Exception:
+                pass
+        driver.refresh()
+        time.sleep(3)
+        if "accounts.craigslist.org/login" not in driver.current_url:
+            print("Session restored from saved cookies ✓")
+            return True
+        print("Saved cookies expired — need fresh login.")
+        return False
+    except Exception as e:
+        print(f"Cookie load failed: {e}")
+        return False
+
 def craigslist_login(driver, email, password):
-    # Try saved cookies first
+    # Try saved cookies first — skips login entirely if session still valid
     if load_cookies(driver):
         return True
 
-    # No valid session — do fresh login
+    # Fresh login — email only (CL removed password login)
     driver.get("https://accounts.craigslist.org/login")
     human_delay(2, 4)
     handle_captcha_if_present(driver)
+
+    print(f"Login page title: {driver.title}")
+    print(f"Login page URL: {driver.current_url}")
+    print(f"Page source preview: {driver.page_source[:300]}")
+
     try:
         ef = WebDriverWait(driver, 15).until(
             EC.presence_of_element_located((By.ID, "inputEmailHandle")))
@@ -285,7 +292,7 @@ def craigslist_login(driver, email, password):
         human_delay()
         btn = driver.find_element(By.CSS_SELECTOR, "button[type='submit']")
         safe_click(driver, btn)
-        print(f"Magic link sent to {email} — waiting up to 3 minutes (check your email and click the link)...")
+        print(f"Magic link sent to {email} — waiting up to 3 minutes (check inbox and click the link)...")
         deadline = time.time() + 180
         while time.time() < deadline:
             time.sleep(3)
@@ -298,6 +305,8 @@ def craigslist_login(driver, email, password):
         return False
     except TimeoutException:
         print("Login failed — could not find login form.")
+        print(f"Page title was: {driver.title}")
+        print(f"Page URL was: {driver.current_url}")
         return False
 
 def click_relocation_if_needed(driver, ad_name):
@@ -925,11 +934,10 @@ def update_ad_analytics_periodically():
 def main():
     global CL_CITY
     email    = os.environ.get("CL_EMAIL", "").strip()
-    password = os.environ.get("CL_PASSWORD", "").strip()
+    password = ""  # CL no longer uses password login
     if not email:
         print("✗ CL_EMAIL environment variable not set. Add it to Railway Variables.")
         return
-    # password is optional for Craigslist
     CL_CITY  = os.environ.get("CL_CITY", CL_CITY)
     _load_existing_listings()
 
