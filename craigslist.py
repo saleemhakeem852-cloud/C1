@@ -204,7 +204,19 @@ def make_driver(proxy_url=None):
     )
     # ChromeDriver 115+ requires explicit allowed origins in newer builds
     options.add_argument("--remote-allow-origins=*")
-    driver = webdriver.Chrome(service=service, options=options)
+    try:
+        import undetected_chromedriver as uc
+        driver = uc.Chrome(
+            options=options,
+            driver_executable_path=chromedriver_bin,
+            browser_executable_path=chromium_bin,
+            headless=True,
+            use_subprocess=True,
+        )
+        print("  [driver] Using undetected-chromedriver")
+    except Exception as uc_err:
+        print(f"  [driver] undetected-chromedriver unavailable ({uc_err}), using stock Chrome")
+        driver = webdriver.Chrome(service=service, options=options)
     driver.execute_cdp_cmd(
         "Page.addScriptToEvaluateOnNewDocument",
         {"source": "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"}
@@ -356,101 +368,65 @@ _FILLABLE_FIELDS = frozenset({
 })
 
 
-def _cdp_click_element(driver, element):
-    rect = element.rect
-    x = rect['x'] + rect['width'] / 2
-    y = rect['y'] + rect['height'] / 2
-    for event_type in ('mousePressed', 'mouseReleased'):
-        driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
-            "type": event_type,
-            "x": x, "y": y,
-            "buttons": 1,
-            "button": "left",
-            "clickCount": 1,
-        })
-
-
-def _cdp_key(driver, key, *, code=None, text=None, key_up=True, modifiers=0):
-    down = {"type": "keyDown", "key": key, "modifiers": modifiers}
-    if code:
-        down["code"] = code
-    if text:
-        down["text"] = text
-        down["unmodifiedText"] = text
-    driver.execute_cdp_cmd("Input.dispatchKeyEvent", down)
-    if key_up:
-        driver.execute_cdp_cmd("Input.dispatchKeyEvent", {
-            "type": "keyUp", "key": key, "modifiers": modifiers,
-        })
-
-
-def _cdp_clear_and_type(driver, element, value):
-    """Type via CDP key events — trusted keystrokes React/CL accept as user input."""
+def _focus_field(driver, element):
     driver.execute_script("arguments[0].scrollIntoView({block:'center'});", element)
-    time.sleep(0.25)
-    _cdp_click_element(driver, element)
     time.sleep(0.2)
-    _cdp_key(driver, "Control", code="ControlLeft", key_up=False, modifiers=0)
-    _cdp_key(driver, "a", code="KeyA", text="a", modifiers=2)
-    _cdp_key(driver, "Control", code="ControlLeft", modifiers=0)
+    try:
+        ActionChains(driver).move_to_element(element).pause(
+            random.uniform(0.1, 0.3)).click().perform()
+    except Exception:
+        driver.execute_script("arguments[0].focus(); arguments[0].click();", element)
+    time.sleep(0.25)
+
+
+def _type_with_send_keys(driver, element, value):
+    """Type with real send_keys — works reliably in headless Chromium."""
+    driver.execute_script("""
+        var el = arguments[0];
+        if (el._valueTracker) { el._valueTracker.setValue(''); }
+    """, element)
+    element.send_keys(Keys.CONTROL + "a")
     time.sleep(0.06)
-    _cdp_key(driver, "Backspace", code="Backspace")
+    element.send_keys(Keys.DELETE)
     time.sleep(0.1)
     for ch in str(value):
-        _cdp_key(driver, ch, text=ch)
-        time.sleep(random.uniform(0.06, 0.16))
-    driver.execute_script("""
-        var el = arguments[0];
-        el.dispatchEvent(new Event('change', {bubbles: true}));
-        el.dispatchEvent(new Event('blur',   {bubbles: true}));
-    """, element)
+        element.send_keys(ch)
+        time.sleep(random.uniform(0.04, 0.11))
 
 
-def _edit_in_place(driver, element):
-    """Tiny manual edit at end-of-field — CL requires this for autofilled fields."""
-    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", element)
-    time.sleep(0.2)
-    _cdp_click_element(driver, element)
-    time.sleep(0.15)
-    _cdp_key(driver, "End", code="End")
-    time.sleep(0.08)
-    _cdp_key(driver, "a", code="KeyA", text="a")
-    time.sleep(0.08)
-    _cdp_key(driver, "Backspace", code="Backspace")
+def _reliable_fill(driver, element, value):
+    """Focus, type with send_keys, sync React state, blur."""
+    _focus_field(driver, element)
+    _type_with_send_keys(driver, element, value)
     time.sleep(0.1)
-    driver.execute_script("""
-        var el = arguments[0];
-        el.dispatchEvent(new Event('input',  {bubbles: true}));
-        el.dispatchEvent(new Event('change', {bubbles: true}));
-        el.dispatchEvent(new Event('blur',   {bubbles: true}));
-    """, element)
+    _react_set_value(driver, element, value)
+    time.sleep(0.1)
+    element.send_keys(Keys.TAB)
+    time.sleep(0.3)
 
 
-def _human_clear_and_type(driver, element, value):
-    """Clear then type — CDP first, send_keys fallback."""
+def _ensure_field_value(driver, name, expected):
+    """Re-fill if DOM value does not match expected (fixes corrupted fields)."""
+    expected = str(expected).strip()
+    if not expected:
+        return True
     try:
-        _cdp_clear_and_type(driver, element, value)
-    except Exception as cdp_err:
-        print(f"  [fill] CDP type failed, using send_keys: {cdp_err}")
-        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", element)
-        time.sleep(0.25)
-        try:
-            ActionChains(driver).move_to_element(element).click().perform()
-        except Exception:
-            driver.execute_script("arguments[0].focus(); arguments[0].click();", element)
-        time.sleep(0.2)
-        element.send_keys(Keys.CONTROL + "a")
-        time.sleep(0.08)
-        element.send_keys(Keys.BACKSPACE)
-        time.sleep(0.12)
-        for ch in str(value):
-            element.send_keys(ch)
-            time.sleep(random.uniform(0.05, 0.14))
-
-
-def _confirm_prefilled_field(driver, element):
-    """Acknowledge a CL-prefilled value with an in-place edit."""
-    _edit_in_place(driver, element)
+        el = driver.find_element(By.CSS_SELECTOR, f"[name='{name}']")
+        actual = (el.get_attribute("value") or "").strip()
+        if actual == expected:
+            return True
+        print(f"  [fix] {name}: got '{actual[:40]}' want '{expected[:40]}'")
+        _focus_field(driver, el)
+        _type_with_send_keys(driver, el, expected)
+        _react_set_value(driver, el, expected)
+        actual = (el.get_attribute("value") or "").strip()
+        ok = actual == expected
+        if not ok:
+            print(f"  [fix] {name}: still '{actual[:40]}' after retry")
+        return ok
+    except Exception as e:
+        print(f"  [fix] {name}: {e}")
+        return False
 
 
 def _autofill_fields_from_errors(errs):
@@ -466,13 +442,6 @@ def _autofill_fields_from_errors(errs):
     if "email" in blob:
         names.append("FromEMail")
     return names
-
-
-def _fill_and_confirm(driver, element, value):
-    """CDP keystroke fill, then in-place edit so CL clears the autofilled flag."""
-    _human_clear_and_type(driver, element, value)
-    time.sleep(0.15)
-    _edit_in_place(driver, element)
 
 
 def _form_validation_errors(driver):
@@ -528,13 +497,16 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     except Exception:
         price = "1"
 
-    # CL rejects fields flagged as "autofilled" — must clear and type with real keystrokes.
     def real_fill(selector, value, use_tab=True):
-        value = str(value)
+        value = str(value).strip()
+        if not value:
+            return ""
         try:
             el = WebDriverWait(driver, 8).until(
                 EC.presence_of_element_located((By.CSS_SELECTOR, selector)))
-            _fill_and_confirm(driver, el, value)
+            _focus_field(driver, el)
+            _type_with_send_keys(driver, el, value)
+            _react_set_value(driver, el, value)
             if use_tab:
                 try:
                     el.send_keys(Keys.TAB)
@@ -542,19 +514,22 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
                     driver.execute_script(
                         "arguments[0].dispatchEvent(new Event('blur',{bubbles:true}));", el)
                 time.sleep(0.35)
+            else:
+                driver.execute_script(
+                    "arguments[0].dispatchEvent(new Event('blur',{bubbles:true}));", el)
+                time.sleep(0.2)
             actual = (el.get_attribute("value") or "").strip()
+            if actual != value:
+                print(f"  ⚠ {selector} mismatch — retrying")
+                _focus_field(driver, el)
+                _type_with_send_keys(driver, el, value)
+                _react_set_value(driver, el, value)
+                actual = (el.get_attribute("value") or "").strip()
             print(f"  ✓ {selector} = '{actual[:50]}'")
             return actual
         except Exception as e:
             print(f"  ✗ real_fill({selector}): {e}")
-            try:
-                el = driver.find_element(By.CSS_SELECTOR, selector)
-                _react_set_value(driver, el, value)
-                print(f"  ✓ {selector} set via React fallback")
-                return value
-            except Exception as e2:
-                print(f"  ✗ React fallback also failed for {selector}: {e2}")
-                return ""
+            return ""
 
     _field_map = {
         "PostingTitle": title,
@@ -565,29 +540,21 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
         "price": price,
     }
 
-    def _retry_fields(field_map, names, in_place=False):
+    def _retry_fields(field_map, names):
         """Re-fill only whitelisted text fields (never hidden/checkbox names)."""
         todo = [n for n in dict.fromkeys(names) if n in _FILLABLE_FIELDS]
         if not todo:
             return
-        print(f"  [autofill] Re-editing fields: {todo}")
+        print(f"  [retry] Re-filling fields: {todo}")
         for name in todo:
             val = field_map.get(name)
             if not val:
                 continue
             try:
                 el = driver.find_element(By.CSS_SELECTOR, f"[name='{name}']")
-                if in_place:
-                    _edit_in_place(driver, el)
-                else:
-                    _fill_and_confirm(driver, el, val)
-                try:
-                    el.send_keys(Keys.TAB)
-                except Exception:
-                    pass
-                time.sleep(0.4)
+                _reliable_fill(driver, el, val)
             except Exception as e:
-                print(f"  [autofill] Could not re-edit {name}: {e}")
+                print(f"  [retry] Could not re-fill {name}: {e}")
 
     print("  Filling title...")
     real_fill("[name='PostingTitle']", title, use_tab=True)
@@ -605,18 +572,8 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
             continue
 
     print("  Filling email...")
-    try:
-        ef = driver.find_element(By.CSS_SELECTOR, "[name='FromEMail']")
-        cur = (ef.get_attribute("value") or "").strip()
-        if cur:
-            print(f"  ✓ [name='FromEMail'] prefilled — confirming")
-            _confirm_prefilled_field(driver, ef)
-            ef.send_keys(Keys.TAB)
-            time.sleep(0.35)
-        elif cl_email:
-            real_fill("[name='FromEMail']", cl_email, use_tab=True)
-    except NoSuchElementException:
-        pass
+    if cl_email:
+        real_fill("[name='FromEMail']", cl_email, use_tab=True)
 
     print("  Filling geographic_area...")
     try:
@@ -641,37 +598,25 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     else:
         print("  ⚠ No ZIP/postal code for this city — skipping postal field")
 
-    print("  Confirming title, description, ZIP (in-place edits)...")
-    for confirm_name in ("PostingTitle", "PostingBody", "postal"):
-        if not _field_map.get(confirm_name):
-            continue
-        try:
-            el = driver.find_element(By.CSS_SELECTOR, f"[name='{confirm_name}']")
-            _edit_in_place(driver, el)
-            time.sleep(0.35)
-        except Exception as e:
-            print(f"  [autofill] Confirm {confirm_name}: {e}")
+    print("  Verifying field values...")
+    for fname, fval in _field_map.items():
+        if fval:
+            _ensure_field_value(driver, fname, fval)
 
     time.sleep(0.5)
     val_errs = _form_validation_errors(driver)
     if val_errs:
-        err_blob = " ".join(val_errs).lower()
         print(f"  [validate] Errors after fill ({len(val_errs)} msg(s))")
         for err in val_errs[:4]:
             print(f"  [validate] {err[:120]}")
         err_fields = _autofill_fields_from_errors(val_errs)
-        if "autofill" in err_blob:
-            # In-place edit first (CL rejects wipe-and-replace on autofilled fields)
-            _retry_fields(_field_map, err_fields, in_place=True)
-            time.sleep(0.6)
-            val_errs = _form_validation_errors(driver)
-            if val_errs and "autofill" in " ".join(val_errs).lower():
-                _retry_fields(_field_map, err_fields, in_place=False)
-        elif err_fields:
-            _retry_fields(_field_map, err_fields, in_place=False)
-        else:
-            _retry_fields(_field_map, list(_field_map), in_place=False)
+        if not err_fields:
+            err_fields = list(_field_map.keys())
+        _retry_fields(_field_map, err_fields)
         time.sleep(0.8)
+        for fname, fval in _field_map.items():
+            if fval:
+                _ensure_field_value(driver, fname, fval)
         val_errs = _form_validation_errors(driver)
         for err in val_errs[:4]:
             print(f"  [validate] Still visible: {err[:120]}")
