@@ -470,43 +470,139 @@ def _focus_field(driver, element):
     time.sleep(0.25)
 
 
-def _human_fill(driver, element, value, use_tab=True):
-    """Fill with trusted send_keys only — CL rejects JS-synthesized InputEvents on submit."""
-    value = str(value).strip()
+def _backspace_clear(driver, element):
+    """Clear field with individual backspaces — React/CL track these as real edits."""
     _focus_field(driver, element)
-    element.send_keys(Keys.CONTROL + "a")
-    time.sleep(0.08)
-    element.send_keys(Keys.DELETE)
-    time.sleep(0.12)
+    current = element.get_attribute("value") or ""
+    for _ in range(len(current) + 5):
+        element.send_keys(Keys.BACKSPACE)
+        time.sleep(0.04)
+    time.sleep(0.15)
+
+
+def _click_field_by_name(driver, name):
+    """Click the label/row for a field so CL registers focus on account-prefilled inputs."""
+    try:
+        driver.execute_script("""
+            var name = arguments[0];
+            var el = document.querySelector('[name="'+name+'"]');
+            if (!el) return false;
+            var row = el.closest('li, .formrow, .form-row, .field, p, div');
+            if (row) {
+                var label = row.querySelector('label');
+                if (label) { label.click(); return true; }
+            }
+            el.click();
+            return true;
+        """, name)
+        time.sleep(0.3)
+    except Exception:
+        pass
+
+
+def _fields_with_autofill_errors(driver):
+    """Field names CL still marks as account-autofilled (must be manually edited)."""
+    try:
+        return driver.execute_script("""
+            var names = [];
+            var form = document.getElementById('postingForm');
+            if (!form) return names;
+            function add(n) { if (n && names.indexOf(n) === -1) names.push(n); }
+            form.querySelectorAll('input,textarea').forEach(function(el) {
+                if (!el.name) return;
+                var p = el.closest('li, .formrow, .form-row, .field') || el.parentElement;
+                for (var i = 0; i < 8 && p; i++) {
+                    var blob = (p.textContent || '').toLowerCase();
+                    if (blob.indexOf('autofill') !== -1) { add(el.name); break; }
+                    p = p.parentElement;
+                }
+            });
+            form.querySelectorAll('.err, .error, li, span, p, a, button').forEach(function(el) {
+                var t = (el.textContent || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                if (t.indexOf('autofill') === -1 || t.length > 80) return;
+                if (t.indexOf('title') !== -1) add('PostingTitle');
+                if (t.indexOf('zip') !== -1 || t.indexOf('postal') !== -1) add('postal');
+                if (t.indexOf('description') !== -1) add('PostingBody');
+                if (t.indexOf('email') !== -1) add('FromEMail');
+            });
+            return names;
+        """) or []
+    except Exception:
+        return []
+
+
+def _human_fill(driver, element, value, use_tab=False):
+    """Type value with backspace clear + slow keystrokes. No Ctrl+A (CL flags it)."""
+    value = str(value).strip()
+    _backspace_clear(driver, element)
     for ch in value:
         element.send_keys(ch)
-        time.sleep(random.uniform(0.08, 0.16))
+        time.sleep(random.uniform(0.10, 0.20))
     if use_tab:
         element.send_keys(Keys.TAB)
     else:
-        driver.execute_script("arguments[0].blur();", element)
-    time.sleep(0.35)
+        driver.execute_script(
+            "arguments[0].dispatchEvent(new Event('change',{bubbles:true}));"
+            "arguments[0].blur();", element)
+    time.sleep(0.4)
     return (element.get_attribute("value") or "").strip()
 
 
-def _nudge_field(driver, name):
-    """Tiny real keystroke edit so CL clears account-autofill flags."""
-    try:
-        el = driver.find_element(By.CSS_SELECTOR, f"[name='{name}']")
-        _focus_field(driver, el)
-        val = (el.get_attribute("value") or "").strip()
+def _resolve_autofill_errors(driver, field_map, max_rounds=6):
+    """
+    CL blocks submit while account-prefilled fields show 'autofilled'.
+    Re-type each flagged field until errors clear.
+    """
+    for round_num in range(1, max_rounds + 1):
+        flagged = _fields_with_autofill_errors(driver)
+        missing = _missing_required_fields(driver)
+        if not flagged and not missing:
+            print(f"  [autofill] cleared after {round_num - 1} retype round(s)")
+            return True
+
+        targets = list(dict.fromkeys(flagged + [m.split(":")[0] for m in missing]))
+        print(f"  [autofill] round {round_num}: retyping {targets}")
+        for name in targets:
+            val = field_map.get(name)
+            if not val:
+                continue
+            try:
+                _click_field_by_name(driver, name)
+                el = driver.find_element(By.CSS_SELECTOR, f"[name='{name}']")
+                actual = _human_fill(driver, el, val, use_tab=False)
+                print(f"  [autofill] {name} → '{actual[:40]}'")
+            except Exception as e:
+                print(f"  [autofill] {name} failed: {e}")
+
+        time.sleep(0.6)
+        errs = _form_validation_errors(driver)
+        still_flagged = _fields_with_autofill_errors(driver)
+        still_missing = _missing_required_fields(driver)
+        print(f"  [autofill] after round {round_num}: "
+              f"flagged={still_flagged} missing={still_missing} errors={len(errs)}")
+        if not still_flagged and not still_missing:
+            return True
+
+    return not _fields_with_autofill_errors(driver) and not _missing_required_fields(driver)
+
+
+def _ensure_fields_intact(driver, field_map):
+    """Re-fill any fields CL cleared during a failed submit attempt."""
+    missing = _missing_required_fields(driver)
+    if not missing:
+        return True
+    print(f"  [repair] Restoring cleared fields: {missing}")
+    for item in missing:
+        name = item.split(":")[0]
+        val = field_map.get(name)
         if not val:
-            return
-        el.send_keys(Keys.END)
-        time.sleep(0.1)
-        el.send_keys(Keys.BACKSPACE)
-        time.sleep(0.1)
-        el.send_keys(val[-1])
-        time.sleep(0.1)
-        el.send_keys(Keys.TAB)
-        time.sleep(0.25)
-    except Exception as e:
-        print(f"  [nudge] {name}: {e}")
+            continue
+        try:
+            el = driver.find_element(By.CSS_SELECTOR, f"[name='{name}']")
+            _human_fill(driver, el, val, use_tab=False)
+        except Exception as e:
+            print(f"  [repair] {name}: {e}")
+    return not _missing_required_fields(driver)
 
 
 def _missing_required_fields(driver):
@@ -675,7 +771,7 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     except Exception:
         price = "1"
 
-    def real_fill(selector, value, use_tab=True):
+    def real_fill(selector, value, use_tab=False):
         value = str(value).strip()
         if not value:
             return ""
@@ -698,30 +794,36 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
         "price": price,
     }
 
-    # Simple fill order — same approach that worked on older CL forms
+    # Account-prefilled fields first — CL requires manual edit on email/ZIP before submit
+    print("  Filling email...")
+    if cl_email:
+        real_fill("[name='FromEMail']", cl_email, use_tab=False)
+
+    print("  Filling postal...")
+    if zip_code:
+        real_fill("[name='postal']", zip_code, use_tab=False)
+    else:
+        print("  ⚠ No ZIP/postal code for this city — skipping postal field")
+
     print("  Filling title...")
-    real_fill("[name='PostingTitle']", title, use_tab=True)
+    real_fill("[name='PostingTitle']", title, use_tab=False)
 
     print("  Filling description...")
-    real_fill("[name='PostingBody']", description, use_tab=True)
+    real_fill("[name='PostingBody']", description, use_tab=False)
 
     print("  Filling price...")
     for price_sel in ["[name='price']", "[name='AskingPrice']", "[name='AskPrice']"]:
         try:
             driver.find_element(By.CSS_SELECTOR, price_sel)
-            real_fill(price_sel, price, use_tab=True)
+            real_fill(price_sel, price, use_tab=False)
             break
         except Exception:
             continue
 
-    print("  Filling email...")
-    if cl_email:
-        real_fill("[name='FromEMail']", cl_email, use_tab=True)
-
     print("  Filling geographic_area...")
     try:
         driver.find_element(By.CSS_SELECTOR, "[name='geographic_area']")
-        real_fill("[name='geographic_area']", city_name, use_tab=True)
+        real_fill("[name='geographic_area']", city_name, use_tab=False)
     except NoSuchElementException:
         pass
 
@@ -732,32 +834,18 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     except Exception:
         pass
 
-    print("  Filling postal...")
-    if zip_code:
-        real_fill("[name='postal']", zip_code, use_tab=False)
-    else:
-        print("  ⚠ No ZIP/postal code for this city — skipping postal field")
-
-    print("  Nudging autofill-sensitive fields...")
-    for nudge_name in ("PostingTitle", "PostingBody", "postal", "FromEMail"):
-        _nudge_field(driver, nudge_name)
+    print("  Resolving CL autofill flags...")
+    if not _resolve_autofill_errors(driver, _field_map):
+        print("  [autofill] Could not clear all autofill flags — aborting submit")
+        val_errs = _form_validation_errors(driver)
+        for err in val_errs[:5]:
+            print(f"  [validate] {err[:120]}")
+        return None
 
     status = _field_status(driver)
     for fname, st in status.items():
         print(f"  [field] {fname}: value='{st.get('value','')}' "
               f"invalid={st.get('invalid')} autofilled={st.get('autofilled')}")
-
-    missing = _missing_required_fields(driver)
-    if missing:
-        print(f"  [validate] DOM missing/empty: {missing}")
-        for item in missing:
-            if ":not-found" in item or ":empty" in item:
-                fname = item.split(":")[0]
-                val = _field_map.get(fname)
-                if val:
-                    print(f"  [validate] Re-filling {fname}...")
-                    real_fill(f"[name='{fname}']", val, use_tab=(fname != "postal"))
-                    _nudge_field(driver, fname)
 
     val_errs = _form_validation_errors(driver)
     print(f"  [validate] visible_errors={len(val_errs)} missing={_missing_required_fields(driver)}")
@@ -918,6 +1006,8 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
 
     # ── Strategy 0: form.requestSubmit (CL's native handler) ───────────────
     submitted = False
+    if not _ensure_fields_intact(driver, _field_map):
+        _resolve_autofill_errors(driver, _field_map, max_rounds=2)
     try:
         result = _native_request_submit(driver)
         print(f"  [submit] requestSubmit → {result}")
@@ -926,6 +1016,7 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
             print(f"  ✅ Strategy 0 (requestSubmit) succeeded → {driver.current_url}")
         elif result.get("ok"):
             print("  [submit] Strategy 0: still on edit page after requestSubmit")
+            _ensure_fields_intact(driver, _field_map)
     except Exception as e:
         print(f"  [submit] Strategy 0 failed: {e}")
 
@@ -966,18 +1057,22 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
         WebDriverWait(driver, 10).until(
             EC.presence_of_element_located((By.CSS_SELECTOR, _SUBMIT_SEL))
         )
+        if not submitted:
+            _ensure_fields_intact(driver, _field_map)
         print("  [submit] ActionChains click sent")
         if _try_click_submit_buttons() or _submission_succeeded(10):
             submitted = True
             print(f"  ✅ Strategy 1 (ActionChains) succeeded → {driver.current_url}")
         else:
             print(f"  [submit] Strategy 1: still on edit page after click")
+            _ensure_fields_intact(driver, _field_map)
     except Exception as e:
         print(f"  [submit] Strategy 1 failed: {e}")
 
     # ── Strategy 2: JS click on all buttons ───────────────────────────────
     if not submitted:
         try:
+            _ensure_fields_intact(driver, _field_map)
             all_btns = driver.find_elements(By.CSS_SELECTOR, _SUBMIT_SEL)
             for btn in reversed(all_btns):
                 driver.execute_script("arguments[0].click();", btn)
@@ -988,85 +1083,63 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
             if _submission_succeeded(10):
                 submitted = True
                 print(f"  ✅ Strategy 2 (JS click) succeeded → {driver.current_url}")
+            else:
+                _ensure_fields_intact(driver, _field_map)
         except Exception as e:
             print(f"  [submit] Strategy 2 failed: {e}")
 
-    # ── Strategy 3: Enter key on focused form field ─────────────────────────
-    if not submitted:
-        try:
-            title_el = WebDriverWait(driver, 8).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "[name='PostingTitle']")))
-            title_el.send_keys(Keys.RETURN)
-            print("  [submit] Enter key sent on title field")
-            if _submission_succeeded(12):
-                submitted = True
-                print(f"  ✅ Strategy 3 (Enter key) succeeded → {driver.current_url}")
-        except Exception as e:
-            print(f"  [submit] Strategy 3 failed: {e}")
-            print(f"  [submit] Strategy 3 URL={driver.current_url}")
-
-    # ── Strategy 4: JS form.submit() ──────────────────────────────────────
-    if not submitted:
-        try:
-            driver.execute_script(
-                "var f=document.getElementById('postingForm'); if(f) f.submit();"
-            )
-            print("  [submit] form.submit() sent")
-            if _submission_succeeded(12):
-                submitted = True
-                print(f"  ✅ Strategy 4 (form.submit) succeeded → {driver.current_url}")
-        except Exception as e:
-            print(f"  [submit] Strategy 4 failed: {e}")
-
     # ── Strategy 5: requests POST using cookies from browser session ───────
     if not submitted:
-        print("  [submit] Strategy 5: requests POST with browser cookies...")
-        try:
-            live_dict, live_action = _extract_live_form(driver)
-            post_data = live_dict if live_dict else form_dict
-            post_url = live_action if live_action else form_action
-            if live_dict:
-                print(f"  [submit] Strategy 5 using live DOM ({len(post_data)} fields)")
-            session = requests.Session()
-            # Copy all browser cookies into requests session
-            for cookie in driver.get_cookies():
-                session.cookies.set(cookie['name'], cookie['value'],
-                                    domain=cookie.get('domain', ''))
-            headers = {
-                'Content-Type': 'application/x-www-form-urlencoded',
-                'Referer': driver.current_url,
-                'Origin': 'https://post.craigslist.org',
-                'User-Agent': (
-                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                    'AppleWebKit/537.36 (KHTML, like Gecko) '
-                    'Chrome/124.0.0.0 Safari/537.36'
-                ),
-            }
-            resp = session.post(
-                post_url,
-                data=post_data,
-                headers=headers,
-                allow_redirects=True,
-                timeout=30,
-            )
-            print(f"  [submit] requests POST → {resp.status_code} → {resp.url}")
-            # CL returns 200 even on failure — check for postingForm in body
-            # If the response body still contains postingForm, submission was rejected
-            resp_has_form = 'id="postingForm"' in resp.text or "name=\"cryptedStepCheck\"" in resp.text
-            if resp.status_code == 200 and "s=edit" not in resp.url and not resp_has_form:
-                # Navigate driver to the response URL so publish step works
-                driver.get(resp.url)
-                time.sleep(3)
-                submitted = True
-                print(f"  ✅ Strategy 5 (requests POST) succeeded → {resp.url}")
-            else:
-                # Extract any error messages from the response HTML
-                err_matches = re.findall(r'class="[^"]*err[^"]*"[^>]*>([^<]{5,})<', resp.text)
-                if err_matches:
-                    print(f"  [submit] CL error(s): {err_matches[:3]}")
-                print(f"  [submit] Strategy 5 rejected (form still present: {resp_has_form})")
-        except Exception as e:
-            print(f"  [submit] Strategy 5 failed: {e}")
+        if _fields_with_autofill_errors(driver):
+            print("  [submit] Strategy 5 skipped — autofill errors still present")
+        else:
+            print("  [submit] Strategy 5: requests POST with browser cookies...")
+            try:
+                _ensure_fields_intact(driver, _field_map)
+                live_dict, live_action = _extract_live_form(driver)
+                post_data = live_dict if live_dict else form_dict
+                post_url = live_action if live_action else form_action
+                if live_dict:
+                    print(f"  [submit] Strategy 5 using live DOM ({len(post_data)} fields)")
+                session = requests.Session()
+                for cookie in driver.get_cookies():
+                    session.cookies.set(cookie['name'], cookie['value'],
+                                        domain=cookie.get('domain', ''))
+                headers = {
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                    'Referer': driver.current_url,
+                    'Origin': 'https://post.craigslist.org',
+                    'User-Agent': (
+                        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                        'AppleWebKit/537.36 (KHTML, like Gecko) '
+                        'Chrome/124.0.0.0 Safari/537.36'
+                    ),
+                }
+                resp = session.post(
+                    post_url,
+                    data=post_data,
+                    headers=headers,
+                    allow_redirects=True,
+                    timeout=30,
+                )
+                print(f"  [submit] requests POST → {resp.status_code} → {resp.url}")
+                resp_has_form = (
+                    'id="postingForm"' in resp.text
+                    or "name=\"cryptedStepCheck\"" in resp.text
+                )
+                if resp.status_code == 200 and "s=edit" not in resp.url and not resp_has_form:
+                    driver.get(resp.url)
+                    time.sleep(3)
+                    submitted = True
+                    print(f"  ✅ Strategy 5 (requests POST) succeeded → {resp.url}")
+                else:
+                    err_matches = re.findall(
+                        r'class="[^"]*err[^"]*"[^>]*>([^<]{5,})<', resp.text)
+                    if err_matches:
+                        print(f"  [submit] CL error(s): {err_matches[:3]}")
+                    print(f"  [submit] Strategy 5 rejected (form still present: {resp_has_form})")
+            except Exception as e:
+                print(f"  [submit] Strategy 5 failed: {e}")
 
     if not submitted:
         print("  ❌ All submit strategies failed — still on edit page")
