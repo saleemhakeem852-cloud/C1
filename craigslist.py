@@ -491,6 +491,9 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     print(f"  [post] {len(form_dict)} fields → {form_action}")
     print(f"  [post] postal={form_dict.get('postal')} title={form_dict.get('PostingTitle','')[:25]}")
     print(f"  [post] cryptedStepCheck={form_dict.get('cryptedStepCheck','')[:20]}...")
+    # Print every field name and value so we can see exactly what's being sent
+    for k, v in sorted(form_dict.items()):
+        print(f"  [post-field] {k}={str(v)[:50]}")
 
     # Build requests session from Selenium cookies
     sess = requests.Session()
@@ -512,7 +515,7 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     if proxies:
         print(f"  [post] Via proxy: {proxy_url.split('@')[-1] if '@' in proxy_url else proxy_url}")
     else:
-        print("  [post] No proxy — using Railway IP")
+        print("  [post] No proxy — using Railway IP (add HTTPS_PROXY env var to fix)")
 
     try:
         resp = sess.post(form_action, data=form_dict,
