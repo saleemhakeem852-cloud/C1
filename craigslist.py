@@ -548,16 +548,46 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     for k, v in sorted(form_dict.items()):
         print(f"  [post-field] {k}={str(v)[:50]}")
 
-    print("  [submit] Clicking browser submit button...")
+    # Force validation events before clicking to satisfy any reactive handlers
     try:
-        submit_btn = WebDriverWait(driver, 10).until(
-            EC.element_to_be_clickable((By.CSS_SELECTOR, "button[type='submit']"))
+        driver.execute_script("""
+        document.querySelectorAll('input,textarea,select').forEach(el => {
+            el.dispatchEvent(new Event('input', {bubbles:true}));
+            el.dispatchEvent(new Event('change', {bubbles:true}));
+            el.dispatchEvent(new Event('blur', {bubbles:true}));
+        });
+        """)
+        time.sleep(0.5)
+    except Exception:
+        pass
+
+    print("  [submit] Clicking Craigslist continue/go button...")
+    try:
+        btn = WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((
+                By.CSS_SELECTOR,
+                "button.go, button.continue, button[type='submit'], button.pickbutton"
+            ))
         )
-        submit_btn.click()
-        time.sleep(5)
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
+        time.sleep(0.5)
+        driver.execute_script("arguments[0].click();", btn)
+        time.sleep(6)
     except Exception as e:
         print(f"  ✗ Submit button click failed: {e}")
         return None
+
+    # Force validation events after clicking
+    try:
+        driver.execute_script("""
+        document.querySelectorAll('input,textarea,select').forEach(el => {
+            el.dispatchEvent(new Event('input', {bubbles:true}));
+            el.dispatchEvent(new Event('change', {bubbles:true}));
+            el.dispatchEvent(new Event('blur', {bubbles:true}));
+        });
+        """)
+    except Exception:
+        pass
 
     if "s=edit" not in driver.current_url:
         print("  ✅ Posted successfully")
