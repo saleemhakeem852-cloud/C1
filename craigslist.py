@@ -160,16 +160,6 @@ def make_driver():
         "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     )
-    # Route browser traffic through residential proxy
-    # Use --proxy-server only for web traffic, not for localhost chromedriver
-    proxy_url = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY") or ""
-    if proxy_url:
-        options.add_argument(f"--proxy-server={proxy_url}")
-        options.add_argument("--proxy-bypass-list=localhost,127.0.0.1")
-        print(f"  [driver] Using proxy: {proxy_url.split('@')[-1] if '@' in proxy_url else proxy_url}")
-    else:
-        print("  [driver] No proxy configured")
-
     chromium_bin = _find_binary(
         ["chromium", "chromium-browser", "google-chrome"],
         ["/usr/bin/chromium", "/usr/bin/chromium-browser"])
@@ -445,72 +435,91 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     real_fill("[name='postal']", zip_code, use_tab=False)
     time.sleep(0.5)
 
-    # (selenium-wire removed — no request interception)
+    # Extract form + POST via requests with residential proxy
+    time.sleep(1)
 
-    # Click submit — CL's own JS will validate and POST
-    url_before = driver.current_url
-    clicked = False
-    for sel in [
-        (By.CSS_SELECTOR, "button.go.big-button.submit-button"),
-        (By.CSS_SELECTOR, "button.go.submit-button"),
-        (By.CSS_SELECTOR, "button.submit-button"),
-        (By.XPATH, '//form[@id="postingForm"]//button[@type="submit"]'),
-        (By.CSS_SELECTOR, "button.go"),
-        (By.CSS_SELECTOR, "button[type='submit']"),
-    ]:
-        try:
-            btn = WebDriverWait(driver, 4).until(EC.element_to_be_clickable(sel))
-            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
-            time.sleep(0.2)
-            btn.click()
-            print(f"  ✓ Submit clicked")
-            clicked = True
-            break
-        except Exception:
-            continue
+    form_data = driver.execute_script("""
+        var form = document.getElementById('postingForm');
+        if (!form) return null;
+        var data = [];
+        form.querySelectorAll('input,textarea,select').forEach(function(el) {
+            if (!el.name) return;
+            if ((el.type === 'checkbox' || el.type === 'radio') && !el.checked) return;
+            data.push([el.name, el.value || '']);
+        });
+        data.push(['__action__', form.action || '']);
+        return data;
+    """)
 
-    if not clicked:
-        print("  ✗ No submit button found")
+    if not form_data:
+        print("  ✗ Could not extract form data")
         return None
 
-    # Wait up to 15s for page to change — CL's JS validation can be slow
+    form_dict = {}
+    form_action = driver.current_url
+    for pair in form_data:
+        if pair[0] == '__action__':
+            if pair[1]: form_action = pair[1]
+        else:
+            form_dict[pair[0]] = pair[1]
+
+    # Ensure our filled values are in the POST
+    form_dict['PostingTitle'] = title
+    form_dict['PostingBody'] = description
+    form_dict['postal'] = zip_code
+    form_dict['geographic_area'] = city_name
+    if cl_email:
+        form_dict['FromEMail'] = cl_email
+    for pf in ['price', 'AskingPrice', 'AskPrice']:
+        if pf in form_dict:
+            form_dict[pf] = price
+            break
+
+    print(f"  [post] {len(form_dict)} fields → {form_action}")
+    print(f"  [post] postal={form_dict.get('postal')} title={form_dict.get('PostingTitle','')[:25]}")
+    print(f"  [post] cryptedStepCheck={form_dict.get('cryptedStepCheck','')[:20]}...")
+
+    # Build requests session from Selenium cookies
+    sess = requests.Session()
+    sess.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Referer": driver.current_url,
+        "Origin": "https://post.craigslist.org",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    })
+    for cookie in driver.get_cookies():
+        sess.cookies.set(cookie['name'], cookie['value'])
+
+    # Route POST through residential proxy (Chrome can't use it, requests can)
+    proxy_url = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
+    proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+    if proxies:
+        print(f"  [post] Via proxy: {proxy_url.split('@')[-1] if '@' in proxy_url else proxy_url}")
+    else:
+        print("  [post] No proxy — using Railway IP")
+
     try:
-        WebDriverWait(driver, 15).until(lambda d: d.current_url != url_before)
-        print(f"  ✓ Page changed → {driver.current_url}")
-        return driver.current_url
-    except TimeoutException:
-        pass
+        resp = sess.post(form_action, data=form_dict,
+                         proxies=proxies, allow_redirects=True, timeout=30)
+        print(f"  [post] Response: {resp.status_code} → {resp.url}")
 
-    # Page didn't change — CL's JS rejected the form client-side
-    # Dump what each field actually contains right now via native getter
-    print("  ⚠ Page did not change — field state at rejection time:")
-    for fname in ["PostingTitle", "PostingBody", "price", "FromEMail", "geographic_area", "postal"]:
-        try:
-            val = driver.execute_script("""
-                var el = document.querySelector("[name='" + arguments[0] + "']");
-                if (!el) return 'NOT_FOUND';
-                var p = el.tagName==='TEXTAREA'
-                    ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-                var d = Object.getOwnPropertyDescriptor(p, 'value');
-                return (d && d.get) ? d.get.call(el) : el.value;
-            """, fname)
-            print(f"    {fname}: '{str(val)[:60]}'")
-        except Exception:
-            pass
+        if "s=edit" not in resp.url:
+            driver.get(resp.url)
+            time.sleep(2)
+            return resp.url
 
-    # Check if CL rejected it client-side (still on edit page)
-    try:
-        errs = [e.text.strip() for e in driver.find_elements(
-            By.CSS_SELECTOR, ".notices li, .err, .error, span.notice, .warning"
-        ) if e.text.strip() and len(e.text.strip()) > 3]
-        if errs:
-            print("  [validation errors]:")
-            for et in sorted(set(errs)):
-                print(f"    → {et[:120]}")
-    except Exception:
-        pass
+        # Still on edit — show what server said
+        err_matches = re.findall(r'<li>([^<]{4,120})</li>', resp.text)
+        for e in err_matches[:6]:
+            print(f"  [post] Server error: {e.strip()}")
+        return resp.url
 
-    return driver.current_url if driver.current_url != url_before else None
+    except Exception as e:
+        print(f"  [post] Request failed: {e}")
+        return None
 
 
 def fill_listing_details(driver, product: dict):
