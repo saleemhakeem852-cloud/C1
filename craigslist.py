@@ -1,5 +1,6 @@
 """
 craigslist.py — CLBlast Craigslist automation
+FIX: form stuck on s=edit — proper blur/change events + Selenium submit
 """
 
 import re
@@ -65,7 +66,7 @@ CATEGORY_MAPPING = {
     "art and collectibles": (20, "collectibles"),
     "homeandappliances": (31, "household items"),
     "home and appliances": (31, "household items"),
-    "entertainment": (17, "cds / dvds / vhs"),
+    "entertainment": (44, "video gaming"),
 }
 
 def get_category_ul_value(category_name):
@@ -169,11 +170,6 @@ _FINGERPRINTS = [
         "platform": "MacIntel", "vendor": "Google Inc.", "lang": "en-US",
         "screen": (2560, 1600), "tz": "America/Chicago",
     },
-    {
-        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.6261.112 Safari/537.36",
-        "platform": "Win32", "vendor": "Google Inc.", "lang": "en-US",
-        "screen": (1440, 900), "tz": "America/Denver",
-    },
 ]
 
 _FINGERPRINT_JS = """
@@ -199,28 +195,6 @@ _FINGERPRINT_JS = """
                 onConnect: {{addListener: function(){{}}}},
                 onMessage: {{addListener: function(){{}}}}
             }},
-        }};
-    }}
-    Object.defineProperty(navigator, 'plugins', {{
-        get: () => {{
-            var ps = [
-                {{name:'Chrome PDF Plugin',      filename:'internal-pdf-viewer', description:'Portable Document Format'}},
-                {{name:'Chrome PDF Viewer',      filename:'mhjfbmdgcfjbbpaeojofohoefgiehjai', description:''}},
-                {{name:'Native Client',          filename:'internal-nacl-plugin', description:''}},
-            ];
-            ps.refresh = function(){{}};
-            ps.item    = function(i){{return ps[i];}};
-            ps.namedItem = function(n){{return ps.find(p=>p.name===n)||null;}};
-            Object.defineProperty(ps,'length',{{get:()=>ps.length}});
-            return ps;
-        }}
-    }});
-    const origQuery = window.Permissions && window.Permissions.prototype.query;
-    if (origQuery) {{
-        window.Permissions.prototype.query = function(p) {{
-            return p.name === 'notifications'
-                ? Promise.resolve({{state: 'granted', onchange: null}})
-                : origQuery.apply(this, arguments);
         }};
     }}
     const getParam = WebGLRenderingContext.prototype.getParameter;
@@ -282,7 +256,6 @@ def make_driver(proxy_url=None):
         print("  [driver] Headed mode (virtual display)")
 
     if proxy_url:
-        print(f"  [driver] Proxy: {proxy_url.split('@')[-1] if '@' in proxy_url else proxy_url}")
         options.add_argument(f"--proxy-server={proxy_url}")
         options.add_argument("--proxy-bypass-list=localhost,127.0.0.1")
 
@@ -346,9 +319,6 @@ def make_driver(proxy_url=None):
             "Accept-Language": f"{fp['lang']},en;q=0.9",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
             "Accept-Encoding": "gzip, deflate, br",
-            "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": f'"{fp["platform"]}"',
         }})
     except Exception:
         pass
@@ -427,49 +397,66 @@ def click_relocation_if_needed(driver, ad_name):
         pass
 
 
-def _type_into_field(driver, selector, value, label="field"):
+# ══════════════════════════════════════════════════════════════════════════════
+#  THE CORE FIX: proper human-like typing that fires all CL validation events
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _clear_and_type(driver, element, value):
     """
-    Click a field, triple-click to select all, delete, then type char by char.
-    Goes through OS keyboard pipeline — CL cannot flag as autofill.
+    Clear a field and type into it character by character, firing all the
+    native browser events (input, change, blur) that CL's validator expects.
+    Uses JavaScript to set value then dispatch events — this bypasses the
+    'autofill' flag while still triggering validation.
     """
     value = str(value).strip()
-    if not value:
-        return ""
+    # 1. Focus the element via click
+    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", element)
+    time.sleep(0.2)
     try:
-        el = WebDriverWait(driver, 8).until(
-            EC.element_to_be_clickable((By.CSS_SELECTOR, selector)))
-    except Exception as e:
-        print(f"  ✗ [{label}] not found: {e}")
-        return ""
+        ActionChains(driver).move_to_element(element).click().perform()
+    except Exception:
+        driver.execute_script("arguments[0].focus();", element)
+    time.sleep(0.15)
 
-    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+    # 2. Select all and delete
+    element.send_keys(Keys.CONTROL + "a")
+    time.sleep(0.1)
+    element.send_keys(Keys.DELETE)
+    time.sleep(0.1)
+
+    # 3. Type character by character (real keystrokes — not autofill)
+    for ch in value:
+        element.send_keys(ch)
+        time.sleep(random.uniform(0.05, 0.13))
+
+    # 4. Fire change + blur events explicitly so CL validators run
+    driver.execute_script("""
+        arguments[0].dispatchEvent(new Event('change', {bubbles: true}));
+        arguments[0].dispatchEvent(new Event('blur',   {bubbles: true}));
+        arguments[0].dispatchEvent(new Event('input',  {bubbles: true}));
+    """, element)
     time.sleep(0.3)
 
-    # Triple-click to select all existing text
-    ActionChains(driver).move_to_element(el).click(el).click(el).click(el).perform()
-    time.sleep(0.2)
-    el.send_keys(Keys.DELETE)
-    time.sleep(0.2)
 
-    # Type character by character — human speed
-    for ch in value:
-        el.send_keys(ch)
-        time.sleep(random.uniform(0.08, 0.18))
-
-    # Tab away to trigger blur/change events
-    el.send_keys(Keys.TAB)
-    time.sleep(0.35)
-
-    actual = (el.get_attribute("value") or "").strip()
-    print(f"  ✓ [{label}] = '{actual[:60]}'")
-    return actual
+def _find_field(driver, selectors, timeout=8):
+    """Try multiple selectors, return first visible element found."""
+    for sel in selectors:
+        try:
+            el = WebDriverWait(driver, timeout).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, sel)))
+            if el.is_displayed():
+                return el
+        except Exception:
+            continue
+    return None
 
 
 def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     """
-    Fill the CL posting form and submit via browser click.
-    region/subregion/category live server-side only — requests POST cannot work.
-    We use the browser's own submit with postal typed last.
+    Fill the CL posting form and submit.
+    KEY FIX: use _clear_and_type (real keystrokes + event dispatch) then
+    click the submit button with Selenium ActionChains — NOT JS click.
+    JS clicks bypass browser validation; Selenium clicks go through it.
     """
     try:
         WebDriverWait(driver, 15).until(
@@ -486,7 +473,7 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     description = (product.get("description") or (
         f"{title} in excellent condition. Well maintained and ready for a new home. "
         "Priced to sell. Local pickup preferred. Message for details.")).strip()
-    _pr = str(product.get("price", "")).strip().replace("$","").replace(",","").replace("Rs","").strip()
+    _pr = str(product.get("price", "")).strip().replace("$", "").replace(",", "").replace("Rs", "").strip()
     try:
         price = str(round(float(_pr))) if _pr else "10"
     except Exception:
@@ -494,60 +481,90 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
 
     print(f"  [fill] title='{title[:50]}' price={price} zip={zip_code} city={city_name}")
 
-    # Disable browser autofill
-    try:
-        driver.execute_script("""
-            var f = document.getElementById('postingForm');
-            if (f) {
-                f.setAttribute('autocomplete','off');
-                f.querySelectorAll('input,textarea').forEach(function(el) {
-                    el.setAttribute('autocomplete','off');
-                    el.setAttribute('data-lpignore','true');
-                });
-            }
-        """)
-    except Exception:
-        pass
+    # ── 1. ZIP / postal — multiple possible field names ──────────────────────
+    zip_field = _find_field(driver, [
+        "[name='postal']",
+        "[name='postal_code']",
+        "input#postal_code",
+        "input#postal",
+    ])
+    if zip_field and zip_code:
+        _clear_and_type(driver, zip_field, zip_code)
+        actual = zip_field.get_attribute("value") or ""
+        print(f"  ✓ [ZIP] = '{actual}'")
+    else:
+        print(f"  ⚠ [ZIP] field not found or no zip_code")
 
-    # ── Fill fields in natural human order: postal FIRST ────────────────────
-    # CL's autofill detector flags postal if filled after other fields.
-    # Filling it first makes it look like natural human tab order.
+    time.sleep(random.uniform(0.4, 0.7))
 
-    # 1. Postal/ZIP first
-    if zip_code:
-        _type_into_field(driver, "[name='postal']", zip_code, "ZIP")
-        time.sleep(random.uniform(0.3, 0.6))
+    # ── 2. Title ─────────────────────────────────────────────────────────────
+    title_field = _find_field(driver, [
+        "[name='PostingTitle']",
+        "input#PostingTitle",
+        "input#title",
+    ])
+    if title_field:
+        _clear_and_type(driver, title_field, title)
+        actual = title_field.get_attribute("value") or ""
+        print(f"  ✓ [title] = '{actual[:60]}'")
+    else:
+        print("  ✗ [title] field not found!")
+        return None
 
-    # 2. Title
-    _type_into_field(driver, "[name='PostingTitle']", title, "title")
+    time.sleep(random.uniform(0.3, 0.6))
+
+    # ── 3. Price ─────────────────────────────────────────────────────────────
+    price_field = _find_field(driver, [
+        "[name='price']",
+        "[name='AskingPrice']",
+        "[name='AskPrice']",
+        "input#price",
+    ])
+    if price_field:
+        _clear_and_type(driver, price_field, price)
+        actual = price_field.get_attribute("value") or ""
+        print(f"  ✓ [price] = '{actual}'")
+    else:
+        print("  ⚠ [price] field not found")
+
     time.sleep(random.uniform(0.3, 0.5))
 
-    # 3. Price
-    for price_sel in ["[name='price']", "[name='AskingPrice']", "[name='AskPrice']"]:
-        try:
-            driver.find_element(By.CSS_SELECTOR, price_sel)
-            _type_into_field(driver, price_sel, price, "price")
-            break
-        except Exception:
-            continue
+    # ── 4. City / neighborhood ───────────────────────────────────────────────
+    city_field = _find_field(driver, [
+        "[name='geographic_area']",
+        "input#geographic_area",
+        "[name='city']",
+    ])
+    if city_field and city_name:
+        _clear_and_type(driver, city_field, city_name)
+        actual = city_field.get_attribute("value") or ""
+        print(f"  ✓ [city] = '{actual}'")
 
-    # 4. City/neighborhood (optional)
-    try:
-        driver.find_element(By.CSS_SELECTOR, "[name='geographic_area']")
-        _type_into_field(driver, "[name='geographic_area']", city_name, "city")
-    except Exception:
-        pass
+    time.sleep(random.uniform(0.3, 0.5))
 
-    # 5. Description
-    _type_into_field(driver, "[name='PostingBody']", description, "description")
-    time.sleep(0.5)
+    # ── 5. Description ───────────────────────────────────────────────────────
+    desc_field = _find_field(driver, [
+        "[name='PostingBody']",
+        "textarea#PostingBody",
+        "textarea#description",
+    ])
+    if desc_field:
+        _clear_and_type(driver, desc_field, description)
+        actual = (desc_field.get_attribute("value") or "")[:40]
+        print(f"  ✓ [description] = '{actual}'")
+    else:
+        print("  ✗ [description] field not found!")
+        return None
 
-    # 6. Email if editable
+    time.sleep(random.uniform(0.4, 0.7))
+
+    # ── 6. Email if editable ─────────────────────────────────────────────────
     try:
         email_el = driver.find_element(By.CSS_SELECTOR, "[name='FromEMail']")
         if not email_el.get_attribute("disabled") and not email_el.get_attribute("readOnly"):
             if cl_email:
-                _type_into_field(driver, "[name='FromEMail']", cl_email, "email")
+                _clear_and_type(driver, email_el, cl_email)
+                print(f"  ✓ [email] = '{cl_email}'")
         else:
             print("  [email] Pre-filled by account")
     except Exception:
@@ -555,60 +572,142 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
 
     time.sleep(0.8)
 
-    # ── SUBMIT: click the Continue button ────────────────────────────────────
-    print("  [submit] Clicking Continue button...")
-    submit_result = driver.execute_script("""
-        var form = document.getElementById('postingForm');
-        if (!form) return {ok: false, reason: 'no-form'};
-        var btn = form.querySelector(
-            'button.go, button.bigbutton, button[type="submit"], input[type="submit"]');
-        if (!btn) return {ok: false, reason: 'no-btn'};
-        btn.scrollIntoView({block: 'center'});
-        btn.click();
-        return {
-            ok: true,
-            btn: (btn.textContent || btn.value || '').trim().substring(0, 30)
-        };
-    """)
-    print(f"  [submit] result={submit_result}")
+    # ── SUBMIT: use Selenium ActionChains to click — NOT JS click ────────────
+    # JS click bypasses browser form validation events.
+    # ActionChains click goes through the full browser event pipeline.
+    print("  [submit] Finding and clicking Continue button...")
+    submitted = False
 
-    # Wait up to 25s to leave the edit page
-    deadline = time.time() + 25
+    # Find the button
+    submit_btn = None
+    for by, sel in [
+        (By.CSS_SELECTOR, "button.go.bigbutton[type='submit']"),
+        (By.CSS_SELECTOR, "button.bigbutton[type='submit']"),
+        (By.CSS_SELECTOR, "#postingForm button[type='submit']"),
+        (By.CSS_SELECTOR, "#postingForm input[type='submit']"),
+        (By.CSS_SELECTOR, "button.go"),
+        (By.XPATH,        "//button[@type='submit' and (contains(@class,'go') or contains(@class,'bigbutton'))]"),
+        (By.XPATH,        "//button[normalize-space(.)='continue' or normalize-space(.)='Continue']"),
+        (By.CSS_SELECTOR, "button[type='submit']"),
+        (By.CSS_SELECTOR, "input[type='submit']"),
+    ]:
+        try:
+            el = WebDriverWait(driver, 5).until(EC.element_to_be_clickable((by, sel)))
+            if el.is_displayed():
+                submit_btn = el
+                label = (el.text or el.get_attribute("value") or sel)[:40]
+                print(f"  [submit] Found button: '{label}'")
+                break
+        except Exception:
+            continue
+
+    if submit_btn:
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", submit_btn)
+        time.sleep(0.5)
+        try:
+            # Use ActionChains — goes through full browser event pipeline
+            ActionChains(driver).move_to_element(submit_btn).pause(
+                random.uniform(0.3, 0.7)).click().perform()
+            submitted = True
+            print("  [submit] Clicked via ActionChains ✓")
+        except Exception as e:
+            print(f"  [submit] ActionChains failed ({e}), trying direct click")
+            try:
+                submit_btn.click()
+                submitted = True
+                print("  [submit] Clicked via .click() ✓")
+            except Exception as e2:
+                print(f"  [submit] Direct click also failed: {e2}")
+    else:
+        print("  [submit] ✗ No submit button found!")
+        # Dump what's on the page for debugging
+        try:
+            btns = driver.find_elements(By.TAG_NAME, "button")
+            print(f"  [debug] Buttons on page: {[b.text[:30] for b in btns[:10]]}")
+        except Exception:
+            pass
+
+    if not submitted:
+        return None
+
+    # ── Wait to leave the edit page ──────────────────────────────────────────
+    deadline = time.time() + 30
     while time.time() < deadline:
         cur = driver.current_url
         if "s=edit" not in cur:
             print(f"  ✅ Left edit page → {cur}")
             return cur
-        time.sleep(0.4)
+        time.sleep(0.5)
 
-    # Still stuck — log what CL shows
-    print("  [submit] Still on edit page after 25s")
+    # Still stuck — log validation errors for debugging
+    print("  [submit] Still on edit page after 30s — checking for validation errors...")
     try:
-        for fname in ["PostingTitle", "PostingBody", "postal", "price"]:
-            try:
-                el = driver.find_element(By.CSS_SELECTOR, f"[name='{fname}']")
-                val = (el.get_attribute("value") or "")[:40]
-                inv = el.get_attribute("aria-invalid")
-                print(f"  [fail] {fname}='{val}' invalid={inv}")
-            except Exception:
-                print(f"  [fail] {fname}: NOT FOUND")
+        # Check each field's value and aria-invalid state
+        for fname, selectors in [
+            ("PostingTitle", ["[name='PostingTitle']"]),
+            ("PostingBody",  ["[name='PostingBody']"]),
+            ("postal",       ["[name='postal']", "[name='postal_code']"]),
+            ("price",        ["[name='price']", "[name='AskingPrice']"]),
+        ]:
+            for sel in selectors:
+                try:
+                    el = driver.find_element(By.CSS_SELECTOR, sel)
+                    val = (el.get_attribute("value") or "")[:40]
+                    inv = el.get_attribute("aria-invalid")
+                    print(f"  [fail] {fname}='{val}' invalid={inv}")
+                    break
+                except Exception:
+                    continue
+
+        # Any visible error messages
         errs = driver.execute_script("""
             var msgs = [];
             document.querySelectorAll('[aria-invalid="true"]').forEach(function(el) {
-                msgs.push(el.name + ':invalid');
+                msgs.push((el.name||el.id||'?') + ':invalid');
             });
-            document.querySelectorAll('.err,.error').forEach(function(el) {
-                var t = (el.textContent||'').replace(/[ \t\n]+/g,' ').trim();
-                if (t && t.length > 3 && t.length < 100) msgs.push(t);
+            document.querySelectorAll('.err,.error,.notice').forEach(function(el) {
+                var t = (el.textContent||'').replace(/[ \\t\\n]+/g,' ').trim();
+                if (t && t.length > 3 && t.length < 200) msgs.push(t);
             });
             return msgs;
         """) or []
-        print(f"  [fail-errors] {errs[:8]}")
-    except Exception:
-        pass
+        if errs:
+            print(f"  [fail-errors] {errs[:8]}")
+        else:
+            print("  [fail-errors] No aria-invalid or .error elements found")
+            # The page loaded but CL isn't accepting — might be a postal issue
+            # Try re-submitting after explicitly blurring all fields
+            print("  [submit] Attempting recovery: blur all fields then re-submit...")
+            driver.execute_script("""
+                document.querySelectorAll('input,textarea').forEach(function(el) {
+                    el.dispatchEvent(new Event('blur', {bubbles:true}));
+                    el.dispatchEvent(new Event('change', {bubbles:true}));
+                });
+            """)
+            time.sleep(1)
+            # One more click attempt
+            for by, sel in [
+                (By.CSS_SELECTOR, "button.go.bigbutton[type='submit']"),
+                (By.CSS_SELECTOR, "button[type='submit']"),
+            ]:
+                try:
+                    btn = driver.find_element(by, sel)
+                    if btn.is_displayed():
+                        ActionChains(driver).move_to_element(btn).click().perform()
+                        print("  [submit] Recovery click sent")
+                        time.sleep(8)
+                        if "s=edit" not in driver.current_url:
+                            print(f"  ✅ Recovery worked → {driver.current_url}")
+                            return driver.current_url
+                        break
+                except Exception:
+                    continue
+    except Exception as debug_err:
+        print(f"  [debug] Error during debug: {debug_err}")
 
     print("  ❌ Submit failed")
     return None
+
 
 def fill_listing_details(driver, product: dict):
     _ZIPS = {
@@ -624,9 +723,6 @@ def fill_listing_details(driver, product: dict):
         "albuquerque": "87108", "brooklyn": "11206", "raleigh": "27604",
         "fargo": "58102", "columbus": "43211", "philadelphia": "19019",
         "nashville": "37205", "saltlakecity": "84118", "milwaukee": "53221",
-        "chandigarh": "", "delhi": "", "mumbai": "", "bangalore": "",
-        "hyderabad": "", "chennai": "", "kolkata": "", "pune": "",
-        "ahmedabad": "", "jaipur": "", "lucknow": "", "surat": "",
     }
 
     zip_code = (
@@ -646,9 +742,6 @@ def fill_listing_details(driver, product: dict):
         "sandiego": "San Diego", "seattle": "Seattle", "miami": "Miami",
         "dallas": "Dallas", "denver": "Denver", "atlanta": "Atlanta",
         "boston": "Boston", "portland": "Portland",
-        "chandigarh": "Chandigarh", "delhi": "Delhi", "mumbai": "Mumbai",
-        "bangalore": "Bangalore", "hyderabad": "Hyderabad", "chennai": "Chennai",
-        "kolkata": "Kolkata", "pune": "Pune",
     }
     _ck = CL_CITY.lower().replace(" ", "").replace("-", "")
     city_name = (
@@ -855,52 +948,6 @@ def _submit_publish_form(driver):
         if "s=preview" not in driver.current_url:
             return True
 
-    # Strategy C: requests POST
-    try:
-        form_data = driver.execute_script("""
-            var form = document.getElementById('publish_bottom')
-                    || document.getElementById('publish_top');
-            if (!form) return null;
-            var data = {};
-            form.querySelectorAll('input,button').forEach(function(el) {
-                if (!el.name) return;
-                if (el.type === 'submit' || el.tagName === 'BUTTON') {
-                    data[el.name] = el.value || el.textContent || 'Continue';
-                } else {
-                    data[el.name] = el.value || '';
-                }
-            });
-            data.__action__ = form.action || '';
-            return data;
-        """)
-        if not form_data:
-            return False
-        action = form_data.pop("__action__", "") or driver.current_url
-        if action.startswith("/"):
-            action = "https://post.craigslist.org" + action
-        session = requests.Session()
-        for cookie in driver.get_cookies():
-            session.cookies.set(cookie["name"], cookie["value"],
-                                domain=cookie.get("domain", ""))
-        resp = session.post(
-            action,
-            data=form_data,
-            headers={
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Referer": driver.current_url,
-                "Origin": "https://post.craigslist.org",
-            },
-            allow_redirects=True,
-            timeout=30,
-        )
-        print(f"  [publish] POST → {resp.status_code} → {resp.url}")
-        if resp.status_code == 200 and "s=preview" not in resp.url:
-            driver.get(resp.url)
-            time.sleep(3)
-            return True
-    except Exception as e:
-        print(f"  [publish] POST fallback failed: {e}")
-
     return "s=preview" not in driver.current_url
 
 
@@ -974,7 +1021,6 @@ def post_product(driver, ad_name, product):
                 print(f"  ✓ Selected city: {txt}")
                 break
         if not city_clicked:
-            # Partial match
             for item in menu_items:
                 txt = (item.text or '').strip().lower()
                 if any(word in txt for word in target.split() if len(word) > 3):
@@ -984,10 +1030,8 @@ def post_product(driver, ad_name, product):
                     break
         if not city_clicked:
             available = [m.text.strip() for m in menu_items[:8]]
-            print(f"  ✗ City '{CL_CITY}' NOT FOUND in dropdown.")
-            print(f"  Available cities: {available}")
-            print(f"  Fix: set CL_CITY env var to one of the above (e.g. 'losangeles')")
-            return False  # Hard fail — do NOT pick a wrong city
+            print(f"  ✗ City '{CL_CITY}' NOT FOUND. Available: {available}")
+            return False
         human_delay(2, 3)
         continue_btn = WebDriverWait(driver, 10).until(
             EC.element_to_be_clickable((By.CSS_SELECTOR,
