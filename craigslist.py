@@ -667,8 +667,96 @@ def _paste_fill(driver, element, value):
     return (element.get_attribute("value") or "").strip()
 
 
+_XDOTOOL_OK = None  # cached: True/False/None
+
+def _xdotool_available():
+    global _XDOTOOL_OK
+    if _XDOTOOL_OK is None:
+        try:
+            r = subprocess.run(["which", "xdotool"], capture_output=True, timeout=3)
+            _XDOTOOL_OK = r.returncode == 0
+        except Exception:
+            _XDOTOOL_OK = False
+    return _XDOTOOL_OK
+
+
+def _xdotool_fill(driver, element, value):
+    """
+    Fill a field using xdotool — true X11 keyboard events on the Xvfb display.
+    Chromium receives these identically to physical keyboard input.
+    CL cannot distinguish xdotool from a real user keystroke.
+    """
+    value = str(value).strip()
+    display = os.environ.get("DISPLAY", ":99")
+
+    # 1. Focus + select-all via Selenium click (no Selenium keys — just focus)
+    _focus_field(driver, element)
+    time.sleep(0.3)
+
+    # 2. Get window ID of the focused Chromium window
+    try:
+        win_id = subprocess.run(
+            ["xdotool", "getactivewindow"],
+            capture_output=True, text=True, timeout=5,
+            env={**os.environ, "DISPLAY": display}
+        ).stdout.strip()
+    except Exception:
+        win_id = None
+
+    base_env = {**os.environ, "DISPLAY": display}
+
+    # 3. Select all existing text, then delete
+    try:
+        if win_id:
+            subprocess.run(["xdotool", "key", "--window", win_id, "ctrl+a"],
+                           timeout=5, env=base_env)
+        else:
+            subprocess.run(["xdotool", "key", "ctrl+a"], timeout=5, env=base_env)
+        time.sleep(0.15)
+        if win_id:
+            subprocess.run(["xdotool", "key", "--window", win_id, "Delete"],
+                           timeout=5, env=base_env)
+        else:
+            subprocess.run(["xdotool", "key", "Delete"], timeout=5, env=base_env)
+        time.sleep(0.15)
+    except Exception:
+        pass
+
+    # 4. Type the value character by character with xdotool type
+    # Use --clearmodifiers to avoid shift/ctrl artifacts
+    # Split into chunks to handle special chars robustly
+    try:
+        chunks = [value[i:i+50] for i in range(0, len(value), 50)]
+        for chunk in chunks:
+            cmd = ["xdotool", "type", "--clearmodifiers", "--delay", "40"]
+            if win_id:
+                cmd += ["--window", win_id]
+            cmd.append(chunk)
+            subprocess.run(cmd, timeout=15, env=base_env)
+            time.sleep(0.1)
+    except Exception as e:
+        print(f"  [xdotool] type failed: {e} — falling back to paste")
+        return _paste_fill(driver, element, value)
+
+    time.sleep(0.3)
+
+    # 5. Verify value landed correctly
+    actual = (element.get_attribute("value") or "").strip()
+    if actual != value:
+        # Retry once with paste
+        print(f"  [xdotool] mismatch (got '{actual[:30]}') — retrying with paste")
+        return _paste_fill(driver, element, value)
+
+    _blur_by_clicking_elsewhere(driver, element)
+    time.sleep(0.2)
+    return actual
+
+
 def _clear_and_type(driver, element, value):
-    """Prefer clipboard paste on Railway; fall back to keystrokes."""
+    """Use xdotool on Xvfb (Railway) — true OS keystrokes CL can't detect.
+    Fall back to clipboard paste, then slow send_keys."""
+    if (IS_RAILWAY or os.environ.get("DISPLAY")) and _xdotool_available():
+        return _xdotool_fill(driver, element, value)
     if IS_RAILWAY or os.environ.get("DISPLAY"):
         return _paste_fill(driver, element, value)
     value = str(value).strip()
@@ -1235,7 +1323,6 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
 
     # ── Strategy 0: form.requestSubmit (CL's native handler) ───────────────
     submitted = False
-    _patch_entire_form(driver)
     try:
         result = _native_request_submit(driver)
         print(f"  [submit] requestSubmit → {result}")
@@ -1285,7 +1372,7 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
             EC.presence_of_element_located((By.CSS_SELECTOR, _SUBMIT_SEL))
         )
         if not submitted:
-            _patch_entire_form(driver)
+            pass  # fields already filled — no re-patch
         print("  [submit] ActionChains click sent")
         if _try_click_submit_buttons() or _submission_succeeded(10):
             submitted = True
@@ -1348,11 +1435,23 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
                 timeout=30,
             )
             print(f"  [submit] requests POST → {resp.status_code} → {resp.url}")
-            resp_has_form = (
+            resp_has_edit_form = (
                 'id="postingForm"' in resp.text
-                or "name=\"cryptedStepCheck\"" in resp.text
+                and 'name="cryptedStepCheck"' in resp.text
             )
-            if resp.status_code == 200 and "s=edit" not in resp.url and not resp_has_form:
+            # Success = no edit form present, or landed on images/preview
+            is_success = (
+                resp.status_code == 200
+                and not resp_has_edit_form
+                and (
+                    "s=edit" not in resp.url
+                    or "s=images" in resp.url
+                    or "s=preview" in resp.url
+                    or "fileInput" in resp.text
+                    or "add_photos_button" in resp.text
+                )
+            )
+            if is_success:
                 driver.get(resp.url)
                 time.sleep(3)
                 submitted = True
@@ -1362,7 +1461,10 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
                     r'class="[^"]*err[^"]*"[^>]*>([^<]{5,})<', resp.text)
                 if err_matches:
                     print(f"  [submit] CL error(s): {err_matches[:3]}")
-                print(f"  [submit] Strategy 5 rejected (form still present: {resp_has_form})")
+                print(f"  [submit] Strategy 5 rejected (edit_form_present: {resp_has_edit_form})")
+                # Debug: show response snippet so we know what CL actually returned
+                snip = resp.text[:600].replace("\n", " ")
+                print(f"  [submit] response snippet: {snip[:300]}")
         except Exception as e:
             print(f"  [submit] Strategy 5 failed: {e}")
 
