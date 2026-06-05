@@ -667,96 +667,8 @@ def _paste_fill(driver, element, value):
     return (element.get_attribute("value") or "").strip()
 
 
-_XDOTOOL_OK = None  # cached: True/False/None
-
-def _xdotool_available():
-    global _XDOTOOL_OK
-    if _XDOTOOL_OK is None:
-        try:
-            r = subprocess.run(["which", "xdotool"], capture_output=True, timeout=3)
-            _XDOTOOL_OK = r.returncode == 0
-        except Exception:
-            _XDOTOOL_OK = False
-    return _XDOTOOL_OK
-
-
-def _xdotool_fill(driver, element, value):
-    """
-    Fill a field using xdotool — true X11 keyboard events on the Xvfb display.
-    Chromium receives these identically to physical keyboard input.
-    CL cannot distinguish xdotool from a real user keystroke.
-    """
-    value = str(value).strip()
-    display = os.environ.get("DISPLAY", ":99")
-
-    # 1. Focus + select-all via Selenium click (no Selenium keys — just focus)
-    _focus_field(driver, element)
-    time.sleep(0.3)
-
-    # 2. Get window ID of the focused Chromium window
-    try:
-        win_id = subprocess.run(
-            ["xdotool", "getactivewindow"],
-            capture_output=True, text=True, timeout=5,
-            env={**os.environ, "DISPLAY": display}
-        ).stdout.strip()
-    except Exception:
-        win_id = None
-
-    base_env = {**os.environ, "DISPLAY": display}
-
-    # 3. Select all existing text, then delete
-    try:
-        if win_id:
-            subprocess.run(["xdotool", "key", "--window", win_id, "ctrl+a"],
-                           timeout=5, env=base_env)
-        else:
-            subprocess.run(["xdotool", "key", "ctrl+a"], timeout=5, env=base_env)
-        time.sleep(0.15)
-        if win_id:
-            subprocess.run(["xdotool", "key", "--window", win_id, "Delete"],
-                           timeout=5, env=base_env)
-        else:
-            subprocess.run(["xdotool", "key", "Delete"], timeout=5, env=base_env)
-        time.sleep(0.15)
-    except Exception:
-        pass
-
-    # 4. Type the value character by character with xdotool type
-    # Use --clearmodifiers to avoid shift/ctrl artifacts
-    # Split into chunks to handle special chars robustly
-    try:
-        chunks = [value[i:i+50] for i in range(0, len(value), 50)]
-        for chunk in chunks:
-            cmd = ["xdotool", "type", "--clearmodifiers", "--delay", "40"]
-            if win_id:
-                cmd += ["--window", win_id]
-            cmd.append(chunk)
-            subprocess.run(cmd, timeout=15, env=base_env)
-            time.sleep(0.1)
-    except Exception as e:
-        print(f"  [xdotool] type failed: {e} — falling back to paste")
-        return _paste_fill(driver, element, value)
-
-    time.sleep(0.3)
-
-    # 5. Verify value landed correctly
-    actual = (element.get_attribute("value") or "").strip()
-    if actual != value:
-        # Retry once with paste
-        print(f"  [xdotool] mismatch (got '{actual[:30]}') — retrying with paste")
-        return _paste_fill(driver, element, value)
-
-    _blur_by_clicking_elsewhere(driver, element)
-    time.sleep(0.2)
-    return actual
-
-
 def _clear_and_type(driver, element, value):
-    """Use xdotool on Xvfb (Railway) — true OS keystrokes CL can't detect.
-    Fall back to clipboard paste, then slow send_keys."""
-    if (IS_RAILWAY or os.environ.get("DISPLAY")) and _xdotool_available():
-        return _xdotool_fill(driver, element, value)
+    """Prefer clipboard paste on Railway; fall back to keystrokes."""
     if IS_RAILWAY or os.environ.get("DISPLAY"):
         return _paste_fill(driver, element, value)
     value = str(value).strip()
@@ -1150,10 +1062,55 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     if not _verify_and_refill(driver, _field_map):
         print("  [verify] Some fields failed verification")
 
-    # Patch React fiber state once (no re-paste — that corrupts fields)
-    _patch_entire_form(driver)
-    time.sleep(0.5)
+    # ── Click every '• autofilled' anchor in CL's error banner ──────────────
+    # These are React-wired links. Clicking them fires a handler that reissues
+    # cryptedStepCheck with those fields marked as user-edited server-side.
+    # JS .click() does NOT work — must be a real ActionChains mouse event.
+    old_token = driver.execute_script(
+        "var el=document.querySelector('[name=cryptedStepCheck]'); return el?el.value:'';"
+    ) or ""
+    print("  Clearing CL autofill flags (clicking banner links)...")
+    autofill_links = driver.execute_script("""
+        var els = [];
+        document.querySelectorAll('a, button, li, span').forEach(function(el) {
+            var t = (el.textContent || '').trim();
+            if (t.indexOf('\u2022 autofilled') !== -1 || t.toLowerCase() === 'autofilled') {
+                var r = el.getBoundingClientRect();
+                if (r.width > 0 && r.height > 0) els.push(el);
+            }
+        });
+        return els;
+    """) or []
+    if autofill_links:
+        print(f"  [autofill] Found {len(autofill_links)} autofill link(s) — clicking each")
+        for link in autofill_links:
+            try:
+                driver.execute_script("arguments[0].scrollIntoView({block:'center'});", link)
+                time.sleep(0.3)
+                ActionChains(driver).move_to_element(link).pause(
+                    random.uniform(0.15, 0.35)).click().perform()
+                time.sleep(0.5)
+                print(f"  [autofill] clicked: '{(link.text or '').strip()[:40]}'")
+            except Exception as e:
+                print(f"  [autofill] click failed: {e}")
+        # Wait up to 4s for cryptedStepCheck to refresh (server reissues token)
+        deadline = time.time() + 4
+        while time.time() < deadline:
+            new_token = driver.execute_script(
+                "var el=document.querySelector('[name=cryptedStepCheck]'); return el?el.value:'';"
+            ) or ""
+            if new_token and new_token != old_token:
+                print(f"  [autofill] cryptedStepCheck refreshed ✓")
+                break
+            time.sleep(0.4)
+        else:
+            print("  [autofill] token unchanged after clicking — server may not have re-issued")
+        # After clicking autofill links, fields may get cleared — restore them
+        _verify_and_refill(driver, _field_map)
+    else:
+        print("  [autofill] No visible autofill links found in banner")
 
+    time.sleep(0.5)
     status = _field_status(driver)
     for fname, st in status.items():
         print(f"  [field] {fname}: value='{st.get('value','')}' "
@@ -1323,6 +1280,7 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
 
     # ── Strategy 0: form.requestSubmit (CL's native handler) ───────────────
     submitted = False
+    _patch_entire_form(driver)
     try:
         result = _native_request_submit(driver)
         print(f"  [submit] requestSubmit → {result}")
@@ -1372,7 +1330,7 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
             EC.presence_of_element_located((By.CSS_SELECTOR, _SUBMIT_SEL))
         )
         if not submitted:
-            pass  # fields already filled — no re-patch
+            _patch_entire_form(driver)
         print("  [submit] ActionChains click sent")
         if _try_click_submit_buttons() or _submission_succeeded(10):
             submitted = True
@@ -1435,23 +1393,11 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
                 timeout=30,
             )
             print(f"  [submit] requests POST → {resp.status_code} → {resp.url}")
-            resp_has_edit_form = (
+            resp_has_form = (
                 'id="postingForm"' in resp.text
-                and 'name="cryptedStepCheck"' in resp.text
+                or "name=\"cryptedStepCheck\"" in resp.text
             )
-            # Success = no edit form present, or landed on images/preview
-            is_success = (
-                resp.status_code == 200
-                and not resp_has_edit_form
-                and (
-                    "s=edit" not in resp.url
-                    or "s=images" in resp.url
-                    or "s=preview" in resp.url
-                    or "fileInput" in resp.text
-                    or "add_photos_button" in resp.text
-                )
-            )
-            if is_success:
+            if resp.status_code == 200 and "s=edit" not in resp.url and not resp_has_form:
                 driver.get(resp.url)
                 time.sleep(3)
                 submitted = True
@@ -1461,10 +1407,7 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
                     r'class="[^"]*err[^"]*"[^>]*>([^<]{5,})<', resp.text)
                 if err_matches:
                     print(f"  [submit] CL error(s): {err_matches[:3]}")
-                print(f"  [submit] Strategy 5 rejected (edit_form_present: {resp_has_edit_form})")
-                # Debug: show response snippet so we know what CL actually returned
-                snip = resp.text[:600].replace("\n", " ")
-                print(f"  [submit] response snippet: {snip[:300]}")
+                print(f"  [submit] Strategy 5 rejected (form still present: {resp_has_form})")
         except Exception as e:
             print(f"  [submit] Strategy 5 failed: {e}")
 
