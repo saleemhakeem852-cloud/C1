@@ -172,6 +172,9 @@ def make_driver():
     chromedriver_bin = _find_binary(
         ["chromedriver"],
         ["/usr/local/bin/chromedriver", "/usr/bin/chromedriver"])
+    # Prefer our wrapper script which passes --allowed-origins=*
+    if os.path.exists("/usr/local/bin/chromedriver"):
+        chromedriver_bin = "/usr/local/bin/chromedriver"
     if not chromedriver_bin:
         raise RuntimeError("chromedriver not found")
     print(f"  [driver] Using chromedriver: {chromedriver_bin}")
