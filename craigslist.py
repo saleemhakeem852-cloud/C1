@@ -248,9 +248,13 @@ def craigslist_login(driver, email, password):
             EC.presence_of_element_located((By.ID, "inputEmailHandle")))
         send_keys_slow(driver, ef, email)
         human_delay()
-        pf = driver.find_element(By.ID, "inputPassword")
-        send_keys_slow(driver, pf, password)
-        human_delay()
+        if password:
+            try:
+                pf = driver.find_element(By.ID, "inputPassword")
+                send_keys_slow(driver, pf, password)
+                human_delay()
+            except Exception:
+                pass
         btn = driver.find_element(By.CSS_SELECTOR, "button[type='submit']")
         safe_click(driver, btn)
         WebDriverWait(driver, 15).until(EC.url_contains("craigslist.org"))
@@ -890,9 +894,7 @@ def main():
     if not email:
         print("✗ CL_EMAIL environment variable not set. Add it to Railway Variables.")
         return
-    if not password:
-        print("✗ CL_PASSWORD environment variable not set. Add it to Railway Variables.")
-        return
+    # password is optional for Craigslist
     CL_CITY  = os.environ.get("CL_CITY", CL_CITY)
     _load_existing_listings()
 

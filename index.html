@@ -2613,7 +2613,7 @@ function updatePlatformBadge(platform) {
   if (!badge) return;
   const accounts = getAccounts(platform);
   const total = accounts.length;
-  const savedCount = accounts.filter(a => a.isSaved && a.email && a.password).length;
+  const savedCount = accounts.filter(a => a.isSaved && a.email && (platform === 'craigslist' || a.password)).length;
   const unsavedCount = total - savedCount;
   if (unsavedCount === 0 && savedCount > 0) {
     badge.className = 'account-status-pill status-saved';
