@@ -2921,7 +2921,9 @@ function renderPostAccountsSelector() {
   ];
 
   container.innerHTML = platforms.map(plat => {
-    const accounts = getAccounts(plat.id).filter(a => a.email && a.password && a.isSaved);
+    const accounts = getAccounts(plat.id).filter(a =>
+      a.isSaved && a.email && (plat.id === 'craigslist' || !!a.password)
+    );
     const hasAccounts = accounts.length > 0;
 
     if (!hasAccounts) {
