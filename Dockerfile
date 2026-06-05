@@ -4,7 +4,13 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1
 
-# Install chromium from debian repos (stable, always works)
+# Unset any proxy vars that Railway might inject during build
+# so apt can reach debian repos directly
+ARG http_proxy=
+ARG https_proxy=
+ARG HTTP_PROXY=
+ARG HTTPS_PROXY=
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
     chromium \
     chromium-driver \
@@ -23,8 +29,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libasound2 \
     && rm -rf /var/lib/apt/lists/*
 
-# Fix chromedriver security policy for container environments
-RUN echo '#!/bin/bash\nexec /usr/bin/chromedriver --allowed-ips="" --allowed-origins="*" "$@"' \
+# Wrapper script so chromedriver always starts with --allowed-origins=*
+RUN printf '#!/bin/sh\nexec /usr/bin/chromedriver --allowed-ips="" --allowed-origins="*" "$@"\n' \
     > /usr/local/bin/chromedriver \
     && chmod +x /usr/local/bin/chromedriver
 
