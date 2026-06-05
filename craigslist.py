@@ -488,6 +488,18 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
             form_dict[pf] = price
             break
 
+    # Always include required checkboxes — they are missing when unchecked
+    for cb in ['contact_phone_ok', 'contact_text_ok', 'show_phone_ok',
+               'crypto_currency_ok', 'delivery_available', 'see_my_other',
+               'show_address_ok', 'save_contact_preferences']:
+        form_dict[cb] = '1'
+
+    # Remove empty optional fields that confuse CL's validator
+    for optional in ['contact_phone', 'contact_phone_extension', 'contact_name',
+                     'xstreet0', 'xstreet1', 'city', 'sale_manufacturer',
+                     'sale_model', 'sale_size', 'condition']:
+        form_dict.pop(optional, None)
+
     print(f"  [post] {len(form_dict)} fields → {form_action}")
     print(f"  [post] postal={form_dict.get('postal')} title={form_dict.get('PostingTitle','')[:25]}")
     print(f"  [post] cryptedStepCheck={form_dict.get('cryptedStepCheck','')[:20]}...")
