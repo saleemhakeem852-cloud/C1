@@ -1150,45 +1150,14 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
         except Exception:
             print(f"  [pre-submit] {fname}: NOT FOUND")
 
-    # ── Submit: find the Continue button and click it ─────────────────────────
-    print("  [submit] Clicking Continue button...")
+    # ── Submit via requests POST — most reliable, bypasses React's on-submit clearing ──
+    # We MUST NOT rely on DOM values after clicking submit (CL clears postal on click).
+    # Instead: build POST from the cryptedStepCheck + our own field values directly.
+    print("  [submit] Building POST request with browser session cookies...")
     submitted = False
 
-    submit_selectors = [
-        "button.go.big-button",
-        "button.go",
-        "button[type='submit']",
-        "input[type='submit']",
-    ]
-
-    for sel in submit_selectors:
-        try:
-            btn = WebDriverWait(driver, 5).until(
-                EC.element_to_be_clickable((By.CSS_SELECTOR, sel)))
-            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
-            time.sleep(0.5)
-            ActionChains(driver).move_to_element(btn).pause(
-                random.uniform(0.2, 0.5)).click().perform()
-            print(f"  [submit] Clicked '{sel}'")
-            # Wait up to 15s to leave the edit page
-            deadline = time.time() + 15
-            while time.time() < deadline:
-                if "s=edit" not in driver.current_url:
-                    submitted = True
-                    break
-                time.sleep(0.75)
-            if submitted:
-                break
-        except Exception as e:
-            print(f"  [submit] {sel} failed: {e}")
-            continue
-
-    if submitted:
-        print(f"  ✅ Submitted → {driver.current_url}")
-        return driver.current_url
-
-    # ── Fallback: requests POST using live form data + browser cookies ─────────
-    print("  [submit] Browser click failed — trying requests POST fallback...")
+    # ── requests POST: use cryptedStepCheck from DOM + our field values ──────────
+    print("  [submit] Sending POST with session cookies...")
     try:
         pairs = driver.execute_script("""
             var form = document.getElementById('postingForm');
@@ -1214,12 +1183,12 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
             else:
                 form_dict[pair[0]] = pair[1]
 
-        # Override with our values
+        # Override with our values — ALWAYS use our zip_code directly (never trust DOM)
         form_dict['PostingTitle'] = title
         form_dict['PostingBody'] = description
         form_dict['geographic_area'] = city_name
-        if zip_code and re.match(r'^\d{5}$', zip_code):
-            form_dict['postal'] = zip_code
+        if zip_code:
+            form_dict['postal'] = zip_code  # force it — CL clears postal on submit click
         else:
             form_dict.pop('postal', None)
         if cl_email:
@@ -1248,17 +1217,24 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
                 'Chrome/124.0.0.0 Safari/537.36'
             ),
         }
+        # Log exactly what we're sending so we can debug if CL rejects it
+        print(f"  [post-data] postal={form_dict.get('postal')} title={form_dict.get('PostingTitle','')[:30]}")
+        print(f"  [post-data] cryptedStepCheck={'YES' if 'cryptedStepCheck' in form_dict else 'MISSING'}")
+
         resp = session.post(form_action, data=form_dict, headers=headers,
                             allow_redirects=True, timeout=30)
         print(f"  [submit-fallback] POST → {resp.status_code} → {resp.url}")
         if resp.status_code == 200 and "s=edit" not in resp.url and 'id="postingForm"' not in resp.text:
             driver.get(resp.url)
             time.sleep(2)
-            print(f"  ✅ Fallback POST succeeded → {resp.url}")
+            print(f"  ✅ POST succeeded → {resp.url}")
             return resp.url
         else:
             errs = re.findall(r'class="[^"]*err[^"]*"[^>]*>([^<]{5,120})<', resp.text)
-            print(f"  ✗ Fallback POST rejected. Errors: {errs[:3]}")
+            print(f"  ✗ POST rejected. Errors: {errs[:3]}")
+            # Print a snippet of the response to help diagnose
+            snippet = resp.text[resp.text.find('postingForm') - 200 : resp.text.find('postingForm') + 200] if 'postingForm' in resp.text else resp.text[:400]
+            print(f"  [resp-snippet] {snippet[:300]}")
     except Exception as e:
         print(f"  ✗ Fallback POST failed: {e}")
 
