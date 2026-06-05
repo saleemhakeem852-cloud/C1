@@ -7,7 +7,7 @@ function getProductLabel(product) {
 }
 
 // --- SECTION A: STORAGE ---
-const API_BASE = (typeof SERVER !== 'undefined') ? SERVER : 'https://clblast-production.up.railway.app';
+const API_BASE = (typeof SERVER !== 'undefined') ? SERVER : 'https://clblast.up.railway.app';
 
 async function saveProductsToStorage(productList) {
   localStorage.setItem('products', JSON.stringify(productList));
@@ -177,7 +177,7 @@ async function runPhotosForProducts(productList) {
 
 async function fetchAIDescription(product) {
   try {
-    const response = await fetch('https://clblast-production.up.railway.app/ai/anthropic-proxy', {
+    const response = await fetch('https://clblast.up.railway.app/ai/anthropic-proxy', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -213,7 +213,7 @@ async function fetchAIDescription(product) {
 
 async function fetchAISpecifications(product) {
   try {
-    const response = await fetch('https://clblast-production.up.railway.app/ai/anthropic-proxy', {
+    const response = await fetch('https://clblast.up.railway.app/ai/anthropic-proxy', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
