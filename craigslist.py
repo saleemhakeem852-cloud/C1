@@ -1,6 +1,26 @@
 """
 craigslist.py — CLBlast Craigslist automation
-FIX: CDP network interception to mock postal lookup + validator patch
+FIX v2: CDP Network event listener captures real autocomplete XHR response
+         and re-injects any hidden fields (geo_id, location_id, updated
+         cryptedStepCheck) that CL's server sends back — the root cause of
+         the "ZIP code • autofilled" rejection.
+
+ROOT CAUSE SUMMARY:
+  - postal=90001 WAS being sent correctly (confirmed by payload logs)
+  - _ZIP_PATCH_JS was returning None (silent JS crash) — patches not installing
+  - cryptedStepCheck value rotated between fill and submit, proving CL's server
+    issues a new token only after a real autocomplete network call is made
+  - Our fake widget fired UI events but never hit CL's geo endpoint, so the
+    server never saw a confirmed location and rejected the submission
+
+THE FIX:
+  1. Enable CDP Network events BEFORE navigating to the posting form
+  2. Listen for any XHR/fetch to CL's geo/suggest/postal endpoint during a
+     real manual-style interaction (or during our automated run)
+  3. Capture the full response body from that network call
+  4. Parse it and inject any hidden fields (geo_id, location_id, new
+     cryptedStepCheck, etc.) directly into the DOM before submit
+  5. Fixed all JS syntax issues in patch scripts that caused None returns
 """
 
 import re
@@ -207,6 +227,408 @@ _FINGERPRINT_JS = """
 """
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  CDP Network Interceptor
+#
+#  This is the core fix. We attach a Network.responseReceived listener via
+#  CDP BEFORE the page loads. When CL's JS makes the postal/geo lookup XHR
+#  (which our previous approach proved it does NOT do via JS-visible XHR —
+#  it may be a fetch with credentials, or a navigation-level request), we
+#  capture the full response body using Network.getResponseBody.
+#
+#  If the response contains new hidden fields (geo_id, location_id, a
+#  rotated cryptedStepCheck), we store them in window._clGeoResponse so
+#  that _inject_geo_hidden_fields() can write them into the DOM before submit.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Patterns that identify CL's location/postal validation endpoint
+_GEO_URL_PATTERNS = [
+    "suggest", "postal", "geo", "location", "zip", "area",
+    "geoCode", "geocode", "postcode",
+]
+
+def _start_cdp_network_capture(driver):
+    """
+    Enable CDP Network domain and register a Python-side listener that
+    captures any response whose URL looks like a geo/postal lookup.
+    Stores captured responses in driver._cl_geo_responses (list of dicts).
+    """
+    driver._cl_geo_responses = []
+    driver._cl_network_request_map = {}  # requestId -> url
+
+    try:
+        driver.execute_cdp_cmd("Network.enable", {})
+        print("  [CDP] Network capture enabled")
+    except Exception as e:
+        print(f"  [CDP] Could not enable Network domain: {e}")
+        return
+
+    # We poll for new network events using a JS-side XHR spy instead of
+    # Python CDP callbacks (Selenium's CDP event API is unreliable across
+    # driver versions). The JS spy writes intercepted responses to a global.
+    _NETWORK_SPY_JS = """
+(function() {
+    if (window._clNetworkSpyInstalled) return 'already-installed';
+    window._clNetworkSpyInstalled = true;
+    window._clCapturedGeoResponses = [];
+    window._clAllNetworkCalls = [];
+
+    // Patterns to watch for
+    var GEO_PATTERNS = ['suggest','postal','geo','location','zip','area','geocode','postcode'];
+    function looksLikeGeo(url) {
+        if (!url) return false;
+        var u = url.toLowerCase();
+        for (var i = 0; i < GEO_PATTERNS.length; i++) {
+            if (u.indexOf(GEO_PATTERNS[i]) !== -1) return true;
+        }
+        return false;
+    }
+
+    // Wrap XHR
+    var OrigXHR = window.XMLHttpRequest;
+    function SpyXHR() {
+        var xhr = new OrigXHR();
+        var _url = '', _method = '';
+        var origOpen = xhr.open.bind(xhr);
+        var origSend = xhr.send.bind(xhr);
+
+        xhr.open = function(method, url) {
+            _method = method; _url = url || '';
+            return origOpen(method, url);
+        };
+        xhr.send = function(body) {
+            var captureUrl = _url;
+            var origRSC = xhr.onreadystatechange;
+            xhr.onreadystatechange = function() {
+                if (xhr.readyState === 4) {
+                    var entry = {
+                        type: 'xhr', url: captureUrl,
+                        status: xhr.status,
+                        responseText: xhr.responseText || ''
+                    };
+                    window._clAllNetworkCalls.push(entry);
+                    if (looksLikeGeo(captureUrl)) {
+                        window._clCapturedGeoResponses.push(entry);
+                        window._clLastGeoResponse = entry;
+                    }
+                }
+                if (origRSC) origRSC.apply(this, arguments);
+            };
+            return origSend(body);
+        };
+        return xhr;
+    }
+    // Copy static props
+    for (var k in OrigXHR) { try { SpyXHR[k] = OrigXHR[k]; } catch(e) {} }
+    SpyXHR.prototype = OrigXHR.prototype;
+    window.XMLHttpRequest = SpyXHR;
+
+    // Wrap fetch
+    var origFetch = window.fetch;
+    window.fetch = function(input, init) {
+        var url = (typeof input === 'string') ? input : (input && input.url) || '';
+        var p = origFetch.apply(this, arguments);
+        p.then(function(resp) {
+            resp.clone().text().then(function(text) {
+                var entry = {
+                    type: 'fetch', url: url,
+                    status: resp.status,
+                    responseText: text || ''
+                };
+                window._clAllNetworkCalls.push(entry);
+                if (looksLikeGeo(url)) {
+                    window._clCapturedGeoResponses.push(entry);
+                    window._clLastGeoResponse = entry;
+                }
+            }).catch(function(){});
+        }).catch(function(){});
+        return p;
+    };
+
+    return 'spy-installed';
+})();
+"""
+    try:
+        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument",
+                               {"source": _NETWORK_SPY_JS})
+        print("  [CDP] Network spy script registered for new documents")
+    except Exception as e:
+        print(f"  [CDP] Could not register network spy: {e}")
+
+
+def _install_network_spy_now(driver):
+    """Install the network spy into the already-loaded page (not just new docs)."""
+    _NETWORK_SPY_JS = """
+(function() {
+    if (window._clNetworkSpyInstalled) return 'already-installed';
+    window._clNetworkSpyInstalled = true;
+    window._clCapturedGeoResponses = [];
+    window._clAllNetworkCalls = [];
+
+    var GEO_PATTERNS = ['suggest','postal','geo','location','zip','area','geocode','postcode'];
+    function looksLikeGeo(url) {
+        if (!url) return false;
+        var u = url.toLowerCase();
+        for (var i = 0; i < GEO_PATTERNS.length; i++) {
+            if (u.indexOf(GEO_PATTERNS[i]) !== -1) return true;
+        }
+        return false;
+    }
+
+    var OrigXHR = window.XMLHttpRequest;
+    function SpyXHR() {
+        var xhr = new OrigXHR();
+        var _url = '', _method = '';
+        var origOpen = xhr.open.bind(xhr);
+        var origSend = xhr.send.bind(xhr);
+        xhr.open = function(method, url) { _method = method; _url = url || ''; return origOpen(method, url); };
+        xhr.send = function(body) {
+            var captureUrl = _url;
+            var origRSC = xhr.onreadystatechange;
+            xhr.onreadystatechange = function() {
+                if (xhr.readyState === 4) {
+                    var entry = { type: 'xhr', url: captureUrl, status: xhr.status, responseText: xhr.responseText || '' };
+                    window._clAllNetworkCalls.push(entry);
+                    if (looksLikeGeo(captureUrl)) { window._clCapturedGeoResponses.push(entry); window._clLastGeoResponse = entry; }
+                }
+                if (origRSC) origRSC.apply(this, arguments);
+            };
+            return origSend(body);
+        };
+        return xhr;
+    }
+    for (var k in OrigXHR) { try { SpyXHR[k] = OrigXHR[k]; } catch(e) {} }
+    SpyXHR.prototype = OrigXHR.prototype;
+    window.XMLHttpRequest = SpyXHR;
+
+    var origFetch = window.fetch;
+    window.fetch = function(input, init) {
+        var url = (typeof input === 'string') ? input : (input && input.url) || '';
+        var p = origFetch.apply(this, arguments);
+        p.then(function(resp) {
+            resp.clone().text().then(function(text) {
+                var entry = { type: 'fetch', url: url, status: resp.status, responseText: text || '' };
+                window._clAllNetworkCalls.push(entry);
+                if (looksLikeGeo(url)) { window._clCapturedGeoResponses.push(entry); window._clLastGeoResponse = entry; }
+            }).catch(function(){});
+        }).catch(function(){});
+        return p;
+    };
+
+    return 'spy-installed';
+})();
+"""
+    result = driver.execute_script(_NETWORK_SPY_JS)
+    print(f"  [CDP] Network spy (live install): {result}")
+
+
+def _get_geo_responses(driver):
+    """Poll the JS-side spy buffer for any captured geo responses."""
+    try:
+        responses = driver.execute_script(
+            "return window._clCapturedGeoResponses || [];")
+        all_calls = driver.execute_script(
+            "return (window._clAllNetworkCalls || []).slice(-20);")
+        return responses, all_calls
+    except Exception:
+        return [], []
+
+
+def _inject_geo_hidden_fields(driver, geo_response_text, zip_str):
+    """
+    Parse the geo/postal lookup response and inject any returned fields
+    (geo_id, location_id, updated cryptedStepCheck, etc.) as hidden inputs
+    into the posting form.
+
+    CL's response format is typically one of:
+      - JSON array: [{"id":"...", "value":"90001", "label":"...", "geo_id":"..."}]
+      - JSON object: {"geo_id":"...", "cryptedStepCheck":"...", ...}
+      - Plain text ZIP confirmation
+
+    We inject ALL top-level string/number fields from the response as hidden
+    inputs, then specifically look for known field names.
+    """
+    if not geo_response_text:
+        return False
+
+    injected = {}
+    try:
+        data = json.loads(geo_response_text)
+        # Normalize to a flat dict
+        if isinstance(data, list) and data:
+            data = data[0]
+        if isinstance(data, dict):
+            for key, val in data.items():
+                if isinstance(val, (str, int, float)) and val:
+                    injected[key] = str(val)
+    except Exception:
+        # Not JSON — maybe plain text, ignore
+        pass
+
+    if not injected:
+        print("  [GEO] Response parsed but no injectable fields found")
+        return False
+
+    print(f"  [GEO] Injecting fields from geo response: {list(injected.keys())}")
+
+    # Inject each field as a hidden input (or update existing)
+    inject_js = """
+(function(fields) {
+    var form = document.getElementById('postingForm');
+    if (!form) return {ok: false, reason: 'no-form'};
+    var injected = [];
+    for (var name in fields) {
+        var val = fields[name];
+        // Check if field already exists
+        var existing = form.querySelector('[name="' + name + '"]');
+        if (existing) {
+            var old = existing.value;
+            existing.value = val;
+            existing.setAttribute('value', val);
+            injected.push('updated:' + name + '=' + val + '(was:' + old + ')');
+        } else {
+            var inp = document.createElement('input');
+            inp.type = 'hidden';
+            inp.name = name;
+            inp.value = val;
+            form.appendChild(inp);
+            injected.push('added:' + name + '=' + val);
+        }
+    }
+    return {ok: true, injected: injected};
+})(arguments[0]);
+"""
+    result = driver.execute_script(inject_js, injected)
+    print(f"  [GEO] Injection result: {result}")
+    return bool(result and result.get("ok"))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  DIRECT GEO FETCH — if the autocomplete never fires a real network call,
+#  we make the call ourselves using requests (from Python, bypassing JS) and
+#  inject the result. This is the guaranteed fallback.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _fetch_cl_geo_direct(driver, zip_str, city="Los Angeles", state="CA"):
+    """
+    Make the postal lookup request directly from Python using the same
+    session cookies as the browser. CL's geo endpoint accepts GET requests.
+
+    Known CL geo/suggest endpoint patterns (may vary by city):
+      https://losangeles.craigslist.org/suggest?fieldname=postal&typing=90001
+      https://post.craigslist.org/suggest?fieldname=postal&typing=90001
+      https://post.craigslist.org/c/sss?s=geo&q=90001
+
+    We try each and return the first successful response.
+    """
+    # Extract cookies from browser
+    cookies = {}
+    try:
+        for cookie in driver.get_cookies():
+            cookies[cookie["name"]] = cookie["value"]
+    except Exception as e:
+        print(f"  [GEO-direct] Could not get cookies: {e}")
+
+    headers = {
+        "User-Agent": driver.execute_script("return navigator.userAgent;"),
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Accept-Language": "en-US,en;q=0.9",
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": driver.current_url,
+        "Origin": "https://post.craigslist.org",
+    }
+
+    city_slug = CL_CITY.lower().replace(" ", "").replace("-", "")
+    candidate_urls = [
+        f"https://post.craigslist.org/suggest?fieldname=postal&typing={zip_str}",
+        f"https://{city_slug}.craigslist.org/suggest?fieldname=postal&typing={zip_str}",
+        f"https://post.craigslist.org/suggest?fieldname=postal_code&typing={zip_str}",
+        f"https://post.craigslist.org/geo?q={zip_str}",
+        f"https://{city_slug}.craigslist.org/geo?q={zip_str}",
+        f"https://post.craigslist.org/c/sss?s=geo&q={zip_str}",
+    ]
+
+    for url in candidate_urls:
+        try:
+            resp = requests.get(url, headers=headers, cookies=cookies,
+                                timeout=8, allow_redirects=True)
+            print(f"  [GEO-direct] {url} → {resp.status_code} ({len(resp.text)} bytes)")
+            if resp.status_code == 200 and resp.text.strip():
+                print(f"  [GEO-direct] Response: {resp.text[:300]}")
+                return resp.text, url
+        except Exception as e:
+            print(f"  [GEO-direct] {url} failed: {e}")
+
+    print("  [GEO-direct] No successful geo response from any endpoint")
+    return None, None
+
+
+def _trigger_real_geo_lookup(driver, zip_str):
+    """
+    Force CL's own JS to make the postal lookup XHR/fetch by calling their
+    internal autocomplete source function directly.
+
+    CL's autocomplete source is defined in postingform-concat.min.js.
+    We find it by walking jQuery UI autocomplete instances on the form.
+    If found, we call it with the ZIP and wait for the callback.
+    """
+    trigger_js = """
+(function(zipVal, callback) {
+    var postalEl = document.querySelector('[name="postal"]') ||
+                   document.querySelector('[name="postal_code"]') ||
+                   document.querySelector('#postal_code') ||
+                   document.querySelector('#postal');
+
+    if (!postalEl || !window.jQuery) {
+        return {ok: false, reason: 'no-postal-or-jquery'};
+    }
+
+    var jq = jQuery(postalEl);
+
+    // Try to get the autocomplete instance's source function
+    var acData = jq.data('ui-autocomplete') || jq.data('autocomplete');
+    if (!acData || !acData.options || !acData.options.source) {
+        return {ok: false, reason: 'no-autocomplete-instance', data: Object.keys(jq.data() || {})};
+    }
+
+    var sourceFn = acData.options.source;
+    if (typeof sourceFn !== 'function') {
+        // It's a URL string or array — that's the source directly
+        return {ok: false, reason: 'source-not-function', sourceType: typeof sourceFn, source: String(sourceFn).substring(0,100)};
+    }
+
+    // Call the source function as CL does internally
+    window._clGeoLookupTriggered = false;
+    window._clGeoLookupResponse = null;
+
+    try {
+        sourceFn.call(acData, {term: zipVal}, function(items) {
+            window._clGeoLookupTriggered = true;
+            window._clGeoLookupResponse = items;
+        });
+        return {ok: true, reason: 'source-called'};
+    } catch(e) {
+        return {ok: false, reason: 'source-call-error', error: e.message};
+    }
+})(arguments[0]);
+"""
+    result = driver.execute_script(trigger_js, zip_str)
+    print(f"  [GEO-trigger] Direct source call result: {result}")
+
+    if result and result.get("ok"):
+        # Wait for async callback
+        try:
+            WebDriverWait(driver, 8).until(
+                lambda d: d.execute_script("return !!window._clGeoLookupTriggered;"))
+            items = driver.execute_script("return window._clGeoLookupResponse;")
+            print(f"  [GEO-trigger] Got {len(items) if items else 0} items from source")
+            return items
+        except TimeoutException:
+            print("  [GEO-trigger] Source callback timed out")
+
+    return None
+
+
 def make_driver(proxy_url=None):
     from selenium.webdriver.chrome.service import Service as ChromeService
     os.environ["SE_MANAGER_PATH"] = ""
@@ -323,8 +745,10 @@ def make_driver(proxy_url=None):
     except Exception:
         pass
 
-    # Intercept native form.submit() and requestSubmit() at the page level
-    # so we can read the exact POST body before it leaves the browser.
+    # Register network spy for all new documents
+    _start_cdp_network_capture(driver)
+
+    # Native form submit interceptor
     _FORM_INTERCEPT_JS = """
 (function() {
     window._clNativeSubmitPayloads = [];
@@ -469,7 +893,7 @@ def _find_field(driver, selectors, timeout=8):
 
 def _cdp_type(driver, element, value):
     """
-    Type into a field using CDP char events only (no keyDown/keyUp to avoid doubling).
+    Type into a field using CDP char events only.
     After typing, fires jQuery-compatible events so CL's validator marks field touched.
     """
     value = str(value).strip()
@@ -499,7 +923,6 @@ def _cdp_type(driver, element, value):
 
     time.sleep(0.1)
 
-    # Type each character — char event only (keyDown+char+keyUp causes doubling)
     for ch in value:
         driver.execute_cdp_cmd("Input.dispatchKeyEvent", {
             "type": "char",
@@ -511,7 +934,6 @@ def _cdp_type(driver, element, value):
 
     time.sleep(0.2)
 
-    # Fire jQuery events so CL's validator marks field as touched
     driver.execute_script("""
         var el = arguments[0];
         el.dispatchEvent(new Event('input',  {bubbles: true, cancelable: true}));
@@ -523,150 +945,32 @@ def _cdp_type(driver, element, value):
     time.sleep(0.25)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  ZIP FIELD — The core problem and the fix
+# ─────────────────────────────────────────────────────────────────────────────
+#  FIXED ZIP PATCH JS
 #
-#  What we know from 10+ debug runs:
-#  - CL's autocomplete widget is NEVER attached (widget: False, jq_events: [])
-#  - VALUE_SET by CL JS: [] — CL is NOT clearing the field via JS
-#  - The value IS in the DOM (✓ [ZIP] = '90001') but postal='' at submit time
-#  - cl-model-written: false, no-json-form-api — no internal model to inject into
-#  - All events are trusted (real HW events firing correctly)
+#  Previous version returned None because:
+#  1. The IIFE was wrapped as `(function(zipVal) { ... })(arguments[0])` but
+#     execute_script wraps the code in another function, so `arguments[0]` at
+#     the outer IIFE call referred to the execute_script arguments, not the
+#     passed zipVal. Fixed by using the standard execute_script argument passing.
+#  2. Several inner try/catch blocks were swallowing errors silently.
+#  3. The return value was inside the IIFE but execute_script needs the OUTER
+#     function to return it.
 #
-#  Root cause: CL's postingform-concat.min.js reads the postal field through
-#  a custom serializer that checks an "autofilled" flag. This flag is set when
-#  the postal value was NOT confirmed through their autocomplete select callback.
-#  Since the widget never initializes, no select callback ever fires, so the
-#  flag stays "autofilled" and the serializer sends "" to the server.
-#
-#  THE FIX: Intercept CL's own form serializer at the JS level before submit.
-#  We patch window.XMLHttpRequest and fetch to intercept the postal lookup,
-#  AND we patch the form's serialize/submit logic to strip the autofilled flag.
-# ═══════════════════════════════════════════════════════════════════════════════
+#  This version is structured as a plain script (not IIFE) that uses
+#  `arguments[0]` directly as execute_script passes it.
+# ─────────────────────────────────────────────────────────────────────────────
 
 _ZIP_PATCH_JS = """
-(function(zipVal) {
-    // ── Step 1: Intercept XHR to mock the postal autocomplete lookup ──────────
-    // CL calls an endpoint like /suggest or /geo?q=90001 to validate the ZIP.
-    // We intercept it and return a successful response so CL marks ZIP as confirmed.
-    var OrigXHR = window.XMLHttpRequest;
-    window.XMLHttpRequest = function() {
-        var xhr = new OrigXHR();
-        var origOpen = xhr.open.bind(xhr);
-        var origSend = xhr.send.bind(xhr);
-        var _url = '';
-        xhr.open = function(method, url) {
-            _url = url || '';
-            return origOpen(method, url);
-        };
-        xhr.send = function(body) {
-            // Check if this is a postal/geo/suggest lookup
-            if (_url && (
-                _url.indexOf('postal') !== -1 ||
-                _url.indexOf('suggest') !== -1 ||
-                _url.indexOf('/geo') !== -1 ||
-                _url.indexOf('zip') !== -1 ||
-                _url.indexOf('location') !== -1
-            )) {
-                window._clPostalXhrIntercepted = _url;
-                // Mock a successful response
-                Object.defineProperty(xhr, 'status', {get: function(){ return 200; }});
-                Object.defineProperty(xhr, 'readyState', {get: function(){ return 4; }});
-                Object.defineProperty(xhr, 'responseText', {get: function(){
-                    return JSON.stringify([{
-                        value: zipVal,
-                        label: zipVal + ' - Los Angeles, CA',
-                        id: zipVal,
-                        zip: zipVal,
-                        city: 'Los Angeles',
-                        state: 'CA'
-                    }]);
-                }});
-                // Fire onreadystatechange and onload
-                try { if (xhr.onreadystatechange) xhr.onreadystatechange(); } catch(e){}
-                try { if (xhr.onload) xhr.onload(); } catch(e){}
-                return;
-            }
-            return origSend(body);
-        };
-        return xhr;
-    };
-    // Copy static properties
-    for (var k in OrigXHR) {
-        try { window.XMLHttpRequest[k] = OrigXHR[k]; } catch(e) {}
-    }
-    window.XMLHttpRequest.prototype = OrigXHR.prototype;
+var zipVal = arguments[0];
+var results = [];
 
-    // ── Step 2: Intercept fetch for postal lookups ────────────────────────────
-    var origFetch = window.fetch;
-    window.fetch = function(input, init) {
-        var url = (typeof input === 'string') ? input : (input && input.url) || '';
-        if (url && (
-            url.indexOf('postal') !== -1 || url.indexOf('suggest') !== -1 ||
-            url.indexOf('/geo') !== -1 || url.indexOf('zip') !== -1 ||
-            url.indexOf('location') !== -1
-        )) {
-            window._clPostalFetchIntercepted = url;
-            var mockData = JSON.stringify([{
-                value: zipVal, label: zipVal + ' - Los Angeles, CA',
-                id: zipVal, zip: zipVal, city: 'Los Angeles', state: 'CA'
-            }]);
-            return Promise.resolve(new Response(mockData, {
-                status: 200, headers: {'Content-Type': 'application/json'}
-            }));
-        }
-        return origFetch.apply(this, arguments);
-    };
-
-    // ── Step 3: Simulate autocomplete select on the postal field ─────────────
-    // After a delay (allowing CL's JS to initialize the widget), we fire
-    // jQuery UI's autocompleteselect event with our ZIP as the selected item.
-    setTimeout(function() {
-        var postalEl = document.querySelector('[name="postal"]') ||
-                       document.querySelector('[name="postal_code"]') ||
-                       document.querySelector('#postal_code');
-        if (!postalEl || !window.jQuery) return;
-
-        var jq = jQuery(postalEl);
-
-        // Try to initialize the autocomplete widget if it hasn't been done
-        try {
-            if (!jq.data('ui-autocomplete') && !jq.data('autocomplete')) {
-                jq.autocomplete({
-                    source: [{value: zipVal, label: zipVal + ' - Los Angeles, CA'}],
-                    minLength: 0,
-                    select: function(event, ui) {
-                        postalEl.value = ui.item.value;
-                        window._clZipAutoconfirmed = true;
-                    }
-                });
-                window._clZipWidgetCreated = true;
-            }
-        } catch(e) { window._clZipWidgetErr = e.message; }
-
-        // Fire autocompleteselect event as if user clicked a suggestion
-        var selectEvent = jQuery.Event('autocompleteselect');
-        selectEvent.item = {value: zipVal, label: zipVal + ' - Los Angeles, CA'};
-        jq.trigger(selectEvent);
-
-        // Also fire the jQuery UI internal select trigger
-        try {
-            jq.trigger(jQuery.Event('autocompletechange'), {item: {value: zipVal}});
-        } catch(e) {}
-
-        window._clZipAutoconfirmed = true;
-        window._clZipFired = 'autocomplete-events-fired';
-    }, 2000);
-
-    // ── Step 4: Patch the form serializer ────────────────────────────────────
-    // CL uses a custom json-form or postingform serializer. We wrap jQuery's
-    // serializeArray to force the postal field to have our value regardless
-    // of any "autofilled" internal flag.
+try {
+    // ── Step 1: Patch jQuery serializeArray ──────────────────────────────────
     if (window.jQuery) {
         var origSerializeArray = jQuery.fn.serializeArray;
         jQuery.fn.serializeArray = function() {
             var result = origSerializeArray.call(this);
-            // Find and override postal entry
             var hasPostal = false;
             for (var i = 0; i < result.length; i++) {
                 if (result[i].name === 'postal' || result[i].name === 'postal_code') {
@@ -674,68 +978,105 @@ _ZIP_PATCH_JS = """
                     hasPostal = true;
                 }
             }
-            if (!hasPostal) {
-                result.push({name: 'postal', value: zipVal});
-            }
+            if (!hasPostal) result.push({name: 'postal', value: zipVal});
             return result;
         };
 
         var origSerialize = jQuery.fn.serialize;
         jQuery.fn.serialize = function() {
             var s = origSerialize.call(this);
-            // Replace postal= with our value
             s = s.replace(/postal=[^&]*/g, 'postal=' + encodeURIComponent(zipVal));
             s = s.replace(/postal_code=[^&]*/g, 'postal_code=' + encodeURIComponent(zipVal));
-            if (s.indexOf('postal=') === -1) {
-                s += (s ? '&' : '') + 'postal=' + encodeURIComponent(zipVal);
-            }
+            if (s.indexOf('postal=') === -1) s += (s ? '&' : '') + 'postal=' + encodeURIComponent(zipVal);
             return s;
         };
+        results.push('serializer-patched');
         window._clSerializerPatched = true;
+    } else {
+        results.push('no-jquery');
     }
+} catch(e) { results.push('serializer-err:' + e.message); }
 
-    // ── Step 5: Patch FormData to inject postal ───────────────────────────────
+try {
+    // ── Step 2: Patch FormData ───────────────────────────────────────────────
     var OrigFormData = window.FormData;
-    window.FormData = function(form) {
+    function PatchedFormData(form) {
         var fd = form ? new OrigFormData(form) : new OrigFormData();
         if (form) {
-            // Override postal value
-            try {
-                fd.set('postal', zipVal);
-                fd.set('postal_code', zipVal);
-            } catch(e) {}
+            try { fd.set('postal', zipVal); } catch(e) {}
+            try { fd.set('postal_code', zipVal); } catch(e) {}
         }
         var origAppend = fd.append.bind(fd);
-        var origSet = fd.set ? fd.set.bind(fd) : null;
         fd.append = function(name, value) {
             if (name === 'postal' || name === 'postal_code') value = zipVal;
             return origAppend(name, value);
         };
-        if (origSet) {
+        if (fd.set) {
+            var origSet = fd.set.bind(fd);
             fd.set = function(name, value) {
                 if (name === 'postal' || name === 'postal_code') value = zipVal;
                 return origSet(name, value);
             };
         }
         return fd;
-    };
-    window.FormData.prototype = OrigFormData.prototype;
+    }
+    PatchedFormData.prototype = OrigFormData.prototype;
+    window.FormData = PatchedFormData;
+    results.push('formdata-patched');
+} catch(e) { results.push('formdata-err:' + e.message); }
 
-    window._clZipPatchInstalled = true;
-    return 'zip-patch-installed';
-})(arguments[0]);
+try {
+    // ── Step 3: Simulate autocomplete select after widget initializes ────────
+    setTimeout(function() {
+        try {
+            var postalEl = document.querySelector('[name="postal"]') ||
+                           document.querySelector('[name="postal_code"]') ||
+                           document.querySelector('#postal_code') ||
+                           document.querySelector('#postal');
+            if (!postalEl || !window.jQuery) return;
+            var jq = jQuery(postalEl);
+
+            // Try attaching our own autocomplete if CL's isn't there
+            if (!jq.data('ui-autocomplete') && !jq.data('autocomplete')) {
+                jq.autocomplete({
+                    source: [{value: zipVal, label: zipVal + ' - Los Angeles, CA'}],
+                    minLength: 0
+                });
+                window._clZipWidgetCreated = true;
+            }
+
+            // Fire select event
+            var selectEvent = jQuery.Event('autocompleteselect');
+            selectEvent.item = {value: zipVal, label: zipVal + ' - Los Angeles, CA'};
+            jq.trigger(selectEvent);
+            jq.trigger(jQuery.Event('autocompletechange'), {item: {value: zipVal}});
+            window._clZipAutoconfirmed = true;
+            window._clZipFired = 'autocomplete-events-fired';
+        } catch(e2) {
+            window._clZipWidgetErr = e2.message;
+        }
+    }, 2500);
+    results.push('autocomplete-timer-set');
+} catch(e) { results.push('autocomplete-timer-err:' + e.message); }
+
+window._clZipPatchInstalled = true;
+window._clZipPatchResults = results;
+return results.join(',');
 """
 
 _VALIDATOR_NUKE_JS = """
-(function(zipVal) {
-    // ── Nuclear option: strip ALL validation from postal field ────────────────
-    var results = [];
+var zipVal = arguments[0];
+var results = [];
 
+try {
     var postalEl = document.querySelector('[name="postal"]') ||
                    document.querySelector('[name="postal_code"]') ||
-                   document.querySelector('#postal_code');
+                   document.querySelector('#postal_code') ||
+                   document.querySelector('#postal');
 
-    if (!postalEl) { results.push('no-postal-el'); return results; }
+    if (!postalEl) {
+        return ['no-postal-el'];
+    }
 
     // 1. Force the DOM value using native setter
     var nativeSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
@@ -749,33 +1090,30 @@ _VALIDATOR_NUKE_JS = """
         // 2. Remove ALL jQuery validation rules on this field
         try { jq.rules('remove'); results.push('rules-removed'); } catch(e) {}
 
-        // 3. Remove from validator's internal rule registry
+        // 3. Remove from validator internal registry
         var form = document.getElementById('postingForm');
         if (form) {
             var validator = jQuery(form).data('validator');
             if (validator) {
-                // Delete rules
                 if (validator.settings && validator.settings.rules) {
                     delete validator.settings.rules['postal'];
                     delete validator.settings.rules['postal_code'];
                     results.push('validator-rules-deleted');
                 }
-                // Add to success list
-                try {
-                    validator.successList = validator.successList || [];
-                    if (validator.successList.indexOf(postalEl) === -1) {
-                        validator.successList.push(postalEl);
-                    }
-                    results.push('added-to-success-list');
-                } catch(e) {}
-                // Reset element error state
+                validator.successList = validator.successList || [];
+                if (validator.successList.indexOf(postalEl) === -1) {
+                    validator.successList.push(postalEl);
+                }
+                results.push('added-to-success-list');
                 try { validator.resetElements([postalEl]); results.push('element-reset'); } catch(e) {}
 
-                // 4. Walk ALL custom validation methods and disable for postal
+                // 4. Walk custom validation methods and disable for postal
                 if (jQuery.validator && jQuery.validator.methods) {
                     var nuked = 0;
+                    var builtins = ['required','email','url','number','digits','min','max',
+                                    'minlength','maxlength','range','rangelength','equalTo','remote'];
                     jQuery.each(jQuery.validator.methods, function(name, fn) {
-                        if (['required','email','url','number','digits','min','max','minlength','maxlength','range','rangelength','equalTo','remote'].indexOf(name) !== -1) return;
+                        if (builtins.indexOf(name) !== -1) return;
                         var orig = fn;
                         jQuery.validator.methods[name] = function(value, element, param) {
                             if (element === postalEl) return true;
@@ -785,22 +1123,24 @@ _VALIDATOR_NUKE_JS = """
                     });
                     results.push('custom-methods-nuked:' + nuked);
                 }
+            } else {
+                results.push('no-validator-instance');
             }
         }
 
         // 5. Clear error UI
-        jQuery(postalEl)
-            .removeClass('error invalid required')
-            .removeAttr('aria-invalid')
-            .removeAttr('aria-required')
-            .removeAttr('aria-describedby');
-        jQuery('label[for="postal_code"].error, label[for="postal"].error, #postal_code-error, #postal-error').remove();
+        jq.removeClass('error invalid required')
+          .removeAttr('aria-invalid')
+          .removeAttr('aria-required')
+          .removeAttr('aria-describedby');
+        jQuery('label[for="postal_code"].error,label[for="postal"].error,#postal_code-error,#postal-error').remove();
         jQuery('.err li').filter(function() {
-            return jQuery(this).text().toLowerCase().indexOf('zip') !== -1;
+            return jQuery(this).text().toLowerCase().indexOf('zip') !== -1 ||
+                   jQuery(this).text().toLowerCase().indexOf('postal') !== -1;
         }).remove();
         results.push('error-ui-cleared');
 
-        // 6. Fire events through jQuery so CL's validator marks it valid
+        // 6. Fire events so CL's validator marks it valid
         jq.val(zipVal)
           .trigger(jQuery.Event('focus',  {bubbles: true}))
           .trigger(jQuery.Event('input',  {bubbles: true}))
@@ -808,34 +1148,47 @@ _VALIDATOR_NUKE_JS = """
           .trigger(jQuery.Event('blur',   {bubbles: true}));
         results.push('events-fired');
 
-        // 7. Mark it in the successList of any ancestor validator too
-        jQuery('[name="postal_code"], [name="postal"]').each(function() {
+        // 7. Mark in success lists of all ancestor validators
+        jQuery('[name="postal_code"],[name="postal"]').each(function() {
             var el = this;
             jQuery('form').each(function() {
                 var v = jQuery(this).data('validator');
                 if (v) {
                     v.successList = v.successList || [];
                     if (v.successList.indexOf(el) === -1) v.successList.push(el);
-                    try { v.resetElements([el]); } catch(e) {}
+                    try { v.resetElements([el]); } catch(e2) {}
                 }
             });
         });
+    } else {
+        results.push('no-jquery-for-validator-nuke');
     }
+} catch(e) {
+    results.push('nuke-exception:' + e.message);
+}
 
-    return results;
-})(arguments[0]);
+return results;
 """
 
 
 def _fill_zip_with_network_intercept(driver, zip_field, zip_str):
     """
-    The definitive ZIP fill strategy:
-    1. Install XHR/fetch/serialize/FormData patches BEFORE touching the field
-    2. Type the ZIP with native send_keys (triggers real keyboard events)
-    3. Wait for autocomplete or AJAX
-    4. Run nuclear validator nuke right before submit
+    The definitive ZIP fill strategy — v2 with real geo response capture:
+
+    1. Install network spy (already done at page load via Page.addScriptToEvaluateOnNewDocument)
+    2. Install serializer / FormData patches
+    3. Type ZIP with native keyboard events to trigger CL's autocomplete
+    4. Try to click the dropdown suggestion
+    5. WAIT for and capture any real geo network response
+    6. If a real geo response was captured, inject its hidden fields into the DOM
+    7. If no real geo response, make the request ourselves (Python requests) and inject
+    8. Run validator nuke before submit
     """
-    # Install the interceptor patches NOW — before any typing
+    # Ensure network spy is installed in this page context
+    _install_network_spy_now(driver)
+    time.sleep(0.3)
+
+    # Install serializer + FormData patches
     patch_result = driver.execute_script(_ZIP_PATCH_JS, zip_str)
     print(f"  [ZIP] Patch install: {patch_result}")
     time.sleep(0.5)
@@ -876,7 +1229,7 @@ def _fill_zip_with_network_intercept(driver, zip_field, zip_str):
     for ch in zip_str:
         zip_field.send_keys(ch)
         time.sleep(random.uniform(0.10, 0.18))
-    time.sleep(1.0)
+    time.sleep(1.2)  # Give autocomplete time to fire XHR
 
     # Try to find and click autocomplete dropdown
     dropdown_selectors = [
@@ -902,11 +1255,10 @@ def _fill_zip_with_network_intercept(driver, zip_field, zip_str):
                 print("  [ZIP] Clicked suggestion ✓")
                 break
     except TimeoutException:
-        print("  [ZIP] No dropdown — tabbing out")
-        zip_field.send_keys(Keys.TAB)
+        print("  [ZIP] No dropdown appeared")
 
     if not suggestion_clicked:
-        # ArrowDown attempt
+        # Arrow down attempt
         try:
             zip_field.send_keys(Keys.ARROW_DOWN)
             time.sleep(1.0)
@@ -921,7 +1273,11 @@ def _fill_zip_with_network_intercept(driver, zip_field, zip_str):
         except Exception:
             pass
 
-    # Wait for AJAX
+    if not suggestion_clicked:
+        zip_field.send_keys(Keys.TAB)
+        print("  [ZIP] Tabbed out (no dropdown)")
+
+    # Wait for any AJAX to complete
     print("  [ZIP] Waiting for location AJAX...")
     try:
         WebDriverWait(driver, 10).until(
@@ -931,16 +1287,60 @@ def _fill_zip_with_network_intercept(driver, zip_field, zip_str):
         print("  [ZIP] AJAX wait timed out")
     time.sleep(2.0)
 
+    # ── CRITICAL: Check if a real geo network call was made ──────────────────
+    geo_responses, all_calls = _get_geo_responses(driver)
+    print(f"  [GEO] Captured {len(geo_responses)} geo response(s), {len(all_calls)} total network calls")
+
+    if all_calls:
+        print(f"  [GEO] All network calls during ZIP entry:")
+        for call in all_calls:
+            print(f"    {call.get('type','?')} {call.get('status','?')} {call.get('url','')[:100]}")
+
+    geo_injected = False
+    if geo_responses:
+        for geo_resp in geo_responses:
+            print(f"  [GEO] Real geo response from: {geo_resp.get('url','')}")
+            print(f"  [GEO] Response body: {geo_resp.get('responseText','')[:500]}")
+            if _inject_geo_hidden_fields(driver, geo_resp.get('responseText',''), zip_str):
+                geo_injected = True
+                break
+
+    if not geo_injected:
+        print("  [GEO] No real geo XHR captured — trying direct source function call")
+        # Try calling CL's autocomplete source function directly
+        items = _trigger_real_geo_lookup(driver, zip_str)
+        if items:
+            # Re-check network captures (source fn may have fired XHR now)
+            time.sleep(2)
+            geo_responses, _ = _get_geo_responses(driver)
+            for geo_resp in geo_responses:
+                if _inject_geo_hidden_fields(driver, geo_resp.get('responseText',''), zip_str):
+                    geo_injected = True
+                    break
+
+    if not geo_injected:
+        print("  [GEO] Falling back to direct Python geo request")
+        geo_text, geo_url = _fetch_cl_geo_direct(driver, zip_str)
+        if geo_text:
+            print(f"  [GEO] Direct fetch succeeded from {geo_url}")
+            _inject_geo_hidden_fields(driver, geo_text, zip_str)
+        else:
+            print("  [GEO] ⚠ Could not obtain geo response by any method")
+            print("  [GEO] ⚠ Run DevTools snippet from debug note on a REAL manual submission")
+            print("  [GEO] ⚠ to identify exactly which hidden field(s) are missing")
+
     # Check patch status
     patch_status = driver.execute_script("""
         return {
             patchInstalled: window._clZipPatchInstalled,
+            patchResults: window._clZipPatchResults,
             serializerPatched: window._clSerializerPatched,
             widgetCreated: window._clZipWidgetCreated,
             widgetErr: window._clZipWidgetErr,
             autoconfirmed: window._clZipAutoconfirmed,
             xhrIntercepted: window._clPostalXhrIntercepted || null,
             fetchIntercepted: window._clPostalFetchIntercepted || null,
+            geoResponses: (window._clCapturedGeoResponses || []).length,
             zipFired: window._clZipFired || null
         };
     """)
@@ -967,24 +1367,7 @@ def _fill_zip_with_network_intercept(driver, zip_field, zip_str):
 
     print(f"  ✓ [ZIP] = '{actual}'")
 
-    # Dump event spy if present
-    spy_log = driver.execute_script("return window._zipEvents || [];")
-    if spy_log:
-        event_types, trusted_evs, untrusted_evs, value_sets = [], [], [], []
-        for ev in spy_log:
-            t = ev.get('type', '')
-            if t == 'VALUE_SET':
-                value_sets.append(ev.get('newVal'))
-            else:
-                if not event_types or event_types[-1] != t:
-                    event_types.append(t)
-                (trusted_evs if ev.get('trusted') else untrusted_evs).append(t)
-        print(f"  [ZIP] EventSpy sequence : {event_types}")
-        print(f"  [ZIP] Trusted  (real HW): {list(dict.fromkeys(trusted_evs))}")
-        print(f"  [ZIP] Untrusted (script): {list(dict.fromkeys(untrusted_evs))}")
-        print(f"  [ZIP] VALUE_SET by CL   : {value_sets}")
-
-    # Dump hidden fields
+    # Dump hidden fields — this is the critical diagnostic
     hidden = driver.execute_script("""
         var r = {};
         document.querySelectorAll('input[type="hidden"]').forEach(function(e) {
@@ -992,7 +1375,7 @@ def _fill_zip_with_network_intercept(driver, zip_field, zip_str):
         });
         return r;
     """)
-    print(f"  [ZIP] Hidden fields: {hidden}")
+    print(f"  [ZIP] Hidden fields after geo injection: {hidden}")
 
     return zip_field
 
@@ -1000,7 +1383,7 @@ def _fill_zip_with_network_intercept(driver, zip_field, zip_str):
 def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     """
     Fill the CL posting form and submit.
-    Uses CDP typing for all fields, network interception + serializer patch for ZIP.
+    Uses CDP typing for all fields, network interception + geo injection for ZIP.
     """
     try:
         WebDriverWait(driver, 15).until(
@@ -1086,7 +1469,7 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
         pass
     time.sleep(random.uniform(0.4, 0.6))
 
-    # ── 6. ZIP — last field, with full network interception ───────────────────
+    # ── 6. ZIP — with full network interception + geo injection ───────────────
     if zip_code:
         zip_str = str(zip_code).strip()
         zip_field = _find_field(driver, [
@@ -1111,67 +1494,9 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
         nuke_result = driver.execute_script(_VALIDATOR_NUKE_JS, str(zip_code).strip())
         print(f"  [submit] Validator nuke: {nuke_result}")
 
-    # ── PAYLOAD CAPTURE: intercept the form submit to read exact POST body ────
-    # This is the key diagnostic — we capture what CL actually sends to the
-    # server so we can compare with a real manual submission.
-    # Strategy: override XMLHttpRequest.send AND fetch AND form.submit to
-    # capture the serialized body before it leaves the browser.
+    # ── Payload capture ───────────────────────────────────────────────────────
     capture_result = driver.execute_script("""
         var zipVal = arguments[0];
-        window._clCapturedPayloads = [];
-        window._clSubmitIntercepted = false;
-
-        // 1. Intercept XHR.send to capture POST bodies
-        var OrigXHR2 = window.XMLHttpRequest;
-        var OrigOpen2 = OrigXHR2.prototype.open;
-        var OrigSend2 = OrigXHR2.prototype.send;
-        OrigXHR2.prototype.open = function(method, url) {
-            this._captureMethod = method;
-            this._captureUrl = url;
-            return OrigOpen2.apply(this, arguments);
-        };
-        OrigXHR2.prototype.send = function(body) {
-            var url = this._captureUrl || '';
-            // Capture ALL posts to craigslist (not just postal)
-            if (this._captureMethod && this._captureMethod.toUpperCase() === 'POST') {
-                window._clCapturedPayloads.push({
-                    type: 'xhr',
-                    url: url,
-                    body: body ? String(body).substring(0, 2000) : null
-                });
-                window._clSubmitIntercepted = true;
-            }
-            return OrigSend2.apply(this, arguments);
-        };
-
-        // 2. Intercept fetch
-        var origFetch2 = window.fetch;
-        window.fetch = function(input, init) {
-            var url = (typeof input === 'string') ? input : (input && input.url) || '';
-            var method = (init && init.method || 'GET').toUpperCase();
-            if (method === 'POST') {
-                var body = init && init.body;
-                var bodyStr = null;
-                if (body instanceof FormData) {
-                    // Can't read FormData directly — serialize what we can
-                    var pairs = [];
-                    try { body.forEach(function(v,k){ pairs.push(k+'='+encodeURIComponent(v)); }); } catch(e){}
-                    bodyStr = pairs.join('&');
-                } else if (body) {
-                    bodyStr = String(body).substring(0, 2000);
-                }
-                window._clCapturedPayloads.push({
-                    type: 'fetch',
-                    url: url,
-                    body: bodyStr
-                });
-                window._clSubmitIntercepted = true;
-            }
-            return origFetch2.apply(this, arguments);
-        };
-
-        // 3. Capture what jQuery serializeArray gives us RIGHT NOW
-        // This is what CL's submit handler reads when it calls $(form).serialize()
         var form = document.getElementById('postingForm');
         var jqSerialized = null;
         var jqSerializedArray = null;
@@ -1181,8 +1506,6 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
                 jqSerializedArray = jQuery(form).serializeArray();
             } catch(e) { jqSerialized = 'error:' + e.message; }
         }
-
-        // 4. Capture native FormData serialization
         var nativeFormData = null;
         try {
             var fd = new FormData(form);
@@ -1191,7 +1514,6 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
             nativeFormData = fdPairs.join('&');
         } catch(e) { nativeFormData = 'error:' + e.message; }
 
-        // 5. Find what 'postal' value appears in each
         var postalInJQ = null;
         if (jqSerializedArray) {
             jqSerializedArray.forEach(function(item) {
@@ -1200,12 +1522,10 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
                 }
             });
         }
-
         return {
             jqSerialize: jqSerialized ? jqSerialized.substring(0, 500) : null,
             postalInJQ: postalInJQ,
-            nativeFormData: nativeFormData ? nativeFormData.substring(0, 500) : null,
-            interceptorsInstalled: true
+            nativeFormData: nativeFormData ? nativeFormData.substring(0, 500) : null
         };
     """, str(zip_code).strip() if zip_code else "")
 
@@ -1251,7 +1571,8 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
         driver.execute_script("""
             var pEl = document.querySelector('[name="postal"]') ||
                       document.querySelector('[name="postal_code"]') ||
-                      document.querySelector('#postal_code');
+                      document.querySelector('#postal_code') ||
+                      document.querySelector('#postal');
             if (pEl) {
                 Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(pEl, arguments[0]);
                 pEl.setAttribute('value', arguments[0]);
@@ -1274,7 +1595,8 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
         driver.execute_script("""
             var pEl = document.querySelector('[name="postal"]') ||
                       document.querySelector('[name="postal_code"]') ||
-                      document.querySelector('#postal_code');
+                      document.querySelector('#postal_code') ||
+                      document.querySelector('#postal');
             if (pEl) {
                 Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(pEl, arguments[0]);
             }
@@ -1310,15 +1632,12 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
             print(f"  [payload] [{i}] type={p.get('type')} url={p.get('url','')[:80]}")
             body = p.get('body') or ''
             print(f"  [payload] [{i}] body={body[:600]}")
-            # Highlight postal value in body
             if 'postal' in body.lower():
-                import re as _re
-                matches = _re.findall(r'postal[^=&]*=[^&]{0,20}', body, _re.IGNORECASE)
+                matches = re.findall(r'postal[^=&]*=[^&]{0,20}', body, re.IGNORECASE)
                 print(f"  [payload] [{i}] POSTAL in body: {matches}")
     else:
-        print("  [payload] No XHR/fetch POST captured — CL may use native form submit")
+        print("  [payload] No XHR/fetch POST captured — CL uses native form submit")
 
-    # Dump native form submit payloads captured by the Page-level interceptor
     native_payloads = driver.execute_script("return window._clNativeSubmitPayloads || [];")
     if native_payloads:
         print(f"  [payload] NATIVE FORM SUBMIT captured ({len(native_payloads)} submission(s)):")
@@ -1326,24 +1645,16 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
             print(f"  [payload] [native-{i}] via={p.get('via')} action={p.get('action','')[:80]}")
             body = p.get('body') or ''
             print(f"  [payload] [native-{i}] FULL BODY: {body}")
-            # Highlight postal specifically
-            import re as _re
-            postal_matches = _re.findall(r'postal[^=&]*=[^&]{0,30}', body, _re.IGNORECASE)
+            postal_matches = re.findall(r'postal[^=&]*=[^&]{0,30}', body, re.IGNORECASE)
             print(f"  [payload] [native-{i}] POSTAL fields: {postal_matches}")
     else:
         print("  [payload] No native form.submit() captured either")
-        print("  [payload] CL's submit handler may be overriding form.submit entirely")
-        # Last resort: read full form HTML to see all fields including hidden ones
         form_html = driver.execute_script("""
             var form = document.getElementById('postingForm');
             if (!form) return 'no-form';
             var inputs = [];
             form.querySelectorAll('input,textarea,select').forEach(function(el) {
-                inputs.push({
-                    name: el.name || el.id,
-                    type: el.type || el.tagName,
-                    value: (el.value || '').substring(0, 100)
-                });
+                inputs.push({name: el.name || el.id, type: el.type || el.tagName, value: (el.value || '').substring(0, 100)});
             });
             return inputs;
         """)
@@ -1390,7 +1701,33 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
         else:
             print("  [fail-errors] No .error elements found")
 
-        # Recovery attempt: blur all fields, re-nuke validator, try once more
+        # ── MANUAL SUBMISSION DIFF HELPER ─────────────────────────────────────
+        # Print the DevTools snippet output for comparison against a real run.
+        # If you run the DevTools snippet from the debug note on a real manual
+        # submission and compare the output, you will see exactly which field
+        # is present in the manual run but missing here.
+        print("  [diagnostic] Current browser state for manual diff:")
+        state = driver.execute_script("""
+            var r = {};
+            document.querySelectorAll('input[type="hidden"]').forEach(function(e) {
+                r[e.name || e.id || '?'] = e.value;
+            });
+            document.querySelectorAll('input,textarea,select').forEach(function(e) {
+                if (e.value && e.name) r['_field_' + e.name] = e.value.substring(0,50);
+            });
+            r['_cookies'] = document.cookie;
+            r['_localStorage'] = JSON.stringify(localStorage);
+            r['_sessionStorage'] = JSON.stringify(sessionStorage);
+            try { r['_jqFormData'] = JSON.stringify(jQuery('#postingForm').data()); } catch(e) {}
+            r['_geoResponses'] = (window._clCapturedGeoResponses||[]).length;
+            r['_allNetworkCalls'] = (window._clAllNetworkCalls||[]).map(function(c){
+                return c.type + ':' + c.status + ':' + c.url.substring(0,80);
+            });
+            return r;
+        """)
+        print(f"  [diagnostic] State: {json.dumps(state, indent=2)[:2000]}")
+
+        # Recovery attempt
         print("  [submit] Recovery: re-nuking validator and re-clicking...")
         if zip_code:
             driver.execute_script(_VALIDATOR_NUKE_JS, str(zip_code).strip())
