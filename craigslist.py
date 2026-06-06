@@ -458,34 +458,18 @@ def _cdp_type(driver, element, value):
 
     time.sleep(0.1)
 
-    # Step 3: Type each character via CDP keyDown + char + keyUp
+    # Step 3: Type each character via CDP "char" event ONLY.
+    # keyDown+char+keyUp causes double-insertion because Chrome processes
+    # keyDown with text="" first (inserting nothing) then char (inserting the
+    # character), but Selenium/undetected-chromedriver ALSO handles keyDown
+    # internally — resulting in every character appearing twice.
+    # Sending ONLY "char" inserts the character exactly once, cleanly.
     for ch in value:
-        key_code = _KEY_CODES.get(ch.upper(), ord(ch.upper()) if ch.isalpha() else 0)
-        modifiers = 2 if ch.isupper() or ch in '!@#$%^&*()_+{}|:"<>?' else 0
-
-        driver.execute_cdp_cmd("Input.dispatchKeyEvent", {
-            "type": "keyDown",
-            "key": ch,
-            "code": f"Key{ch.upper()}" if ch.isalpha() else "Unidentified",
-            "keyCode": key_code,
-            "modifiers": modifiers,
-            "text": ch,
-        })
         driver.execute_cdp_cmd("Input.dispatchKeyEvent", {
             "type": "char",
             "key": ch,
-            "code": f"Key{ch.upper()}" if ch.isalpha() else "Unidentified",
-            "keyCode": key_code,
-            "modifiers": modifiers,
             "text": ch,
-        })
-        driver.execute_cdp_cmd("Input.dispatchKeyEvent", {
-            "type": "keyUp",
-            "key": ch,
-            "code": f"Key{ch.upper()}" if ch.isalpha() else "Unidentified",
-            "keyCode": key_code,
-            "modifiers": modifiers,
-            "text": ch,
+            "unmodifiedText": ch,
         })
         time.sleep(random.uniform(0.06, 0.14))
 
@@ -717,6 +701,26 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
                 _cdp_type(driver, zip_field, zip_code)
                 zip_field.send_keys(Keys.TAB)
                 time.sleep(1.0)
+                actual = zip_field.get_attribute("value") or ""
+            # Last resort: if still empty, force value via JS + jQuery trigger
+            # The postal field accepts a direct value set when typed chars are lost
+            if not actual and zip_field:
+                print("  [ZIP] Still empty — forcing value via JS")
+                driver.execute_script("""
+                    var el = arguments[0];
+                    var val = arguments[1];
+                    // Use native input value setter to bypass React/Vue if present
+                    var nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+                        window.HTMLInputElement.prototype, 'value').set;
+                    nativeInputValueSetter.call(el, val);
+                    el.dispatchEvent(new Event('input',  {bubbles: true}));
+                    el.dispatchEvent(new Event('change', {bubbles: true}));
+                    el.dispatchEvent(new Event('blur',   {bubbles: true}));
+                    if (window.jQuery) {
+                        jQuery(el).val(val).trigger('input').trigger('change').trigger('blur');
+                    }
+                """, zip_field, zip_code)
+                time.sleep(0.5)
                 actual = zip_field.get_attribute("value") or ""
             print(f"  ✓ [ZIP] = '{actual}'")
         else:
