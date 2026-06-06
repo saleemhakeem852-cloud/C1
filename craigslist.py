@@ -1551,6 +1551,25 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     handle_captcha_if_present(driver)
     _wait_for_cl_js_init(driver)
 
+    # ── DIAGNOSTIC: Read edit page initial state BEFORE touching anything ─────
+    try:
+        initial_state = driver.execute_script(
+            "var r={};"
+            "document.querySelectorAll('input[type=\'hidden\']').forEach(function(e){"
+            "  r[e.name||e.id||'?']=(e.value||'').substring(0,70);"
+            "});"
+            "var postal=document.querySelector('[name=\'postal\'],[name=\'postal_code\']');"
+            "r['_postal_preload']=postal?postal.value:'';"
+            "r['_postal_readonly']=postal?(postal.readOnly||postal.disabled||false):null;"
+            "return r;"
+        )
+        print(f"  [EDIT-DIAG] Edit page initial state: {initial_state}")
+        print(f"  [EDIT-DIAG] cryptedStepCheck at load: {initial_state.get('cryptedStepCheck','MISSING')[:60]}")
+        print(f"  [EDIT-DIAG] postal at load: '{initial_state.get('_postal_preload','')}'")
+        print(f"  [EDIT-DIAG] postal readonly/disabled: {initial_state.get('_postal_readonly')}")
+    except Exception as _e_diag:
+        print(f"  [EDIT-DIAG] failed: {_e_diag}")
+
     title = (product.get("title") or product.get("name") or "Quality Item For Sale").strip()
     description = (product.get("description") or (
         f"{title} in excellent condition. Well maintained and ready for a new home. "
@@ -1625,24 +1644,8 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     time.sleep(random.uniform(0.4, 0.6))
 
     # ── 6. ZIP ────────────────────────────────────────────────────────────────
-    # FINAL APPROACH — based on confirmed facts from both test logs:
-    #
-    # FACT 1: CL's postal field has NO autocomplete (Log2: no-ac-instance, keys=[]).
-    #         Every dropdown we saw was our OWN fake widget. Real CL has none.
-    #
-    # FACT 2: Real humans just type the ZIP and submit. No dropdown needed.
-    #
-    # FACT 3: cryptedStepCheck is signed at PAGE-LOAD by the server, encoding
-    #         the expected postal from the city/area the user selected.
-    #         Overwriting a pre-loaded ZIP = token mismatch = "autofilled" error.
-    #
-    # SOLUTION:
-    # Step 1 — Read what CL pre-loaded into postal at page load.
-    # Step 2 — If already correct: DO NOT touch it. Token is valid.
-    # Step 3 — If different CL value: accept CL's value, keep token valid.
-    # Step 4 — If empty: type it with real send_keys + Tab (no CDP, no patches).
-    # No fake widget, no serializer patches, no validator nuke, no autocomplete.
-
+    # APPROACH: Read pre-loaded value. Don't touch if already correct.
+    # If empty: plain send_keys + Tab (human-like). No patches, no fake widgets.
     if zip_code:
         zip_str = str(zip_code).strip()
         zip_field = _find_field(driver, [
@@ -1654,18 +1657,18 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
             print(f"  [ZIP] Pre-loaded postal value at page load: '{preloaded_val}'")
 
             if preloaded_val == zip_str:
-                # CL already put the correct ZIP — token signed for this value
-                print(f"  ✓ [ZIP] = '{zip_str}' (pre-loaded by CL, not touched — token valid)")
+                print(f"  ✓ [ZIP] = '{zip_str}' (pre-loaded by CL, not touched)")
 
             elif preloaded_val:
-                # CL pre-loaded a different ZIP from city selection.
-                # Token is signed for CL's value. Accept it to keep token valid.
-                print(f"  [ZIP] CL pre-loaded '{preloaded_val}', wanted '{zip_str}' — accepting CL's value")
-                print(f"  ✓ [ZIP] = '{preloaded_val}' (CL's value, token valid)")
+                print(f"  [ZIP] CL pre-loaded '{preloaded_val}', wanted '{zip_str}' — accepting CL value")
+                print(f"  ✓ [ZIP] = '{preloaded_val}' (CL pre-loaded, token valid)")
 
             else:
-                # Field is empty — token signed with postal=empty. Type it naturally.
+                # Field is empty. Type naturally with send_keys + Tab.
                 print(f"  [ZIP] Field empty — typing '{zip_str}' with real send_keys")
+                token_before_zip = driver.execute_script(
+                    "var e=document.querySelector('[name=\'cryptedStepCheck\']');"
+                    "return e?e.value:null;")
                 try:
                     ActionChains(driver)\
                         .move_to_element(zip_field)\
@@ -1682,15 +1685,25 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
                         time.sleep(random.uniform(0.08, 0.18))
                     time.sleep(0.5)
                     zip_field.send_keys(Keys.TAB)
-                    time.sleep(1.0)
+                    time.sleep(2.0)
                     actual = zip_field.get_attribute("value") or ""
                     print(f"  ✓ [ZIP] = '{actual}'")
+                    token_after_zip = driver.execute_script(
+                        "var e=document.querySelector('[name=\'cryptedStepCheck\']');"
+                        "return e?e.value:null;")
+                    if token_before_zip != token_after_zip:
+                        print(f"  [ZIP-DIAG] *** TOKEN ROTATED AFTER TYPING ZIP ***")
+                        print(f"  [ZIP-DIAG] before: {str(token_before_zip)[:60]}")
+                        print(f"  [ZIP-DIAG] after:  {str(token_after_zip)[:60]}")
+                    else:
+                        print(f"  [ZIP-DIAG] Token did NOT change after typing ZIP (expected)")
+                        print(f"  [ZIP-DIAG] token: {str(token_before_zip)[:60]}")
                 except Exception as e_zip:
                     print(f"  [ZIP] send_keys failed: {e_zip}")
         else:
             print("  ⚠ [ZIP] field not found")
 
-    # ── Wait for all AJAX to settle ───────────────────────────────────────────
+    # ── Wait for AJAX ─────────────────────────────────────────────────────────
     try:
         WebDriverWait(driver, 8).until(
             lambda d: d.execute_script("return typeof jQuery==='undefined' || jQuery.active == 0"))
@@ -2252,6 +2265,62 @@ def post_product(driver, ad_name, product):
     if "login" in driver.current_url.lower():
         print("  ✗ Session expired.")
         return False
+
+    # ── DIAGNOSTIC: Dump area page inputs + try to fill ZIP if field exists ────
+    _area_zip = (os.environ.get("CL_ZIP") or "").strip()
+    if not _area_zip:
+        _AREA_ZIPS = {
+            "losangeles":"90001","newyork":"10001","chicago":"60601",
+            "houston":"77001","phoenix":"85001","sfbay":"94102",
+            "sandiego":"92101","seattle":"98101","miami":"33101",
+            "dallas":"75201","denver":"80201","atlanta":"30301",
+            "boston":"02101","portland":"97201",
+        }
+        _ck = CL_CITY.lower().replace(" ","").replace("-","")
+        _area_zip = _AREA_ZIPS.get(_ck, "90001")
+
+    try:
+        area_inputs = driver.execute_script(
+            "var r=[];"
+            "document.querySelectorAll('input,select,textarea').forEach(function(el){"
+            "  r.push({tag:el.tagName,type:el.type||'',name:el.name||'',"
+            "          id:el.id||'',placeholder:el.placeholder||'',"
+            "          value:(el.value||'').substring(0,30),"
+            "          visible:el.offsetParent!==null});"
+            "});"
+            "return r;"
+        )
+        print(f"  [AREA-DIAG] Inputs on area page: {area_inputs}")
+    except Exception as _e:
+        print(f"  [AREA-DIAG] input dump failed: {_e}")
+
+    try:
+        zip_on_area = driver.execute_script(
+            "var names=['postal','zip','zipcode','postal_code','zip_code'];"
+            "for(var i=0;i<names.length;i++){"
+            "  var el=document.querySelector('[name=\''+names[i]+'\']')||"
+            "          document.querySelector('[id=\''+names[i]+'\']');"
+            "  if(el) return {found:true,name:el.name,id:el.id,ph:el.placeholder,val:el.value};"
+            "}"
+            "return {found:false};"
+        )
+        print(f"  [AREA-DIAG] ZIP field on area page: {zip_on_area}")
+        if zip_on_area and zip_on_area.get("found"):
+            _fname = zip_on_area.get("name") or zip_on_area.get("id") or ""
+            print(f"  [AREA-DIAG] *** ZIP FIELD FOUND ON AREA PAGE — filling {_area_zip} ***")
+            driver.execute_script(
+                "var n=arguments[0],z=arguments[1];"
+                "var el=document.querySelector('[name=\''+n+'\']')||document.querySelector('[id=\''+n+'\']');"
+                "if(el){el.focus();el.value=z;"
+                "el.dispatchEvent(new Event('input',{bubbles:true}));"
+                "el.dispatchEvent(new Event('change',{bubbles:true}));}",
+                _fname, _area_zip
+            )
+            print(f"  [AREA-DIAG] ZIP filled on area page ✓")
+        else:
+            print(f"  [AREA-DIAG] No ZIP field on area page (will fill on edit page)")
+    except Exception as _e2:
+        print(f"  [AREA-DIAG] ZIP check failed: {_e2}")
 
     # ── City selection ────────────────────────────────────────────────────────
     try:
