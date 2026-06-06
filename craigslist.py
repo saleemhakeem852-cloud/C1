@@ -1662,9 +1662,9 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
         pass
     time.sleep(random.uniform(0.4, 0.6))
 
-    # ── 6. ZIP ────────────────────────────────────────────────────────────────
-    # APPROACH: Read pre-loaded value. Don't touch if already correct.
-    # If empty: plain send_keys + Tab (human-like). No patches, no fake widgets.
+    # ── 6. ZIP — always goes through full _fill_zip_with_network_intercept ──────
+    # This function types with ActionChains key events, waits for the dropdown,
+    # selects with ArrowDown+Enter, and checks cryptedStepCheck rotation.
     if zip_code:
         zip_str = str(zip_code).strip()
         zip_field = _find_field(driver, [
@@ -1674,49 +1674,12 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
         if zip_field:
             preloaded_val = (zip_field.get_attribute("value") or "").strip()
             print(f"  [ZIP] Pre-loaded postal value at page load: '{preloaded_val}'")
-
             if preloaded_val == zip_str:
-                print(f"  ✓ [ZIP] = '{zip_str}' (pre-loaded by CL, not touched)")
-
-            elif preloaded_val:
-                print(f"  [ZIP] CL pre-loaded '{preloaded_val}', wanted '{zip_str}' — accepting CL value")
-                print(f"  ✓ [ZIP] = '{preloaded_val}' (CL pre-loaded, token valid)")
-
+                print(f"  ✓ [ZIP] = '{zip_str}' (pre-loaded by CL — not touching, token valid)")
             else:
-                # Field is empty. Type naturally with send_keys + Tab.
-                print(f"  [ZIP] Field empty — typing '{zip_str}' with real send_keys")
-                token_before_zip = driver.execute_script(
-                    "return (function(){var inputs=document.querySelectorAll('input[type=hidden]');for(var i=0;i<inputs.length;i++){if(inputs[i].name==='cryptedStepCheck')return inputs[i].value;}return null;})()")
-                try:
-                    ActionChains(driver)\
-                        .move_to_element(zip_field)\
-                        .pause(random.uniform(0.3, 0.5))\
-                        .click()\
-                        .perform()
-                    time.sleep(0.3)
-                    zip_field.send_keys(Keys.CONTROL + "a")
-                    time.sleep(0.1)
-                    zip_field.send_keys(Keys.DELETE)
-                    time.sleep(0.2)
-                    for ch in zip_str:
-                        zip_field.send_keys(ch)
-                        time.sleep(random.uniform(0.08, 0.18))
-                    time.sleep(0.5)
-                    zip_field.send_keys(Keys.TAB)
-                    time.sleep(2.0)
-                    actual = zip_field.get_attribute("value") or ""
-                    print(f"  ✓ [ZIP] = '{actual}'")
-                    token_after_zip = driver.execute_script(
-                        "return (function(){var inputs=document.querySelectorAll('input[type=hidden]');for(var i=0;i<inputs.length;i++){if(inputs[i].name==='cryptedStepCheck')return inputs[i].value;}return null;})()")
-                    if token_before_zip != token_after_zip:
-                        print(f"  [ZIP-DIAG] *** TOKEN ROTATED AFTER TYPING ZIP ***")
-                        print(f"  [ZIP-DIAG] before: {str(token_before_zip)[:60]}")
-                        print(f"  [ZIP-DIAG] after:  {str(token_after_zip)[:60]}")
-                    else:
-                        print(f"  [ZIP-DIAG] Token did NOT change after typing ZIP (expected)")
-                        print(f"  [ZIP-DIAG] token: {str(token_before_zip)[:60]}")
-                except Exception as e_zip:
-                    print(f"  [ZIP] send_keys failed: {e_zip}")
+                # Always use the full dropdown flow — ArrowDown+Enter is the only
+                # path that triggers CL's internal autocomplete select handler
+                zip_field = _fill_zip_with_network_intercept(driver, zip_field, zip_str)
         else:
             print("  ⚠ [ZIP] field not found")
 
