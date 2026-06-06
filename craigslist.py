@@ -972,36 +972,114 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
         pass
     time.sleep(0.5)
 
-    # ── Nuke the "autofilled" validator check right before submit ─────────────────
-    driver.execute_script("""
-        if (!window.jQuery) return;
-        var form = document.getElementById('postingForm');
-        if (!form) return;
-        var validator = jQuery(form).data('validator');
-        ['postal', 'postal_code'].forEach(function(fname) {
-            var el = form.elements[fname];
-            if (el) {
-                try { jQuery(el).rules('remove'); } catch(e) {}
-                if (validator) {
-                    delete validator.settings.rules[fname];
-                    try { validator.resetElements([el]); } catch(e) {}
+    # ── Inject ZIP into CL's internal form data model ─────────────────────────
+    # CL's form serializer reads from its own internal JSON object, not from
+    # input.value. requestSubmit() submits that model — so our DOM value is
+    # ignored. We need to write into CL's model directly.
+    # Also nuke the "autofilled" validator rule so the field passes.
+    if zip_code:
+        inject_result = driver.execute_script("""
+            var zipVal = arguments[0];
+            var results = [];
+
+            // 1. Find the postal input
+            var postalEl = document.querySelector('[name="postal"]') ||
+                           document.querySelector('[name="postal_code"]') ||
+                           document.querySelector("#postal_code");
+            if (!postalEl) { results.push("no-postal-el"); return results; }
+
+            // 2. Set value on the DOM element using native setter
+            var nativeSetter = Object.getOwnPropertyDescriptor(
+                HTMLInputElement.prototype, "value").set;
+            nativeSetter.call(postalEl, zipVal);
+            postalEl.setAttribute("value", zipVal);
+            results.push("dom-set:" + postalEl.value);
+
+            if (window.jQuery) {
+                var jq = jQuery(postalEl);
+
+                // 3. Write into CL's internal form data object
+                // CL stores form state in a 'postingProcess' or 'formData' object
+                // Try every known path
+                var written = false;
+                var paths = [
+                    window.cl && window.cl.postingProcess,
+                    window.postingProcess,
+                    window.formData,
+                    window.cl && window.cl.formData,
+                ];
+                paths.forEach(function(obj) {
+                    if (!obj) return;
+                    ["postal", "postal_code"].forEach(function(k) {
+                        if (k in obj) { obj[k] = zipVal; written = true; }
+                    });
+                    if (obj.data) {
+                        ["postal", "postal_code"].forEach(function(k) {
+                            if (k in obj.data) { obj.data[k] = zipVal; written = true; }
+                        });
+                    }
+                });
+                results.push("cl-model-written:" + written);
+
+                // 4. Trigger the full event sequence CL needs
+                // (focus is already on the element from earlier; we re-fire change/blur)
+                jq.trigger(jQuery.Event("input",  {bubbles: true}));
+                jq.trigger(jQuery.Event("change", {bubbles: true}));
+                results.push("events-fired");
+
+                // 5. Strip the autofilled validator rule
+                var form = document.getElementById("postingForm");
+                if (form) {
+                    var validator = jq.closest("form").data("validator") ||
+                                    jQuery(form).data("validator");
+                    if (validator) {
+                        ["postal", "postal_code"].forEach(function(fname) {
+                            var el2 = form.elements[fname];
+                            if (el2) {
+                                try { jQuery(el2).rules("remove"); } catch(e){}
+                                if (validator.settings && validator.settings.rules) {
+                                    delete validator.settings.rules[fname];
+                                }
+                                try { validator.resetElements([el2]); } catch(e){}
+                                validator.successList = validator.successList || [];
+                                if (validator.successList.indexOf(el2) === -1) {
+                                    validator.successList.push(el2);
+                                }
+                                jQuery(el2).removeClass("error invalid")
+                                           .removeAttr("aria-invalid")
+                                           .removeAttr("aria-describedby");
+                                jQuery("#" + el2.id + "-error, label[for='" + fname + "'].error").remove();
+                            }
+                        });
+                        results.push("validator-nuked");
+                    }
                 }
-                jQuery(el).removeClass('error')
-                          .removeAttr('aria-invalid')
-                          .removeAttr('aria-describedby');
-                jQuery('#' + el.id + '-error, label[for="' + fname + '"].error').remove();
+
+                // 6. Check if there's a 'json-form' submit handler we need to call
+                // CL uses a json-form plugin that intercepts submit
+                var jsonForm = jQuery(form).data("json-form") ||
+                               jQuery(form).data("jsonForm");
+                if (jsonForm && jsonForm.setField) {
+                    try {
+                        jsonForm.setField("postal", zipVal);
+                        results.push("json-form-set");
+                    } catch(e) { results.push("json-form-err:" + e.message); }
+                } else {
+                    results.push("no-json-form-api");
+                }
             }
-        });
-    """)
+            return results;
+        """, str(zip_code).strip())
+        print(f"  [submit] ZIP inject: {inject_result}")
     time.sleep(0.3)
 
-    # ── SUBMIT: use Selenium ActionChains to click — NOT JS click ────────────
-    # JS click bypasses browser form validation events.
-    # ActionChains click goes through the full browser event pipeline.
+    # ── SUBMIT: ActionChains click is primary — requestSubmit is fallback ─────
+    # requestSubmit() submits CL's serialized form model which misses our ZIP.
+    # ActionChains fires a real mousedown/mouseup/click on the button, going
+    # through CL's click handler which re-serializes from the DOM at click time.
     print("  [submit] Finding and clicking Continue button...")
     submitted = False
 
-    # Find the button
     submit_btn = None
     for by, sel in [
         (By.CSS_SELECTOR, "button.go.bigbutton[type='submit']"),
@@ -1027,41 +1105,35 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     if submit_btn:
         driver.execute_script("arguments[0].scrollIntoView({block:'center'});", submit_btn)
         time.sleep(0.5)
-        # Strategy A: requestSubmit — native form submission, bypasses CL bot-detection
-        # that intercepts synthetic mouse clicks
+
+        # Strategy A: ActionChains real click (primary — goes through CL's click handler)
         try:
-            result = driver.execute_script("""
-                var form = document.getElementById('postingForm');
-                var btn  = arguments[0];
-                if (form && typeof form.requestSubmit === 'function') {
-                    form.requestSubmit(btn);
-                    return 'requestSubmit';
-                }
-                return null;
-            """, submit_btn)
-            if result == 'requestSubmit':
-                submitted = True
-                print("  [submit] Submitted via form.requestSubmit(btn) ✓")
+            ActionChains(driver).move_to_element(submit_btn).pause(
+                random.uniform(0.3, 0.6)).click().perform()
+            submitted = True
+            print("  [submit] Clicked via ActionChains ✓")
         except Exception as e:
-            print(f"  [submit] requestSubmit failed ({e}), falling back to ActionChains")
-        # Strategy B: ActionChains Selenium click
+            print(f"  [submit] ActionChains failed ({e})")
+
+        # Strategy B: requestSubmit (fallback)
         if not submitted:
             try:
-                ActionChains(driver).move_to_element(submit_btn).pause(
-                    random.uniform(0.3, 0.7)).click().perform()
+                result = driver.execute_script("""
+                    var form = document.getElementById('postingForm');
+                    var btn  = arguments[0];
+                    if (form && typeof form.requestSubmit === 'function') {
+                        form.requestSubmit(btn);
+                        return 'requestSubmit';
+                    }
+                    btn.click();
+                    return 'direct-click';
+                """, submit_btn)
                 submitted = True
-                print("  [submit] Clicked via ActionChains ✓")
+                print(f"  [submit] Fallback: {result} ✓")
             except Exception as e:
-                print(f"  [submit] ActionChains failed ({e}), trying direct click")
-                try:
-                    submit_btn.click()
-                    submitted = True
-                    print("  [submit] Clicked via .click() ✓")
-                except Exception as e2:
-                    print(f"  [submit] Direct click also failed: {e2}")
+                print(f"  [submit] Fallback also failed: {e}")
     else:
         print("  [submit] ✗ No submit button found!")
-        # Dump what's on the page for debugging
         try:
             btns = driver.find_elements(By.TAG_NAME, "button")
             print(f"  [debug] Buttons on page: {[b.text[:30] for b in btns[:10]]}")
@@ -1071,13 +1143,14 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     if not submitted:
         return None
 
-    # ── Wait to leave the edit page ──────────────────────────────────────────
+    # ── Wait to leave the edit page ───────────────────────────────────────────
     deadline = time.time() + 30
     while time.time() < deadline:
         cur = driver.current_url
         if "s=edit" not in cur:
             print(f"  ✅ Left edit page → {cur}")
             return cur
+        time.sleep(0.5)
         time.sleep(0.5)
 
     # Still stuck — log validation errors for debugging
