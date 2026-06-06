@@ -1314,42 +1314,47 @@ def _fill_zip_with_network_intercept(driver, zip_field, zip_str):
         "return (function(){var inputs=document.querySelectorAll('input[type=hidden]');for(var i=0;i<inputs.length;i++){if(inputs[i].name==='cryptedStepCheck')return inputs[i].value;}return null;})();")
 
     if dropdown_visible.get('found'):
-        # ArrowDown + Enter — goes through native key pipeline into jQuery UI internal handler
         print("  [ZIP] Dropdown found — selecting with ArrowDown + Enter...")
         try:
-            # Ensure postal field has focus
-            zip_field = _find_field(driver, [
-                "[name='postal']", "[name='postal_code']",
-                "input#postal_code", "input#postal",
-            ]) or zip_field
-            ActionChains(driver).click(zip_field).perform()
-            time.sleep(0.3)
+            # Re-find the element FRESH — the old reference is stale because
+            # CL's autocomplete JS rebuilt the DOM when the dropdown appeared.
+            # This is why StaleElementReferenceException was happening.
+            zip_field = WebDriverWait(driver, 5).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR,
+                    "[name='postal'], [name='postal_code'], #postal_code, #postal")))
 
-            # ArrowDown navigates to first item in jQuery UI menu
-            ActionChains(driver).key_down(Keys.ARROW_DOWN, zip_field).perform()
-            time.sleep(0.5)
-            ActionChains(driver).key_up(Keys.ARROW_DOWN, zip_field).perform()
+            # Click to ensure focus on the freshly-found element
+            driver.execute_script("arguments[0].focus();", zip_field)
+            time.sleep(0.4)
+
+            # Send ArrowDown then Enter using send_keys directly on the element.
+            # This is more reliable than ActionChains for stale-DOM situations
+            # because it re-uses the element reference we just fetched.
+            zip_field.send_keys(Keys.ARROW_DOWN)
             time.sleep(0.8)
-
-            # Enter selects the highlighted item — triggers autocompleteselect internally
-            ActionChains(driver).key_down(Keys.RETURN, zip_field).perform()
-            time.sleep(0.3)
-            ActionChains(driver).key_up(Keys.RETURN, zip_field).perform()
+            zip_field.send_keys(Keys.RETURN)
             time.sleep(2.0)
 
             suggestion_clicked = True
             print("  [ZIP] ArrowDown + Enter sent ✓")
 
-            # Check if cryptedStepCheck rotated — proves CL's handler fired
+            # Verify value was set by the selection
+            selected_val = zip_field.get_attribute("value") or ""
+            print(f"  [ZIP] Value after selection: '{selected_val}'")
+
+            # Check cryptedStepCheck rotation — proves CL's handler fired
             token_after = driver.execute_script(
-                "return (function(){var inputs=document.querySelectorAll('input[type=hidden]');for(var i=0;i<inputs.length;i++){if(inputs[i].name==='cryptedStepCheck')return inputs[i].value;}return null;})();")
+                "return (function(){var inputs=document.querySelectorAll('input[type=hidden]');"
+                "for(var i=0;i<inputs.length;i++){"
+                "if(inputs[i].name==='cryptedStepCheck')return inputs[i].value;"
+                "}return null;})()")
             if token_after and token_before and token_after != token_before:
                 print("  [ZIP] ✅ cryptedStepCheck ROTATED — CL confirmed the ZIP!")
-                print(f"  [ZIP] before: {str(token_before)[:50]}")
-                print(f"  [ZIP] after:  {str(token_after)[:50]}")
+                print(f"  [ZIP] before: {str(token_before)[:60]}")
+                print(f"  [ZIP] after:  {str(token_after)[:60]}")
             else:
                 print("  [ZIP] ⚠ cryptedStepCheck did NOT rotate after ArrowDown+Enter")
-                print(f"  [ZIP] token: {str(token_before)[:50]}")
+                print(f"  [ZIP] token: {str(token_before)[:60]}")
 
         except Exception as e:
             print(f"  [ZIP] ArrowDown+Enter failed: {e}")
@@ -1357,20 +1362,24 @@ def _fill_zip_with_network_intercept(driver, zip_field, zip_str):
     else:
         print("  [ZIP] No dropdown appeared")
 
-    # If ArrowDown+Enter didn't work or no dropdown, try Tab blur
+    # Fallback: Tab blur (also re-finds element fresh)
     if not suggestion_clicked:
         print("  [ZIP] Falling back to Tab blur")
         try:
-            ActionChains(driver).key_down(Keys.TAB, zip_field).perform()
-            time.sleep(0.2)
-            ActionChains(driver).key_up(Keys.TAB, zip_field).perform()
+            fresh_zip = driver.find_element(By.CSS_SELECTOR,
+                "[name='postal'], [name='postal_code'], #postal_code, #postal")
+            fresh_zip.send_keys(Keys.TAB)
         except Exception:
-            driver.execute_script("arguments[0].blur();", zip_field)
+            driver.execute_script(
+                "var el = document.querySelector('[name=postal],[name=postal_code]');"
+                "if(el) el.blur();")
         time.sleep(2.0)
 
-        # Check token rotation even after Tab
         token_after_tab = driver.execute_script(
-            "return (function(){var el=document.querySelectorAll('input');for(var i=0;i<el.length;i++){if(el[i].name==='cryptedStepCheck')return el[i].value;}return null;})();")
+            "return (function(){var inputs=document.querySelectorAll('input[type=hidden]');"
+            "for(var i=0;i<inputs.length;i++){"
+            "if(inputs[i].name==='cryptedStepCheck')return inputs[i].value;"
+            "}return null;})()")
         if token_after_tab and token_before and token_after_tab != token_before:
             print("  [ZIP] ✅ cryptedStepCheck rotated after Tab — ZIP accepted!")
         else:
