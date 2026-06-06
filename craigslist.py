@@ -1025,19 +1025,6 @@ try {
     results.push('formdata-patched');
 } catch(e) { results.push('formdata-err:' + e.message); }
 
-try {
-    // ── Step 3: Simulate autocomplete select after widget initializes ────────
-    setTimeout(function() {
-        try {
-            var postalEl = document.querySelector('[name="postal"]') ||
-                           document.querySelector('[name="postal_code"]') ||
-                           document.querySelector('#postal_code') ||
-                           document.querySelector('#postal');
-            if (!postalEl || !window.jQuery) return;
-            var jq = jQuery(postalEl);
-
-            // Try attaching our own autocomplete if CL's isn't there
-            if (!jq.data('ui-autocomplete') && !jq.data('autocomplete')) {
                 jq.autocomplete({
                     source: [{value: zipVal, label: zipVal + ' - Los Angeles, CA'}],
                     minLength: 0
@@ -1320,212 +1307,182 @@ def _call_cl_internal_location_setter(driver, zip_str, city_str="Los Angeles"):
 
 
 def _fill_zip_with_network_intercept(driver, zip_field, zip_str):
-    """
-    The definitive ZIP fill strategy — v3:
-
-    Root cause confirmed: CL makes ZERO network calls (_allNetworkCalls: []).
-    The autocomplete dataset is local. The server rejects because CL's internal
-    JS location state object is never updated — only the DOM input value is set.
-
-    This version:
-    1. Types ZIP with real native send_keys to trigger CL's autocomplete naturally
-    2. Clicks the dropdown if it appears
-    3. Calls _call_cl_internal_location_setter to fire CL's select handlers directly
-    4. Keeps serializer + FormData patches as safety net
-    5. Validator nuke to clear error state
-    """
-    # Ensure network spy is installed in this page context
     _install_network_spy_now(driver)
     time.sleep(0.3)
 
-    # Install serializer + FormData patches
     patch_result = driver.execute_script(_ZIP_PATCH_JS, zip_str)
     print(f"  [ZIP] Patch install: {patch_result}")
-    time.sleep(0.5)
+    time.sleep(0.3)
 
-    # Focus field with real mouse click
+    # Read CL's real autocomplete config before touching anything
+    ac_config = driver.execute_script("""
+        var el = document.querySelector('[name="postal"]') ||
+                 document.querySelector('[name="postal_code"]') ||
+                 document.querySelector('#postal_code') ||
+                 document.querySelector('#postal');
+        if (!el || !window.jQuery) return {err: 'no-el-or-jquery'};
+        var acData = jQuery(el).data('ui-autocomplete') || jQuery(el).data('autocomplete');
+        var events = jQuery._data(el, 'events') || {};
+        return {
+            hasAC: !!acData,
+            minLength: acData ? acData.options.minLength : null,
+            delay: acData ? acData.options.delay : null,
+            source: acData ? String(acData.options.source).substring(0, 300) : null,
+            events: Object.keys(events)
+        };
+    """)
+    print(f"  [ZIP] CL autocomplete config: {ac_config}")
+
+    min_len = 3
+    ac_delay = 0.35
+    if ac_config and ac_config.get('hasAC'):
+        try: min_len = int(ac_config.get('minLength') or 3)
+        except: pass
+        try: ac_delay = float(ac_config.get('delay') or 350) / 1000.0
+        except: pass
+    print(f"  [ZIP] Using minLength={min_len}, delay={ac_delay:.2f}s")
+
+    # Focus via Tab from description field
     driver.execute_script("arguments[0].scrollIntoView({block:'center'});", zip_field)
-    time.sleep(0.5)
-
-    # Tab from previous field to get natural focus chain
+    time.sleep(0.4)
     try:
-        prev = driver.find_element(By.CSS_SELECTOR,
-            "[name='FromEMail'], [name='PostingBody'], textarea#PostingBody")
+        prev = driver.find_element(By.CSS_SELECTOR, "[name='PostingBody'], textarea#PostingBody")
         ActionChains(driver).move_to_element(prev).click().perform()
-        time.sleep(0.4)
+        time.sleep(0.3)
         prev.send_keys(Keys.TAB)
-        time.sleep(0.8)
+        time.sleep(0.6)
+        focused_name = driver.execute_script("return document.activeElement ? document.activeElement.name : null")
+        if focused_name not in ('postal', 'postal_code'):
+            ActionChains(driver).move_to_element(zip_field).click().perform()
+            time.sleep(0.4)
     except Exception:
-        ActionChains(driver).move_to_element(zip_field).pause(0.3).click().perform()
-        time.sleep(0.5)
+        ActionChains(driver).move_to_element(zip_field).click().perform()
+        time.sleep(0.4)
 
-    # Re-locate field after tab
     zip_field = _find_field(driver, [
-        "[name='postal']", "[name='postal_code']",
-        "input#postal_code", "input#postal",
+        "[name='postal']", "[name='postal_code']", "input#postal_code", "input#postal",
     ]) or zip_field
 
-    # Ensure focus
-    focused = driver.execute_script("return document.activeElement === arguments[0];", zip_field)
-    if not focused:
-        ActionChains(driver).move_to_element(zip_field).click().perform()
-        time.sleep(0.3)
-
-    # Clear and type with native send_keys (real trusted keyboard events)
+    # Clear field
     zip_field.send_keys(Keys.CONTROL + "a")
     time.sleep(0.1)
     zip_field.send_keys(Keys.DELETE)
     time.sleep(0.2)
-    for ch in zip_str:
+
+    # Type with real send_keys so CL's native keydown handlers fire
+    print(f"  [ZIP] Typing {zip_str} with real send_keys...")
+    for i, ch in enumerate(zip_str):
         zip_field.send_keys(ch)
-        time.sleep(random.uniform(0.10, 0.18))
-    time.sleep(1.2)  # Give autocomplete time to fire XHR
+        delay = random.uniform(0.12, 0.22)
+        if i + 1 == min_len:
+            delay = ac_delay + random.uniform(0.3, 0.6)
+            print(f"  [ZIP] Reached minLength ({min_len}) — pausing {delay:.2f}s for CL debounce")
+        time.sleep(delay)
 
-    # Try to find and click autocomplete dropdown
-    dropdown_selectors = [
-        ".ui-autocomplete li.ui-menu-item",
-        ".ui-autocomplete li",
-        "ul.ui-menu li",
-        "ul[id*='ui-id'] li",
-        "[class*='autocomplete'] li",
-        "[role='option']",
-        "[role='listbox'] li",
-    ]
+    time.sleep(ac_delay + 0.5)
+
+    # Wait for CL's real dropdown and click it
     suggestion_clicked = False
-    try:
-        WebDriverWait(driver, 5).until(
-            lambda d: any(d.find_elements(By.CSS_SELECTOR, s) for s in dropdown_selectors))
-        for sel in dropdown_selectors:
-            items = driver.find_elements(By.CSS_SELECTOR, sel)
-            visible = [s for s in items if s.is_displayed()]
-            if visible:
-                print(f"  [ZIP] Autocomplete dropdown found — clicking suggestion")
-                ActionChains(driver).move_to_element(visible[0]).pause(0.3).click().perform()
-                suggestion_clicked = True
-                print("  [ZIP] Clicked suggestion ✓")
-                break
-    except TimeoutException:
-        print("  [ZIP] No dropdown appeared")
+    print(f"  [ZIP] Waiting up to 3s for CL real dropdown...")
+    deadline = time.time() + 3.0
+    while time.time() < deadline:
+        visible_items = driver.execute_script("""
+            var items = [];
+            document.querySelectorAll('.ui-autocomplete, .ui-menu, [role="listbox"]').forEach(function(menu) {
+                var rect = menu.getBoundingClientRect();
+                if (rect.width > 0 && rect.height > 0 && window.getComputedStyle(menu).display !== 'none') {
+                    menu.querySelectorAll('li.ui-menu-item, li, [role="option"]').forEach(function(li) {
+                        var txt = (li.textContent || '').trim();
+                        if (txt && li.offsetParent !== null) items.push(txt.substring(0,60));
+                    });
+                }
+            });
+            return items;
+        """)
+        if visible_items:
+            print(f"  [ZIP] Dropdown items: {visible_items[:4]}")
+            break
+        time.sleep(0.15)
 
-    if not suggestion_clicked:
-        # Arrow down attempt
+    for sel in [".ui-autocomplete li.ui-menu-item", ".ui-autocomplete li", "ul.ui-menu li.ui-menu-item"]:
         try:
-            zip_field.send_keys(Keys.ARROW_DOWN)
-            time.sleep(1.0)
-            for sel in dropdown_selectors:
-                items = driver.find_elements(By.CSS_SELECTOR, sel)
-                visible = [s for s in items if s.is_displayed()]
-                if visible:
-                    ActionChains(driver).move_to_element(visible[0]).pause(0.3).click().perform()
-                    suggestion_clicked = True
-                    print("  [ZIP] Clicked suggestion after ArrowDown ✓")
-                    break
+            items = driver.find_elements(By.CSS_SELECTOR, sel)
+            visible = [s for s in items if s.is_displayed() and s.text.strip()]
+            if visible:
+                best = next((x for x in visible if zip_str[:3] in x.text), visible[0])
+                print(f"  [ZIP] Clicking real CL suggestion: '{best.text[:50]}'")
+                ActionChains(driver).move_to_element(best).pause(random.uniform(0.2, 0.4)).click().perform()
+                suggestion_clicked = True
+                print("  [ZIP] Real suggestion clicked ✓")
+                break
         except Exception:
             pass
 
     if not suggestion_clicked:
+        print("  [ZIP] No real dropdown — Tabbing out")
         zip_field.send_keys(Keys.TAB)
-        print("  [ZIP] Tabbed out (no dropdown)")
+        time.sleep(0.4)
 
-    # ── Call CL's internal location setter directly ──────────────────────────
-    # CL uses ZERO network calls (confirmed by logs). The real confirmation
-    # happens via CL's internal JS autocomplete select handlers updating an
-    # internal state object. We call those handlers directly.
-    time.sleep(0.5)
-    _call_cl_internal_location_setter(driver, zip_str)
-    time.sleep(0.8)
-
-    # Wait for any AJAX to complete
-    print("  [ZIP] Waiting for location AJAX...")
+    # Wait for AJAX
     try:
         WebDriverWait(driver, 10).until(
             lambda d: d.execute_script("return typeof jQuery==='undefined' || jQuery.active===0"))
-        print("  [ZIP] AJAX complete ✓")
+        print("  [ZIP] AJAX settled ✓")
     except Exception:
-        print("  [ZIP] AJAX wait timed out")
-    time.sleep(2.0)
+        pass
+    time.sleep(1.5)
 
-    # ── CRITICAL: Check if a real geo network call was made ──────────────────
+    # Check network captures
     geo_responses, all_calls = _get_geo_responses(driver)
-    print(f"  [GEO] Captured {len(geo_responses)} geo response(s), {len(all_calls)} total network calls")
-
-    if all_calls:
-        print(f"  [GEO] All network calls during ZIP entry:")
-        for call in all_calls:
-            print(f"    {call.get('type','?')} {call.get('status','?')} {call.get('url','')[:100]}")
+    print(f"  [GEO] {len(geo_responses)} geo responses, {len(all_calls)} total network calls")
+    for c in all_calls:
+        print(f"    {c.get('type')} {c.get('status')} {c.get('url','')[:100]}")
 
     geo_injected = False
     if geo_responses:
         for geo_resp in geo_responses:
-            print(f"  [GEO] Real geo response from: {geo_resp.get('url','')}")
-            print(f"  [GEO] Response body: {geo_resp.get('responseText','')[:500]}")
+            print(f"  [GEO] Response from: {geo_resp.get('url','')}")
+            print(f"  [GEO] Body: {geo_resp.get('responseText','')[:400]}")
             if _inject_geo_hidden_fields(driver, geo_resp.get('responseText',''), zip_str):
                 geo_injected = True
                 break
 
     if not geo_injected:
-        print("  [GEO] No real geo XHR captured — trying direct source function call")
-        # Try calling CL's autocomplete source function directly
-        items = _trigger_real_geo_lookup(driver, zip_str)
-        if items:
-            # Re-check network captures (source fn may have fired XHR now)
-            time.sleep(2)
-            geo_responses, _ = _get_geo_responses(driver)
-            for geo_resp in geo_responses:
-                if _inject_geo_hidden_fields(driver, geo_resp.get('responseText',''), zip_str):
-                    geo_injected = True
-                    break
-
-    if not geo_injected:
-        print("  [GEO] Falling back to direct Python geo request")
+        print("  [GEO] No XHR — direct Python geo request")
         geo_text, geo_url = _fetch_cl_geo_direct(driver, zip_str)
-        if geo_text:
-            print(f"  [GEO] Direct fetch succeeded from {geo_url}")
+        if geo_text and geo_text.strip() not in ('[]', '', 'null'):
             _inject_geo_hidden_fields(driver, geo_text, zip_str)
-        else:
-            print("  [GEO] ⚠ Could not obtain geo response by any method")
-            print("  [GEO] ⚠ Run DevTools snippet from debug note on a REAL manual submission")
-            print("  [GEO] ⚠ to identify exactly which hidden field(s) are missing")
 
-    # Check patch status
+    # Status
     patch_status = driver.execute_script("""
         return {
-            patchInstalled: window._clZipPatchInstalled,
-            patchResults: window._clZipPatchResults,
+            patchInstalled:   window._clZipPatchInstalled,
             serializerPatched: window._clSerializerPatched,
-            widgetCreated: window._clZipWidgetCreated,
-            widgetErr: window._clZipWidgetErr,
-            autoconfirmed: window._clZipAutoconfirmed,
-            xhrIntercepted: window._clPostalXhrIntercepted || null,
-            fetchIntercepted: window._clPostalFetchIntercepted || null,
-            geoResponses: (window._clCapturedGeoResponses || []).length,
-            zipFired: window._clZipFired || null
+            widgetCreated:    window._clZipWidgetCreated || false,
+            geoResponses:     (window._clCapturedGeoResponses || []).length,
+            allNetworkCalls:  (window._clAllNetworkCalls || []).length
         };
     """)
     print(f"  [ZIP] Patch status: {patch_status}")
+    # widgetCreated must now be false — if True the fake widget snuck back in
 
-    # Re-read field value
     zip_field = _find_field(driver, [
-        "[name='postal']", "[name='postal_code']",
-        "input#postal_code", "input#postal",
+        "[name='postal']", "[name='postal_code']", "input#postal_code", "input#postal",
     ]) or zip_field
     actual = (zip_field.get_attribute("value") if zip_field else "") or ""
 
-    # If still empty, force-set
-    if not actual and zip_field:
-        print("  [ZIP] Value empty — force-setting via native setter")
+    if not actual:
         driver.execute_script("""
             var el = arguments[0], v = arguments[1];
             Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(el, v);
             el.setAttribute('value', v);
             if (window.jQuery) jQuery(el).val(v).trigger('input').trigger('change');
         """, zip_field, zip_str)
-        time.sleep(0.5)
+        time.sleep(0.3)
         actual = zip_field.get_attribute("value") or ""
 
     print(f"  ✓ [ZIP] = '{actual}'")
 
-    # Dump hidden fields — this is the critical diagnostic
     hidden = driver.execute_script("""
         var r = {};
         document.querySelectorAll('input[type="hidden"]').forEach(function(e) {
@@ -1533,7 +1490,7 @@ def _fill_zip_with_network_intercept(driver, zip_field, zip_str):
         });
         return r;
     """)
-    print(f"  [ZIP] Hidden fields after geo injection: {hidden}")
+    print(f"  [ZIP] Hidden fields: {hidden}")
 
     return zip_field
 
