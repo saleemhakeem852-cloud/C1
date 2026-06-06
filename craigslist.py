@@ -323,6 +323,42 @@ def make_driver(proxy_url=None):
     except Exception:
         pass
 
+    # Intercept native form.submit() and requestSubmit() at the page level
+    # so we can read the exact POST body before it leaves the browser.
+    _FORM_INTERCEPT_JS = """
+(function() {
+    window._clNativeSubmitPayloads = [];
+    function _captureForm(form, via) {
+        try {
+            var fd = new FormData(form);
+            var pairs = [];
+            fd.forEach(function(v, k) { pairs.push(k + '=' + String(v).substring(0, 200)); });
+            window._clNativeSubmitPayloads.push({
+                action: form.action, method: form.method,
+                via: via, body: pairs.join('&')
+            });
+        } catch(e) {}
+    }
+    var origSubmit = HTMLFormElement.prototype.submit;
+    HTMLFormElement.prototype.submit = function() {
+        _captureForm(this, 'submit');
+        return origSubmit.call(this);
+    };
+    if (HTMLFormElement.prototype.requestSubmit) {
+        var origRS = HTMLFormElement.prototype.requestSubmit;
+        HTMLFormElement.prototype.requestSubmit = function(btn) {
+            _captureForm(this, 'requestSubmit');
+            return origRS.call(this, btn);
+        };
+    }
+})();
+"""
+    try:
+        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument",
+                               {"source": _FORM_INTERCEPT_JS})
+    except Exception:
+        pass
+
     return driver
 
 
@@ -1281,6 +1317,37 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
                 print(f"  [payload] [{i}] POSTAL in body: {matches}")
     else:
         print("  [payload] No XHR/fetch POST captured — CL may use native form submit")
+
+    # Dump native form submit payloads captured by the Page-level interceptor
+    native_payloads = driver.execute_script("return window._clNativeSubmitPayloads || [];")
+    if native_payloads:
+        print(f"  [payload] NATIVE FORM SUBMIT captured ({len(native_payloads)} submission(s)):")
+        for i, p in enumerate(native_payloads):
+            print(f"  [payload] [native-{i}] via={p.get('via')} action={p.get('action','')[:80]}")
+            body = p.get('body') or ''
+            print(f"  [payload] [native-{i}] FULL BODY: {body}")
+            # Highlight postal specifically
+            import re as _re
+            postal_matches = _re.findall(r'postal[^=&]*=[^&]{0,30}', body, _re.IGNORECASE)
+            print(f"  [payload] [native-{i}] POSTAL fields: {postal_matches}")
+    else:
+        print("  [payload] No native form.submit() captured either")
+        print("  [payload] CL's submit handler may be overriding form.submit entirely")
+        # Last resort: read full form HTML to see all fields including hidden ones
+        form_html = driver.execute_script("""
+            var form = document.getElementById('postingForm');
+            if (!form) return 'no-form';
+            var inputs = [];
+            form.querySelectorAll('input,textarea,select').forEach(function(el) {
+                inputs.push({
+                    name: el.name || el.id,
+                    type: el.type || el.tagName,
+                    value: (el.value || '').substring(0, 100)
+                });
+            });
+            return inputs;
+        """)
+        print(f"  [payload] All form fields at submit time: {form_html}")
 
     # ── Wait to leave the edit page ───────────────────────────────────────────
     deadline = time.time() + 35
