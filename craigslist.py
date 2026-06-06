@@ -666,9 +666,45 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
             "input#postal",
         ])
         if zip_field:
-            _cdp_type(driver, zip_field, zip_code)
+            # ── Step A: Click field, type ZIP via CDP ────────────────────────
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", zip_field)
+            time.sleep(0.3)
+            ActionChains(driver).move_to_element(zip_field).pause(
+                random.uniform(0.2, 0.4)).click().perform()
+            time.sleep(0.3)
 
-            # ── Wait for autocomplete dropdown and click first suggestion ────
+            # Type ZIP digit by digit via CDP
+            for ch in zip_code:
+                driver.execute_cdp_cmd("Input.dispatchKeyEvent", {
+                    "type": "char", "key": ch, "text": ch, "unmodifiedText": ch,
+                })
+                time.sleep(random.uniform(0.08, 0.15))
+
+            time.sleep(0.3)
+
+            # ── Step B: Manually trigger jQuery autocomplete search ──────────
+            # CDP typing doesn't always trigger CL's jQuery UI autocomplete.
+            # We fire the exact jQuery events the autocomplete widget listens to.
+            triggered = driver.execute_script("""
+                var el = arguments[0];
+                var jqEl = jQuery(el);
+                if (!jqEl.length) return 'no-jquery';
+                // Trigger the keyup event which jQuery autocomplete listens to
+                jqEl.trigger('keydown');
+                jqEl.trigger('keyup');
+                jqEl.trigger('input');
+                // Directly call autocomplete search if the widget is attached
+                try {
+                    jqEl.autocomplete('search', el.value);
+                    return 'autocomplete-search-called';
+                } catch(e) {
+                    return 'no-autocomplete-widget: ' + e.message;
+                }
+            """, zip_field)
+            print(f"  [ZIP] Autocomplete trigger result: {triggered}")
+            time.sleep(1.5)
+
+            # ── Step C: Wait for dropdown and click first suggestion ─────────
             suggestion_clicked = False
             try:
                 WebDriverWait(driver, 6).until(
@@ -676,19 +712,37 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
                         ".ui-autocomplete li.ui-menu-item, .ui-autocomplete li"))
                 suggestions = driver.find_elements(By.CSS_SELECTOR,
                     ".ui-autocomplete li.ui-menu-item, .ui-autocomplete li")
-                if suggestions:
+                visible = [s for s in suggestions if s.is_displayed()]
+                print(f"  [ZIP] Autocomplete suggestions found: {len(visible)}")
+                if visible:
                     try:
-                        ActionChains(driver).move_to_element(suggestions[0]).pause(
+                        ActionChains(driver).move_to_element(visible[0]).pause(
                             random.uniform(0.3, 0.5)).click().perform()
                         suggestion_clicked = True
                         print("  [ZIP] Clicked autocomplete suggestion ✓")
                     except Exception:
-                        zip_field.send_keys(Keys.RETURN)
+                        visible[0].send_keys(Keys.RETURN)
                         suggestion_clicked = True
                         print("  [ZIP] Confirmed with Enter")
+                else:
+                    zip_field.send_keys(Keys.RETURN)
+                    suggestion_clicked = True
             except TimeoutException:
-                zip_field.send_keys(Keys.TAB)
-                print("  [ZIP] No autocomplete dropdown — pressed Tab")
+                # Autocomplete still not showing — try one more trigger method:
+                # simulate the exact keypress CL uses to open autocomplete
+                print("  [ZIP] Dropdown not shown — trying ArrowDown to open")
+                zip_field.send_keys(Keys.ARROW_DOWN)
+                time.sleep(1.0)
+                suggestions = driver.find_elements(By.CSS_SELECTOR,
+                    ".ui-autocomplete li.ui-menu-item, .ui-autocomplete li")
+                visible = [s for s in suggestions if s.is_displayed()]
+                if visible:
+                    ActionChains(driver).move_to_element(visible[0]).pause(0.3).click().perform()
+                    suggestion_clicked = True
+                    print("  [ZIP] Clicked suggestion after ArrowDown ✓")
+                else:
+                    zip_field.send_keys(Keys.TAB)
+                    print("  [ZIP] No dropdown at all — pressed Tab")
 
             # ── Wait for CL's AJAX location lookup to fully complete ─────────
             # After ZIP selection CL fires an AJAX call that populates hidden
