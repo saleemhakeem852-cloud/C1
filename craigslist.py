@@ -1307,6 +1307,20 @@ def _call_cl_internal_location_setter(driver, zip_str, city_str="Los Angeles"):
 
 
 def _fill_zip_with_network_intercept(driver, zip_field, zip_str):
+    """
+    The definitive ZIP fill strategy — v3:
+
+    Root cause confirmed: CL makes ZERO network calls (_allNetworkCalls: []).
+    The autocomplete dataset is local. The server rejects because CL's internal
+    JS location state object is never updated — only the DOM input value is set.
+
+    This version:
+    1. Types ZIP with real native send_keys to trigger CL's autocomplete naturally
+    2. Clicks the dropdown if it appears
+    3. Calls _call_cl_internal_location_setter to fire CL's select handlers directly
+    4. Keeps serializer + FormData patches as safety net
+    5. Validator nuke to clear error state
+    """
     _install_network_spy_now(driver)
     time.sleep(0.3)
 
