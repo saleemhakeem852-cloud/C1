@@ -1311,7 +1311,7 @@ def _fill_zip_with_network_intercept(driver, zip_field, zip_str):
 
     # Capture cryptedStepCheck BEFORE selection attempt
     token_before = driver.execute_script(
-        "var e=document.querySelector('[name=\"cryptedStepCheck\"]'); return e?e.value:null;")
+        "return (function(){var inputs=document.querySelectorAll('input[type=hidden]');for(var i=0;i<inputs.length;i++){if(inputs[i].name==='cryptedStepCheck')return inputs[i].value;}return null;})();")
 
     if dropdown_visible.get('found'):
         # ArrowDown + Enter — goes through native key pipeline into jQuery UI internal handler
@@ -1342,7 +1342,7 @@ def _fill_zip_with_network_intercept(driver, zip_field, zip_str):
 
             # Check if cryptedStepCheck rotated — proves CL's handler fired
             token_after = driver.execute_script(
-                "return (function(){var e=document.querySelector('[name=\'cryptedStepCheck\']');return e?e.value:null;})();")
+                "return (function(){var inputs=document.querySelectorAll('input[type=hidden]');for(var i=0;i<inputs.length;i++){if(inputs[i].name==='cryptedStepCheck')return inputs[i].value;}return null;})();")
             if token_after and token_before and token_after != token_before:
                 print("  [ZIP] ✅ cryptedStepCheck ROTATED — CL confirmed the ZIP!")
                 print(f"  [ZIP] before: {str(token_before)[:50]}")
@@ -1572,16 +1572,16 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
 
     # ── DIAGNOSTIC: Read edit page initial state BEFORE touching anything ─────
     try:
-        initial_state = driver.execute_script(
-            "var r={};"
-            "document.querySelectorAll('input[type=\'hidden\']').forEach(function(e){"
-            "  r[e.name||e.id||'?']=(e.value||'').substring(0,70);"
-            "});"
-            "var postal=document.querySelector('[name=\'postal\'],[name=\'postal_code\']');"
-            "r['_postal_preload']=postal?postal.value:'';"
-            "r['_postal_readonly']=postal?(postal.readOnly||postal.disabled||false):null;"
-            "return r;"
-        )
+        initial_state = driver.execute_script("""
+            var r = {};
+            document.querySelectorAll('input[type=hidden]').forEach(function(e) {
+                r[e.name || e.id || '?'] = (e.value || '').substring(0, 70);
+            });
+            var postal = document.querySelector('[name=postal],[name=postal_code]');
+            r['_postal_preload'] = postal ? postal.value : '';
+            r['_postal_readonly'] = postal ? (postal.readOnly || postal.disabled || false) : null;
+            return r;
+        """)
         print(f"  [EDIT-DIAG] Edit page initial state: {initial_state}")
         print(f"  [EDIT-DIAG] cryptedStepCheck at load: {initial_state.get('cryptedStepCheck','MISSING')[:60]}")
         print(f"  [EDIT-DIAG] postal at load: '{initial_state.get('_postal_preload','')}'")
@@ -1686,8 +1686,7 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
                 # Field is empty. Type naturally with send_keys + Tab.
                 print(f"  [ZIP] Field empty — typing '{zip_str}' with real send_keys")
                 token_before_zip = driver.execute_script(
-                    "var e=document.querySelector('[name=\'cryptedStepCheck\']');"
-                    "return e?e.value:null;")
+                    "return (function(){var inputs=document.querySelectorAll('input[type=hidden]');for(var i=0;i<inputs.length;i++){if(inputs[i].name==='cryptedStepCheck')return inputs[i].value;}return null;})()")
                 try:
                     ActionChains(driver)\
                         .move_to_element(zip_field)\
@@ -1708,8 +1707,7 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
                     actual = zip_field.get_attribute("value") or ""
                     print(f"  ✓ [ZIP] = '{actual}'")
                     token_after_zip = driver.execute_script(
-                        "var e=document.querySelector('[name=\'cryptedStepCheck\']');"
-                        "return e?e.value:null;")
+                        "return (function(){var inputs=document.querySelectorAll('input[type=hidden]');for(var i=0;i<inputs.length;i++){if(inputs[i].name==='cryptedStepCheck')return inputs[i].value;}return null;})()")
                     if token_before_zip != token_after_zip:
                         print(f"  [ZIP-DIAG] *** TOKEN ROTATED AFTER TYPING ZIP ***")
                         print(f"  [ZIP-DIAG] before: {str(token_before_zip)[:60]}")
@@ -2314,27 +2312,28 @@ def post_product(driver, ad_name, product):
         print(f"  [AREA-DIAG] input dump failed: {_e}")
 
     try:
-        zip_on_area = driver.execute_script(
-            "var names=['postal','zip','zipcode','postal_code','zip_code'];"
-            "for(var i=0;i<names.length;i++){"
-            "  var el=document.querySelector('[name=\''+names[i]+'\']')||"
-            "          document.querySelector('[id=\''+names[i]+'\']');"
-            "  if(el) return {found:true,name:el.name,id:el.id,ph:el.placeholder,val:el.value};"
-            "}"
-            "return {found:false};"
-        )
+        zip_on_area = driver.execute_script("""
+            var names = ['postal','zip','zipcode','postal_code','zip_code'];
+            for (var i = 0; i < names.length; i++) {
+                var el = document.getElementById(names[i]) ||
+                         document.getElementsByName(names[i])[0];
+                if (el) return {found:true, name:el.name, id:el.id, ph:el.placeholder, val:el.value};
+            }
+            return {found: false};
+        """)
         print(f"  [AREA-DIAG] ZIP field on area page: {zip_on_area}")
         if zip_on_area and zip_on_area.get("found"):
             _fname = zip_on_area.get("name") or zip_on_area.get("id") or ""
             print(f"  [AREA-DIAG] *** ZIP FIELD FOUND ON AREA PAGE — filling {_area_zip} ***")
-            driver.execute_script(
-                "var n=arguments[0],z=arguments[1];"
-                "var el=document.querySelector('[name=\''+n+'\']')||document.querySelector('[id=\''+n+'\']');"
-                "if(el){el.focus();el.value=z;"
-                "el.dispatchEvent(new Event('input',{bubbles:true}));"
-                "el.dispatchEvent(new Event('change',{bubbles:true}));}",
-                _fname, _area_zip
-            )
+            driver.execute_script("""
+                var n = arguments[0], z = arguments[1];
+                var el = document.getElementById(n) || document.getElementsByName(n)[0];
+                if (el) {
+                    el.focus(); el.value = z;
+                    el.dispatchEvent(new Event('input', {bubbles:true}));
+                    el.dispatchEvent(new Event('change', {bubbles:true}));
+                }
+            """, _fname, _area_zip)
             print(f"  [AREA-DIAG] ZIP filled on area page ✓")
         else:
             print(f"  [AREA-DIAG] No ZIP field on area page (will fill on edit page)")
