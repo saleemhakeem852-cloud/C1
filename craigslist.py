@@ -1342,6 +1342,90 @@ def _fill_zip_with_network_intercept(driver, zip_field, zip_str):
             selected_val = zip_field.get_attribute("value") or ""
             print(f"  [ZIP] Value after selection: '{selected_val}'")
 
+            # ── Directly invoke CL's autocompleteselect handler ───────────────
+            # ArrowDown+Enter fires on our fake widget (from _ZIP_PATCH_JS).
+            # CL's real handler is bound to the postingForm or the postal field
+            # via jQuery's event system. We call it directly with the item object.
+            callback_result = driver.execute_script("""
+                var zipVal = arguments[0];
+                var results = [];
+                var postalEl = document.querySelector('[name=postal]') ||
+                               document.querySelector('[name=postal_code]');
+                if (!postalEl || !window.jQuery) return ['no-postal-or-jquery'];
+
+                // 1. Read CL's bound autocompleteselect handler source
+                var jqEl = jQuery(postalEl);
+                var events = jQuery._data(postalEl, 'events') || {};
+                var handlerSrc = null;
+                if (events.autocompleteselect) {
+                    handlerSrc = events.autocompleteselect[0].handler.toString().substring(0, 200);
+                    results.push('handler-found:' + handlerSrc);
+                } else {
+                    results.push('no-autocompleteselect-on-field');
+                }
+
+                // 2. Check postingForm for the handler
+                var form = document.getElementById('postingForm');
+                if (form) {
+                    var formEvents = jQuery._data(form, 'events') || {};
+                    var formHandlerKeys = Object.keys(formEvents);
+                    results.push('form-events:' + formHandlerKeys.join(','));
+                }
+
+                // 3. Read the autocomplete widget's select option directly
+                var ac = jqEl.data('ui-autocomplete') || jqEl.data('autocomplete');
+                if (ac && ac.options && ac.options.select) {
+                    var selSrc = ac.options.select.toString().substring(0, 300);
+                    results.push('ac-select-option:' + selSrc);
+                    // Call it directly with the item
+                    try {
+                        var fakeEvent = jQuery.Event('autocompleteselect');
+                        var fakeUi = {item: {value: zipVal, label: zipVal + ' - Los Angeles, CA'}};
+                        ac.options.select.call(postalEl, fakeEvent, fakeUi);
+                        results.push('ac-select-called');
+                    } catch(e) { results.push('ac-select-err:' + e.message); }
+                } else {
+                    results.push('no-ac-select-option');
+                }
+
+                // 4. Fire autocompleteselect on every ancestor up to form
+                var item = {value: zipVal, label: zipVal + ' - Los Angeles, CA'};
+                var node = postalEl;
+                var fired = 0;
+                while (node && node !== document) {
+                    var nodeEvents = jQuery._data(node, 'events') || {};
+                    if (nodeEvents.autocompleteselect) {
+                        jQuery(node).trigger(
+                            jQuery.Event('autocompleteselect', {item: item}),
+                            [{item: item}]
+                        );
+                        fired++;
+                        results.push('fired-on:' + (node.id||node.tagName));
+                    }
+                    node = node.parentElement;
+                }
+                results.push('ancestor-fires:' + fired);
+
+                // 5. Force-set CL's internal confirmed state via any known path
+                // CL's postingform JS uses a module pattern — try known variable names
+                ['cl', 'CL', 'posting', 'postForm', 'pf'].forEach(function(name) {
+                    if (window[name] && typeof window[name] === 'object') {
+                        results.push('global:' + name + ':' + Object.keys(window[name]).slice(0,5).join(','));
+                    }
+                });
+
+                // 6. Set jQuery data on the field to mark it as confirmed
+                jqEl.data('postal-confirmed', true);
+                jqEl.data('cl-location-confirmed', true);
+                jqEl.attr('data-confirmed', 'true');
+                postalEl.setAttribute('data-autofilled', 'false');
+                postalEl.setAttribute('data-confirmed', 'true');
+                results.push('data-attrs-set');
+
+                return results;
+            """, zip_str)
+            print(f"  [ZIP] Callback invocation result: {callback_result}")
+
             # Check cryptedStepCheck rotation — proves CL's handler fired
             token_after = driver.execute_script(
                 "return (function(){var inputs=document.querySelectorAll('input[type=hidden]');"
@@ -1353,7 +1437,7 @@ def _fill_zip_with_network_intercept(driver, zip_field, zip_str):
                 print(f"  [ZIP] before: {str(token_before)[:60]}")
                 print(f"  [ZIP] after:  {str(token_after)[:60]}")
             else:
-                print("  [ZIP] ⚠ cryptedStepCheck did NOT rotate after ArrowDown+Enter")
+                print("  [ZIP] ⚠ cryptedStepCheck did NOT rotate after callback")
                 print(f"  [ZIP] token: {str(token_before)[:60]}")
 
         except Exception as e:
