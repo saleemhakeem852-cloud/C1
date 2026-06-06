@@ -1293,41 +1293,107 @@ def _fill_zip_with_network_intercept(driver, zip_field, zip_str):
 
     if items_with_coords:
         print(f"  [ZIP] Real dropdown items: {[i['text'] for i in items_with_coords[:3]]}")
-        item = items_with_coords[0]
-        try:
-            # Scroll to top so viewport coords match, then click
-            driver.execute_script("window.scrollTo(0, 0);")
-            time.sleep(0.2)
-            body = driver.find_element(By.TAG_NAME, "body")
-            ActionChains(driver)\
-                .move_to_element_with_offset(body, item["x"], item["y"])\
-                .pause(random.uniform(0.25, 0.45))\
-                .click()\
-                .perform()
-            suggestion_clicked = True
-            print("  [ZIP] Clicked real CL dropdown item by coords ✓")
-            time.sleep(2.0)
-        except Exception as e:
-            print(f"  [ZIP] Coord click failed: {e}")
-            # Fallback: JS mousedown/click events
-            try:
-                driver.execute_script("""
-                    var items = document.querySelectorAll(
-                        '.ui-autocomplete li.ui-menu-item, .ui-autocomplete li');
-                    if (items.length > 0) {
-                        ['mouseenter','mousedown','mouseup','click'].forEach(function(evName) {
-                            items[0].dispatchEvent(
-                                new MouseEvent(evName, {bubbles:true, cancelable:true}));
-                        });
-                    }
-                """)
-                suggestion_clicked = True
-                print("  [ZIP] JS mouse event fallback on dropdown ✓")
-                time.sleep(2.0)
-            except Exception as e2:
-                print(f"  [ZIP] JS fallback also failed: {e2}")
 
-    # Try standard Selenium element click as last resort
+        # ── PRIMARY FIX: Trigger jQuery UI autocomplete's internal _trigger("select")
+        # Raw DOM mouse events (mousedown/click) are ignored by CL — the widget
+        # only fires its autocompleteselect callback through its own _trigger path.
+        # This is the ONLY way cryptedStepCheck gets re-signed with a confirmed ZIP.
+        jqui_select_result = driver.execute_script("""
+            var zipVal = arguments[0];
+            try {
+                var postalEl = document.querySelector('[name="postal"]') ||
+                               document.querySelector('[name="postal_code"]') ||
+                               document.querySelector('#postal') ||
+                               document.querySelector('#postal_code');
+                if (!postalEl || !window.jQuery) return {ok: false, reason: 'no-el-or-jquery'};
+
+                var jq = jQuery(postalEl);
+                var ac = jq.data('ui-autocomplete') || jq.data('autocomplete');
+                if (!ac) return {ok: false, reason: 'no-ac-instance'};
+
+                // Find the first visible dropdown item
+                var menu = ac.menu;
+                var firstItem = null;
+                var firstItemValue = null;
+                var firstItemLabel = null;
+
+                // Try to get the item data from the menu widget's active item or first li
+                if (menu && menu.element) {
+                    var firstLi = menu.element.find('li.ui-menu-item:first');
+                    if (firstLi.length) {
+                        var itemData = firstLi.data('ui-autocomplete-item') ||
+                                       firstLi.data('item.autocomplete');
+                        if (itemData) {
+                            firstItemValue = itemData.value || itemData.id || zipVal;
+                            firstItemLabel = itemData.label || itemData.value || zipVal;
+                            firstItem = itemData;
+                        }
+                    }
+                }
+
+                // Fallback: construct item from dropdown text
+                if (!firstItem) {
+                    var firstLiText = jQuery('.ui-autocomplete li.ui-menu-item:first').text().trim();
+                    firstItemValue = zipVal;
+                    firstItemLabel = firstLiText || (zipVal + ' - Los Angeles, CA');
+                    firstItem = {value: firstItemValue, label: firstItemLabel};
+                }
+
+                // Set the field value the way jQuery UI does internally
+                jq.val(firstItemValue);
+                Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')
+                      .set.call(postalEl, firstItemValue);
+
+                // Fire the internal jQuery UI widget _trigger("select") — this is what
+                // a real user click triggers inside jQuery UI, and what CL hooks into.
+                var ui = {item: firstItem};
+                ac._trigger('select', null, ui);
+
+                // Also fire the public jQuery events CL may bind directly
+                jq.trigger(jQuery.Event('autocompleteselect'), ui);
+                jq.trigger(jQuery.Event('autocompletechange'), ui);
+
+                // Fire standard input/change so any non-widget listeners also fire
+                jq.trigger('input').trigger('change').trigger('blur');
+
+                // Close the menu (as jQuery UI does after selection)
+                try { ac.close(); } catch(e) {}
+                try { if (menu) menu.element.hide(); } catch(e) {}
+
+                return {ok: true, value: firstItemValue, label: firstItemLabel};
+            } catch(e) {
+                return {ok: false, reason: 'exception', error: e.message};
+            }
+        """, zip_str)
+
+        print(f"  [ZIP] jQuery UI _trigger('select') result: {jqui_select_result}")
+        if jqui_select_result and jqui_select_result.get("ok"):
+            suggestion_clicked = True
+            print("  [ZIP] jQuery UI autocomplete select triggered ✓ — cryptedStepCheck should now rotate")
+            time.sleep(2.5)  # Give CL's AJAX callback time to update cryptedStepCheck
+        else:
+            # Fallback: try Selenium element click (moves to element properly so coords are valid)
+            try:
+                items_els = driver.find_elements(
+                    By.CSS_SELECTOR,
+                    ".ui-autocomplete li.ui-menu-item, .ui-autocomplete li, [role='option']")
+                visible_els = [el for el in items_els if el.is_displayed() and el.text.strip()]
+                if visible_els:
+                    driver.execute_script(
+                        "arguments[0].scrollIntoView({block:'nearest'});", visible_els[0])
+                    time.sleep(0.3)
+                    ActionChains(driver)\
+                        .move_to_element(visible_els[0])\
+                        .pause(random.uniform(0.2, 0.35))\
+                        .click()\
+                        .perform()
+                    suggestion_clicked = True
+                    print("  [ZIP] Fallback Selenium element click on dropdown ✓")
+                    time.sleep(2.0)
+            except Exception as e_fb:
+                print(f"  [ZIP] Selenium element click fallback failed: {e_fb}")
+
+    # Try standard Selenium element click as last resort (if items_with_coords was empty)
     if not suggestion_clicked:
         for sel in [
             ".ui-autocomplete li.ui-menu-item",
@@ -1340,6 +1406,9 @@ def _fill_zip_with_network_intercept(driver, zip_field, zip_str):
                 visible = [s for s in items if s.is_displayed() and s.text.strip()]
                 if visible:
                     print(f"  [ZIP] Selenium dropdown: {[v.text[:30] for v in visible[:3]]}")
+                    driver.execute_script(
+                        "arguments[0].scrollIntoView({block:'nearest'});", visible[0])
+                    time.sleep(0.3)
                     ActionChains(driver).move_to_element(visible[0]).pause(
                         random.uniform(0.3, 0.5)).click().perform()
                     suggestion_clicked = True
@@ -1356,6 +1425,32 @@ def _fill_zip_with_network_intercept(driver, zip_field, zip_str):
         except Exception:
             driver.execute_script("arguments[0].blur();", zip_field)
         time.sleep(2.0)
+
+    # ── Step 6a: Verify cryptedStepCheck rotated (proof CL's handler fired) ──
+    if suggestion_clicked:
+        print("  [ZIP] Waiting for cryptedStepCheck rotation (CL AJAX update)...")
+        pre_token = driver.execute_script("""
+            var el = document.querySelector('[name="cryptedStepCheck"]');
+            return el ? el.value : null;
+        """)
+        # Wait for CL's server to update the token (up to 8s)
+        token_rotated = False
+        deadline_token = time.time() + 8
+        while time.time() < deadline_token:
+            cur_token = driver.execute_script("""
+                var el = document.querySelector('[name="cryptedStepCheck"]');
+                return el ? el.value : null;
+            """)
+            if cur_token and pre_token and cur_token != pre_token:
+                token_rotated = True
+                print(f"  [ZIP] ✓ cryptedStepCheck rotated — ZIP confirmed by CL server!")
+                print(f"  [ZIP]   old: {pre_token[:40]}...")
+                print(f"  [ZIP]   new: {cur_token[:40]}...")
+                break
+            time.sleep(0.4)
+        if not token_rotated:
+            print(f"  [ZIP] ⚠ cryptedStepCheck did NOT rotate — CL may still reject ZIP")
+            print(f"  [ZIP]   token: {pre_token[:60] if pre_token else 'none'}")
 
     # ── Step 6: Wait for AJAX to complete ────────────────────────────────────
     print("  [ZIP] Waiting for AJAX after ZIP entry...")
