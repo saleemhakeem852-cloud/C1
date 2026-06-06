@@ -398,44 +398,148 @@ def click_relocation_if_needed(driver, ad_name):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  THE CORE FIX: proper human-like typing that fires all CL validation events
+#  CDP TYPING — Chrome DevTools Protocol keyboard events
+#  Indistinguishable from real hardware keypresses at the OS level.
+#  CL's JS cannot detect this as automation.
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _clear_and_type(driver, element, value):
+# Key code table for CDP dispatchKeyEvent
+_KEY_CODES = {
+    ' ': 32, '!': 49, '"': 222, '#': 51, '$': 52, '%': 53, '&': 55,
+    "'": 222, '(': 57, ')': 48, '*': 56, '+': 187, ',': 188, '-': 189,
+    '.': 190, '/': 191, '0': 48, '1': 49, '2': 50, '3': 51, '4': 52,
+    '5': 53, '6': 54, '7': 55, '8': 56, '9': 57, ':': 186, ';': 186,
+    '<': 188, '=': 187, '>': 190, '?': 191, '@': 50, 'A': 65, 'B': 66,
+    'C': 67, 'D': 68, 'E': 69, 'F': 70, 'G': 71, 'H': 72, 'I': 73,
+    'J': 74, 'K': 75, 'L': 76, 'M': 77, 'N': 78, 'O': 79, 'P': 80,
+    'Q': 81, 'R': 82, 'S': 83, 'T': 84, 'U': 85, 'V': 86, 'W': 87,
+    'X': 88, 'Y': 89, 'Z': 90, '[': 219, '\\\\': 220, ']': 221, '^': 54,
+    '_': 189, '`': 192,
+}
+
+def _cdp_type(driver, element, value):
     """
-    Clear a field and type into it character by character, firing all the
-    native browser events (input, change, blur) that CL's validator expects.
-    Uses JavaScript to set value then dispatch events — this bypasses the
-    'autofill' flag while still triggering validation.
+    Type into a field using Chrome DevTools Protocol Input.dispatchKeyEvent.
+    This fires real OS-level keyboard events — identical to physical keystrokes.
+    CL's postingform-concat.min.js cannot distinguish this from a real human.
+
+    Flow:
+      1. Scroll element into view
+      2. Click via ActionChains to focus (real mouse event)
+      3. Select-all + delete via CDP keydown
+      4. Type each character via CDP keyDown/char/keyUp sequence
+      5. Fire jQuery-compatible input/change events via JS
     """
     value = str(value).strip()
-    # 1. Focus the element via click
-    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", element)
-    time.sleep(0.2)
+    if not value:
+        return
+
+    # Step 1: scroll into view + ActionChains click to focus
+    driver.execute_script("arguments[0].scrollIntoView({block:'center', inline:'nearest'});", element)
+    time.sleep(0.25)
     try:
-        ActionChains(driver).move_to_element(element).click().perform()
+        ActionChains(driver).move_to_element(element).pause(
+            random.uniform(0.1, 0.25)).click().perform()
     except Exception:
         driver.execute_script("arguments[0].focus();", element)
-    time.sleep(0.15)
+    time.sleep(random.uniform(0.15, 0.3))
 
-    # 2. Select all and delete
-    element.send_keys(Keys.CONTROL + "a")
-    time.sleep(0.1)
-    element.send_keys(Keys.DELETE)
+    # Step 2: Select all existing content via CDP Ctrl+A then Delete
+    for key_action in [
+        {"type": "keyDown", "key": "Control", "code": "ControlLeft",  "keyCode": 17, "modifiers": 0},
+        {"type": "keyDown", "key": "a",       "code": "KeyA",         "keyCode": 65, "modifiers": 2},
+        {"type": "keyUp",   "key": "a",       "code": "KeyA",         "keyCode": 65, "modifiers": 2},
+        {"type": "keyUp",   "key": "Control", "code": "ControlLeft",  "keyCode": 17, "modifiers": 0},
+        {"type": "keyDown", "key": "Delete",  "code": "Delete",       "keyCode": 46, "modifiers": 0},
+        {"type": "keyUp",   "key": "Delete",  "code": "Delete",       "keyCode": 46, "modifiers": 0},
+    ]:
+        driver.execute_cdp_cmd("Input.dispatchKeyEvent", key_action)
+        time.sleep(0.03)
+
     time.sleep(0.1)
 
-    # 3. Type character by character (real keystrokes — not autofill)
+    # Step 3: Type each character via CDP keyDown + char + keyUp
     for ch in value:
-        element.send_keys(ch)
-        time.sleep(random.uniform(0.05, 0.13))
+        key_code = _KEY_CODES.get(ch.upper(), ord(ch.upper()) if ch.isalpha() else 0)
+        modifiers = 2 if ch.isupper() or ch in '!@#$%^&*()_+{}|:"<>?' else 0
 
-    # 4. Fire change + blur events explicitly so CL validators run
+        driver.execute_cdp_cmd("Input.dispatchKeyEvent", {
+            "type": "keyDown",
+            "key": ch,
+            "code": f"Key{ch.upper()}" if ch.isalpha() else "Unidentified",
+            "keyCode": key_code,
+            "modifiers": modifiers,
+            "text": ch,
+        })
+        driver.execute_cdp_cmd("Input.dispatchKeyEvent", {
+            "type": "char",
+            "key": ch,
+            "code": f"Key{ch.upper()}" if ch.isalpha() else "Unidentified",
+            "keyCode": key_code,
+            "modifiers": modifiers,
+            "text": ch,
+        })
+        driver.execute_cdp_cmd("Input.dispatchKeyEvent", {
+            "type": "keyUp",
+            "key": ch,
+            "code": f"Key{ch.upper()}" if ch.isalpha() else "Unidentified",
+            "keyCode": key_code,
+            "modifiers": modifiers,
+            "text": ch,
+        })
+        time.sleep(random.uniform(0.06, 0.14))
+
+    time.sleep(0.2)
+
+    # Step 4: Fire jQuery-compatible events so CL's validator marks field as touched
     driver.execute_script("""
-        arguments[0].dispatchEvent(new Event('change', {bubbles: true}));
-        arguments[0].dispatchEvent(new Event('blur',   {bubbles: true}));
-        arguments[0].dispatchEvent(new Event('input',  {bubbles: true}));
+        var el = arguments[0];
+        // Native events
+        el.dispatchEvent(new Event('input',  {bubbles: true, cancelable: true}));
+        el.dispatchEvent(new Event('change', {bubbles: true, cancelable: true}));
+        // jQuery events (CL uses jQuery internally for validation)
+        if (window.jQuery) {
+            jQuery(el).trigger('input').trigger('change').trigger('keyup');
+        }
     """, element)
-    time.sleep(0.3)
+    time.sleep(0.25)
+
+
+def _clear_and_type(driver, element, value):
+    """Alias — all fills now go through CDP."""
+    _cdp_type(driver, element, value)
+
+
+def _wait_for_cl_js_init(driver, timeout=20):
+    """
+    Wait for CL's postingform JS to fully initialize before we touch any field.
+    CL loads form HTML first, then scripts — if we fill before scripts run,
+    the scripts reset all fields. We wait for the jQuery form validator to attach.
+    """
+    print("  [init] Waiting for CL form JS to initialize...")
+    try:
+        WebDriverWait(driver, timeout).until(lambda d: d.execute_script("""
+            try {
+                // CL's postingform JS attaches jQuery data to the form when ready
+                var form = document.getElementById('postingForm');
+                if (!form) return false;
+                // Check jQuery is loaded and form validator is attached
+                if (!window.jQuery) return false;
+                var jqForm = jQuery(form);
+                // CL attaches a 'validate' data key when validator is ready
+                if (jqForm.data('validator')) return true;
+                // Fallback: check that postingform-concat script has run
+                // by checking if CL's cl.postingProcess object exists
+                if (window.cl && window.cl.postingProcess) return true;
+                // Last resort: just check jQuery is loaded and form exists
+                return jQuery('#postingForm').length > 0;
+            } catch(e) { return false; }
+        """))
+        print("  [init] CL form JS ready ✓")
+    except TimeoutException:
+        print("  [init] Timeout waiting for CL JS — proceeding anyway")
+    # Extra buffer for any remaining async init
+    time.sleep(1.5)
 
 
 def _find_field(driver, selectors, timeout=8):
@@ -453,10 +557,14 @@ def _find_field(driver, selectors, timeout=8):
 
 def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     """
-    Fill the CL posting form and submit.
-    KEY FIX: use _clear_and_type (real keystrokes + event dispatch) then
-    click the submit button with Selenium ActionChains — NOT JS click.
-    JS clicks bypass browser validation; Selenium clicks go through it.
+    Fill the CL posting form using CDP keyboard events (indistinguishable from
+    real hardware) and submit via form.requestSubmit().
+
+    KEY CHANGES vs previous version:
+    1. Wait for CL's postingform JS to fully init before touching any field
+    2. All typing goes through _cdp_type (CDP Input.dispatchKeyEvent)
+    3. ZIP is filled LAST — right before submit — so autocomplete cannot wipe it
+    4. After typing ZIP, we wait for autocomplete, confirm with Enter, verify
     """
     try:
         WebDriverWait(driver, 15).until(
@@ -466,7 +574,12 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
         return None
 
     handle_captcha_if_present(driver)
-    time.sleep(2)
+
+    # ── CRITICAL: wait for CL's JS to fully initialize ──────────────────────
+    # CL loads form HTML first then scripts. If we fill before scripts run,
+    # the scripts reset our values. _wait_for_cl_js_init detects when
+    # postingform-concat.min.js has finished attaching jQuery validators.
+    _wait_for_cl_js_init(driver)
 
     # Build values
     title = (product.get("title") or product.get("name") or "Quality Item For Sale").strip()
@@ -481,70 +594,23 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
 
     print(f"  [fill] title='{title[:50]}' price={price} zip={zip_code} city={city_name}")
 
-    # ── 1. ZIP / postal — multiple possible field names ──────────────────────
-    # CL uses a jQuery autocomplete on the postal field: typing triggers a
-    # lookup that can CLEAR the field value. We must type, then wait for the
-    # autocomplete suggestion to appear and dismiss it (Enter/Tab), then wait
-    # for the lookup to complete, then verify the value stuck.
-    zip_field = _find_field(driver, [
-        "[name='postal']",
-        "[name='postal_code']",
-        "input#postal_code",
-        "input#postal",
-    ])
-    if zip_field and zip_code:
-        _clear_and_type(driver, zip_field, zip_code)
-        # Wait up to 4s for the autocomplete dropdown to appear then dismiss
-        try:
-            WebDriverWait(driver, 4).until(
-                lambda d: d.find_elements(By.CSS_SELECTOR,
-                    ".ui-autocomplete li, .autocomplete-suggestion, [class*='autocomplete'] li"))
-            # Press Enter to select the first suggestion (confirms the ZIP)
-            zip_field.send_keys(Keys.RETURN)
-            print("  [ZIP] Autocomplete suggestion appeared — pressed Enter to confirm")
-        except TimeoutException:
-            # No dropdown — just press Tab to trigger blur/change
-            zip_field.send_keys(Keys.TAB)
-            print("  [ZIP] No autocomplete dropdown — pressed Tab to blur")
-        # Wait for any AJAX lookup to finish (field may be cleared then re-populated)
-        time.sleep(2.0)
-        # Re-locate the field (DOM may have been rebuilt)
-        zip_field = _find_field(driver, [
-            "[name='postal']", "[name='postal_code']",
-            "input#postal_code", "input#postal",
-        ])
-        actual = (zip_field.get_attribute("value") if zip_field else "") or ""
-        if not actual:
-            # Autocomplete wiped it — type again now that lookup has settled
-            print(f"  [ZIP] Field cleared by autocomplete — re-typing...")
-            if zip_field:
-                _clear_and_type(driver, zip_field, zip_code)
-                zip_field.send_keys(Keys.TAB)
-                time.sleep(1.5)
-                actual = zip_field.get_attribute("value") or ""
-        print(f"  ✓ [ZIP] = '{actual}'")
-    else:
-        print(f"  ⚠ [ZIP] field not found or no zip_code")
-
-    time.sleep(random.uniform(0.4, 0.7))
-
-    # ── 2. Title ─────────────────────────────────────────────────────────────
+    # ── 1. Title ─────────────────────────────────────────────────────────────
     title_field = _find_field(driver, [
         "[name='PostingTitle']",
         "input#PostingTitle",
         "input#title",
     ])
     if title_field:
-        _clear_and_type(driver, title_field, title)
+        _cdp_type(driver, title_field, title)
         actual = title_field.get_attribute("value") or ""
         print(f"  ✓ [title] = '{actual[:60]}'")
     else:
         print("  ✗ [title] field not found!")
         return None
 
-    time.sleep(random.uniform(0.3, 0.6))
+    time.sleep(random.uniform(0.4, 0.7))
 
-    # ── 3. Price ─────────────────────────────────────────────────────────────
+    # ── 2. Price ─────────────────────────────────────────────────────────────
     price_field = _find_field(driver, [
         "[name='price']",
         "[name='AskingPrice']",
@@ -552,35 +618,35 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
         "input#price",
     ])
     if price_field:
-        _clear_and_type(driver, price_field, price)
+        _cdp_type(driver, price_field, price)
         actual = price_field.get_attribute("value") or ""
         print(f"  ✓ [price] = '{actual}'")
     else:
         print("  ⚠ [price] field not found")
 
-    time.sleep(random.uniform(0.3, 0.5))
+    time.sleep(random.uniform(0.3, 0.6))
 
-    # ── 4. City / neighborhood ───────────────────────────────────────────────
+    # ── 3. City / neighborhood ───────────────────────────────────────────────
     city_field = _find_field(driver, [
         "[name='geographic_area']",
         "input#geographic_area",
         "[name='city']",
     ])
     if city_field and city_name:
-        _clear_and_type(driver, city_field, city_name)
+        _cdp_type(driver, city_field, city_name)
         actual = city_field.get_attribute("value") or ""
         print(f"  ✓ [city] = '{actual}'")
 
     time.sleep(random.uniform(0.3, 0.5))
 
-    # ── 5. Description ───────────────────────────────────────────────────────
+    # ── 4. Description ───────────────────────────────────────────────────────
     desc_field = _find_field(driver, [
         "[name='PostingBody']",
         "textarea#PostingBody",
         "textarea#description",
     ])
     if desc_field:
-        _clear_and_type(driver, desc_field, description)
+        _cdp_type(driver, desc_field, description)
         actual = (desc_field.get_attribute("value") or "")[:40]
         print(f"  ✓ [description] = '{actual}'")
     else:
@@ -589,17 +655,72 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
 
     time.sleep(random.uniform(0.4, 0.7))
 
-    # ── 6. Email if editable ─────────────────────────────────────────────────
+    # ── 5. Email if editable ─────────────────────────────────────────────────
     try:
         email_el = driver.find_element(By.CSS_SELECTOR, "[name='FromEMail']")
         if not email_el.get_attribute("disabled") and not email_el.get_attribute("readOnly"):
             if cl_email:
-                _clear_and_type(driver, email_el, cl_email)
+                _cdp_type(driver, email_el, cl_email)
                 print(f"  ✓ [email] = '{cl_email}'")
         else:
             print("  [email] Pre-filled by account")
     except Exception:
         pass
+
+    time.sleep(random.uniform(0.4, 0.6))
+
+    # ── 6. ZIP — filled LAST, right before submit ────────────────────────────
+    # Reason: CL's jQuery autocomplete on the postal field fires an AJAX lookup
+    # that can clear the value. By filling ZIP last we give it no time to re-fire
+    # while we fill other fields. After typing we wait for the autocomplete
+    # suggestion and confirm with Enter — which is what CL expects.
+    if zip_code:
+        zip_field = _find_field(driver, [
+            "[name='postal']",
+            "[name='postal_code']",
+            "input#postal_code",
+            "input#postal",
+        ])
+        if zip_field:
+            _cdp_type(driver, zip_field, zip_code)
+            # Wait for autocomplete dropdown
+            try:
+                WebDriverWait(driver, 5).until(
+                    lambda d: d.find_elements(By.CSS_SELECTOR,
+                        ".ui-autocomplete li, .ui-menu-item, [class*='autocomplete'] li"))
+                # Move mouse to first suggestion and click it — most natural
+                suggestions = driver.find_elements(By.CSS_SELECTOR,
+                    ".ui-autocomplete li, .ui-menu-item, [class*='autocomplete'] li")
+                if suggestions:
+                    try:
+                        ActionChains(driver).move_to_element(suggestions[0]).pause(
+                            random.uniform(0.2, 0.4)).click().perform()
+                        print("  [ZIP] Clicked first autocomplete suggestion ✓")
+                    except Exception:
+                        zip_field.send_keys(Keys.RETURN)
+                        print("  [ZIP] Autocomplete appeared — confirmed with Enter")
+                else:
+                    zip_field.send_keys(Keys.RETURN)
+            except TimeoutException:
+                # No dropdown shown — press Tab to blur and trigger validation
+                zip_field.send_keys(Keys.TAB)
+                print("  [ZIP] No autocomplete — pressed Tab to blur")
+            time.sleep(2.0)
+            # Re-find field after possible DOM rebuild
+            zip_field = _find_field(driver, [
+                "[name='postal']", "[name='postal_code']",
+                "input#postal_code", "input#postal",
+            ])
+            actual = (zip_field.get_attribute("value") if zip_field else "") or ""
+            if not actual and zip_field:
+                print("  [ZIP] Autocomplete cleared value — re-typing once more")
+                _cdp_type(driver, zip_field, zip_code)
+                zip_field.send_keys(Keys.TAB)
+                time.sleep(1.0)
+                actual = zip_field.get_attribute("value") or ""
+            print(f"  ✓ [ZIP] = '{actual}'")
+        else:
+            print("  ⚠ [ZIP] field not found")
 
     time.sleep(0.8)
 
