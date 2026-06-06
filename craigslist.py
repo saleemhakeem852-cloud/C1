@@ -1171,18 +1171,168 @@ return results;
 """
 
 
+def _call_cl_internal_location_setter(driver, zip_str, city_str="Los Angeles"):
+    """
+    CL's postingform-concat.min.js embeds the autocomplete dataset locally
+    (no network call — confirmed by _allNetworkCalls: [] in logs).
+
+    When a user selects from the autocomplete, CL's select handler calls an
+    internal function that sets location state in a JS object. We find and
+    call that function directly.
+
+    Strategies tried in order:
+    1. Find the autocomplete widget's select handler and call it with fake item data
+    2. Find cl.postingProcess.setLocation or similar internal setter
+    3. Walk all jQuery event handlers on the postal field and fire the select handler
+    4. Simulate the exact event sequence CL's autocomplete fires on real selection
+    """
+    result = driver.execute_script("""
+        var zipVal = arguments[0];
+        var cityVal = arguments[1];
+        var log = [];
+
+        var postalEl = document.querySelector('[name="postal"]') ||
+                       document.querySelector('[name="postal_code"]') ||
+                       document.querySelector('#postal_code') ||
+                       document.querySelector('#postal');
+
+        if (!postalEl || !window.jQuery) {
+            return {ok: false, reason: 'no-postal-or-jquery', log: log};
+        }
+
+        var jq = jQuery(postalEl);
+        var fakeItem = {
+            value: zipVal,
+            label: zipVal + ' - ' + cityVal + ', CA',
+            id: zipVal,
+            geo_id: zipVal,
+            postal: zipVal,
+            area: cityVal
+        };
+
+        // ── Strategy 1: Fire the autocomplete uiAutocomplete select handler ──
+        // CL attaches handler via jQuery('input.postal').on('autocompleteselect', ...)
+        // We fire this exact event with a fake item object.
+        try {
+            var selectEvt = jQuery.Event('autocompleteselect');
+            selectEvt.item = fakeItem;
+            jq.trigger(selectEvt, [{item: fakeItem}]);
+            log.push('fired-autocompleteselect');
+        } catch(e) { log.push('autocompleteselect-err:' + e.message); }
+
+        // ── Strategy 2: Find all jQuery handlers on the postal field ─────────
+        try {
+            var events = jQuery._data(postalEl, 'events') || {};
+            var evNames = Object.keys(events);
+            log.push('postal-events:' + evNames.join(','));
+            // Fire each handler that looks like a select/change handler
+            ['autocompleteselect', 'autocompletechange', 'autocompletefocus',
+             'select', 'change', 'chosen:updated'].forEach(function(evName) {
+                if (events[evName]) {
+                    events[evName].forEach(function(h) {
+                        try {
+                            var fakeEvent = jQuery.Event(evName);
+                            fakeEvent.item = fakeItem;
+                            h.handler.call(postalEl, fakeEvent, {item: fakeItem});
+                            log.push('called-handler:' + evName);
+                        } catch(e2) { log.push('handler-err:' + evName + ':' + e2.message); }
+                    });
+                }
+            });
+        } catch(e) { log.push('events-walk-err:' + e.message); }
+
+        // ── Strategy 3: Call CL's internal postingProcess location functions ─
+        try {
+            var clObj = window.cl || window.CL || {};
+            var pp = clObj.postingProcess || clObj.posting || clObj.form || {};
+            var fnNames = Object.keys(pp).filter(function(k) {
+                return typeof pp[k] === 'function' && (
+                    k.toLowerCase().indexOf('loc') !== -1 ||
+                    k.toLowerCase().indexOf('geo') !== -1 ||
+                    k.toLowerCase().indexOf('zip') !== -1 ||
+                    k.toLowerCase().indexOf('postal') !== -1 ||
+                    k.toLowerCase().indexOf('area') !== -1
+                );
+            });
+            log.push('cl-location-fns:' + fnNames.join(','));
+            fnNames.forEach(function(fn) {
+                try {
+                    pp[fn].call(pp, zipVal, fakeItem);
+                    log.push('called:' + fn);
+                } catch(e3) { log.push('fn-err:' + fn + ':' + e3.message); }
+            });
+        } catch(e) { log.push('cl-pp-err:' + e.message); }
+
+        // ── Strategy 4: Walk ALL global objects for location setter ──────────
+        try {
+            var globalFns = [];
+            ['cl','CL','clp','clPosting','posting','postingForm'].forEach(function(objName) {
+                var obj = window[objName];
+                if (!obj) return;
+                var walk = function(o, prefix, depth) {
+                    if (depth > 3) return;
+                    Object.keys(o || {}).forEach(function(k) {
+                        try {
+                            if (typeof o[k] === 'function') {
+                                var kl = k.toLowerCase();
+                                if (kl.indexOf('loc') !== -1 || kl.indexOf('geo') !== -1 ||
+                                    kl.indexOf('zip') !== -1 || kl.indexOf('postal') !== -1 ||
+                                    kl.indexOf('area') !== -1 || kl.indexOf('set') !== -1) {
+                                    globalFns.push(prefix + '.' + k);
+                                }
+                            } else if (typeof o[k] === 'object' && o[k] !== null) {
+                                walk(o[k], prefix + '.' + k, depth + 1);
+                            }
+                        } catch(e) {}
+                    });
+                };
+                walk(obj, objName, 0);
+            });
+            log.push('global-loc-fns:' + globalFns.join(','));
+        } catch(e) { log.push('global-walk-err:' + e.message); }
+
+        // ── Strategy 5: Simulate exact event sequence of real autocomplete ───
+        // Real sequence: mouseenter → mousemove → mousedown → mouseup → click
+        // on the suggestion LI, which jQuery UI translates to 'autocompleteselect'
+        // We already fired autocompleteselect above. Also fire the full sequence:
+        try {
+            jq.triggerHandler('focus');
+            setTimeout(function() {
+                jq.val(zipVal);
+                jq.triggerHandler(jQuery.Event('keydown',  {keyCode: 49})); // '1'
+                jq.triggerHandler(jQuery.Event('input',    {bubbles: true}));
+                jq.triggerHandler(jQuery.Event('keyup',    {keyCode: 49}));
+                // Simulate dropdown item click
+                var selectEv = jQuery.Event('autocompleteselect');
+                selectEv.item = fakeItem;
+                jq.trigger(selectEv, [{item: fakeItem}]);
+                jq.triggerHandler(jQuery.Event('change',   {bubbles: true}));
+                jq.triggerHandler(jQuery.Event('blur',     {bubbles: true}));
+            }, 300);
+            log.push('delayed-sequence-set');
+        } catch(e) { log.push('sequence-err:' + e.message); }
+
+        return {ok: true, log: log};
+    """, zip_str, city_str)
+
+    print(f"  [ZIP-internal] Location setter result: {result}")
+    return result
+
+
 def _fill_zip_with_network_intercept(driver, zip_field, zip_str):
     """
-    The definitive ZIP fill strategy — v2 with real geo response capture:
+    The definitive ZIP fill strategy — v3:
 
-    1. Install network spy (already done at page load via Page.addScriptToEvaluateOnNewDocument)
-    2. Install serializer / FormData patches
-    3. Type ZIP with native keyboard events to trigger CL's autocomplete
-    4. Try to click the dropdown suggestion
-    5. WAIT for and capture any real geo network response
-    6. If a real geo response was captured, inject its hidden fields into the DOM
-    7. If no real geo response, make the request ourselves (Python requests) and inject
-    8. Run validator nuke before submit
+    Root cause confirmed: CL makes ZERO network calls (_allNetworkCalls: []).
+    The autocomplete dataset is local. The server rejects because CL's internal
+    JS location state object is never updated — only the DOM input value is set.
+
+    This version:
+    1. Types ZIP with real native send_keys to trigger CL's autocomplete naturally
+    2. Clicks the dropdown if it appears
+    3. Calls _call_cl_internal_location_setter to fire CL's select handlers directly
+    4. Keeps serializer + FormData patches as safety net
+    5. Validator nuke to clear error state
     """
     # Ensure network spy is installed in this page context
     _install_network_spy_now(driver)
@@ -1276,6 +1426,14 @@ def _fill_zip_with_network_intercept(driver, zip_field, zip_str):
     if not suggestion_clicked:
         zip_field.send_keys(Keys.TAB)
         print("  [ZIP] Tabbed out (no dropdown)")
+
+    # ── Call CL's internal location setter directly ──────────────────────────
+    # CL uses ZERO network calls (confirmed by logs). The real confirmation
+    # happens via CL's internal JS autocomplete select handlers updating an
+    # internal state object. We call those handlers directly.
+    time.sleep(0.5)
+    _call_cl_internal_location_setter(driver, zip_str)
+    time.sleep(0.8)
 
     # Wait for any AJAX to complete
     print("  [ZIP] Waiting for location AJAX...")
