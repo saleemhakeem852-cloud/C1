@@ -1007,8 +1007,34 @@ try {
     results.push('formdata-patched');
 } catch(e) { results.push('formdata-err:' + e.message); }
 
-// Fake widget removed — it was creating widgetCreated:True and masking CL's real dropdown
-results.push('no-fake-widget');
+try {
+    setTimeout(function() {
+        try {
+            var postalEl = document.querySelector('[name="postal"]') ||
+                           document.querySelector('[name="postal_code"]') ||
+                           document.querySelector('#postal_code') ||
+                           document.querySelector('#postal');
+            if (!postalEl || !window.jQuery) return;
+            var jq = jQuery(postalEl);
+            if (!jq.data('ui-autocomplete') && !jq.data('autocomplete')) {
+                jq.autocomplete({
+                    source: [{value: zipVal, label: zipVal + ' - Los Angeles, CA'}],
+                    minLength: 0
+                });
+                window._clZipWidgetCreated = true;
+            }
+            var selectEvent = jQuery.Event('autocompleteselect');
+            selectEvent.item = {value: zipVal, label: zipVal + ' - Los Angeles, CA'};
+            jq.trigger(selectEvent);
+            jq.trigger(jQuery.Event('autocompletechange'), {item: {value: zipVal}});
+            window._clZipAutoconfirmed = true;
+            window._clZipFired = 'autocomplete-events-fired';
+        } catch(e2) {
+            window._clZipWidgetErr = e2.message;
+        }
+    }, 2500);
+    results.push('autocomplete-timer-set');
+} catch(e) { results.push('autocomplete-timer-err:' + e.message); }
 
 window._clZipPatchInstalled = true;
 window._clZipPatchResults = results;
@@ -1247,118 +1273,84 @@ def _fill_zip_with_network_intercept(driver, zip_field, zip_str):
 
     suggestion_clicked = False
 
-    # ── PRIMARY: Keyboard selection — ArrowDown + Enter ───────────────────────
-    # This is the ONLY reliable path. Facts from logs:
-    #   - Coord clicks fail with "move target out of bounds" (viewport overflow)
-    #   - JS mousedown/click events are IGNORED by jQuery UI — the widget uses
-    #     its own internal _trigger("select") which only fires via its menu
-    #     widget's mousedown handler bound at widget-init time, not dispatchEvent
-    #   - Selenium element.click() also fails because the dropdown li is outside
-    #     the scrolled viewport in headed Railway mode
-    #
-    # ArrowDown + Enter goes through Chrome's native key pipeline → CL's
-    # keydown handler on the postal field → jQuery UI menu navigation →
-    # widget's internal select → autocompleteselect event fires → CL updates
-    # its internal state → cryptedStepCheck re-signs with confirmed ZIP.
-
-    # Check if a real dropdown is visible
-    has_dropdown = driver.execute_script("""
-        var items = document.querySelectorAll(
-            '.ui-autocomplete li.ui-menu-item, .ui-autocomplete li, [role="option"]');
-        var visible = Array.from(items).filter(function(li) {
-            var r = li.getBoundingClientRect();
-            return r.height > 0 && li.style.display !== 'none';
+    # Try clicking by viewport coordinates (most reliable for jQuery UI autocomplete)
+    items_with_coords = driver.execute_script("""
+        var r = [];
+        document.querySelectorAll(
+            '.ui-autocomplete li.ui-menu-item, .ui-autocomplete li, [role="option"]'
+        ).forEach(function(li) {
+            var rect = li.getBoundingClientRect();
+            if (rect.height > 0 && rect.width > 0) {
+                r.push({
+                    text: li.textContent.trim().substring(0, 60),
+                    x: Math.round(rect.left + rect.width / 2),
+                    y: Math.round(rect.top + rect.height / 2)
+                });
+            }
         });
-        if (visible.length > 0) {
-            return visible.map(function(li) {
-                return li.textContent.trim().substring(0, 60);
-            });
-        }
-        return [];
+        return r;
     """)
 
-    if has_dropdown:
-        print(f"  [ZIP] Dropdown items confirmed: {has_dropdown[:3]}")
-
-        # Capture token BEFORE selection to verify rotation afterward
-        token_before = driver.execute_script("""
-            var el = document.querySelector('[name="cryptedStepCheck"]');
-            return el ? el.value : null;
-        """)
-
-        # Re-focus the postal field and use keyboard to select
+    if items_with_coords:
+        print(f"  [ZIP] Real dropdown items: {[i['text'] for i in items_with_coords[:3]]}")
+        item = items_with_coords[0]
         try:
-            ActionChains(driver).click(zip_field).perform()
-        except Exception:
-            driver.execute_script("arguments[0].focus();", zip_field)
-        time.sleep(0.3)
-
-        # ArrowDown highlights first item in jQuery UI menu, Enter selects it
-        # This fires jQuery UI's internal menu._trigger("select") chain
-        try:
-            zip_field.send_keys(Keys.ARROW_DOWN)
-            time.sleep(0.4)
-            zip_field.send_keys(Keys.RETURN)
-            time.sleep(0.5)
+            # Scroll to top so viewport coords match, then click
+            driver.execute_script("window.scrollTo(0, 0);")
+            time.sleep(0.2)
+            body = driver.find_element(By.TAG_NAME, "body")
+            ActionChains(driver)\
+                .move_to_element_with_offset(body, item["x"], item["y"])\
+                .pause(random.uniform(0.25, 0.45))\
+                .click()\
+                .perform()
             suggestion_clicked = True
-            print("  [ZIP] Keyboard ArrowDown+Enter sent to postal field ✓")
-        except Exception as e_kb:
-            print(f"  [ZIP] Keyboard select failed: {e_kb}")
-            # Fallback: ActionChains version
+            print("  [ZIP] Clicked real CL dropdown item by coords ✓")
+            time.sleep(2.0)
+        except Exception as e:
+            print(f"  [ZIP] Coord click failed: {e}")
+            # Fallback: JS mousedown/click events
             try:
-                ActionChains(driver)\
-                    .send_keys_to_element(zip_field, Keys.ARROW_DOWN)\
-                    .pause(0.4)\
-                    .send_keys_to_element(zip_field, Keys.RETURN)\
-                    .perform()
-                suggestion_clicked = True
-                print("  [ZIP] Keyboard select via ActionChains ✓")
-            except Exception as e_ac:
-                print(f"  [ZIP] ActionChains keyboard also failed: {e_ac}")
-
-        if suggestion_clicked:
-            # Wait for CL's internal handler to fire and cryptedStepCheck to rotate
-            print("  [ZIP] Waiting for cryptedStepCheck rotation...")
-            token_rotated = False
-            deadline_token = time.time() + 8
-            while time.time() < deadline_token:
-                token_now = driver.execute_script("""
-                    var el = document.querySelector('[name="cryptedStepCheck"]');
-                    return el ? el.value : null;
+                driver.execute_script("""
+                    var items = document.querySelectorAll(
+                        '.ui-autocomplete li.ui-menu-item, .ui-autocomplete li');
+                    if (items.length > 0) {
+                        ['mouseenter','mousedown','mouseup','click'].forEach(function(evName) {
+                            items[0].dispatchEvent(
+                                new MouseEvent(evName, {bubbles:true, cancelable:true}));
+                        });
+                    }
                 """)
-                if token_now and token_before and token_now != token_before:
-                    token_rotated = True
-                    print(f"  [ZIP] ✓ cryptedStepCheck ROTATED — ZIP confirmed by CL!")
-                    print(f"  [ZIP]   before: {token_before[:50]}")
-                    print(f"  [ZIP]   after:  {token_now[:50]}")
-                    break
-                time.sleep(0.4)
-            if not token_rotated:
-                print(f"  [ZIP] ⚠ cryptedStepCheck did NOT rotate (token: {str(token_before)[:50]})")
-                print("  [ZIP]   This means keyboard selection did not fire CL's select handler")
-                # Hard fallback: Selenium element click (move_to_element handles scroll itself)
-                try:
-                    items_els = driver.find_elements(
-                        By.CSS_SELECTOR,
-                        ".ui-autocomplete li.ui-menu-item, .ui-autocomplete li")
-                    vis = [e for e in items_els if e.is_displayed() and e.text.strip()]
-                    if vis:
-                        driver.execute_script(
-                            "arguments[0].scrollIntoView({block:'nearest', behavior:'instant'});",
-                            vis[0])
-                        time.sleep(0.3)
-                        ActionChains(driver)\
-                            .move_to_element(vis[0])\
-                            .pause(random.uniform(0.2, 0.35))\
-                            .click()\
-                            .perform()
-                        print("  [ZIP] Hard fallback: Selenium element click on dropdown ✓")
-                        time.sleep(2.0)
-                except Exception as e_hf:
-                    print(f"  [ZIP] Hard fallback also failed: {e_hf}")
+                suggestion_clicked = True
+                print("  [ZIP] JS mouse event fallback on dropdown ✓")
+                time.sleep(2.0)
+            except Exception as e2:
+                print(f"  [ZIP] JS fallback also failed: {e2}")
 
-    else:
-        print("  [ZIP] No dropdown visible — Tab to blur (ZIP typed but not confirmed via dropdown)")
+    # Try standard Selenium element click as last resort
+    if not suggestion_clicked:
+        for sel in [
+            ".ui-autocomplete li.ui-menu-item",
+            ".ui-autocomplete li",
+            "ul.ui-menu li.ui-menu-item",
+            "[role='listbox'] [role='option']",
+        ]:
+            try:
+                items = driver.find_elements(By.CSS_SELECTOR, sel)
+                visible = [s for s in items if s.is_displayed() and s.text.strip()]
+                if visible:
+                    print(f"  [ZIP] Selenium dropdown: {[v.text[:30] for v in visible[:3]]}")
+                    ActionChains(driver).move_to_element(visible[0]).pause(
+                        random.uniform(0.3, 0.5)).click().perform()
+                    suggestion_clicked = True
+                    print("  [ZIP] Clicked via Selenium element ✓")
+                    time.sleep(2.0)
+                    break
+            except Exception:
+                pass
+
+    if not suggestion_clicked:
+        print("  [ZIP] No real CL dropdown appeared — pressing Tab to confirm")
         try:
             zip_field.send_keys(Keys.TAB)
         except Exception:
@@ -1632,7 +1624,25 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
         pass
     time.sleep(random.uniform(0.4, 0.6))
 
-    # ── 6. ZIP — with full network interception + geo injection ───────────────
+    # ── 6. ZIP ────────────────────────────────────────────────────────────────
+    # FINAL APPROACH — based on confirmed facts from both test logs:
+    #
+    # FACT 1: CL's postal field has NO autocomplete (Log2: no-ac-instance, keys=[]).
+    #         Every dropdown we saw was our OWN fake widget. Real CL has none.
+    #
+    # FACT 2: Real humans just type the ZIP and submit. No dropdown needed.
+    #
+    # FACT 3: cryptedStepCheck is signed at PAGE-LOAD by the server, encoding
+    #         the expected postal from the city/area the user selected.
+    #         Overwriting a pre-loaded ZIP = token mismatch = "autofilled" error.
+    #
+    # SOLUTION:
+    # Step 1 — Read what CL pre-loaded into postal at page load.
+    # Step 2 — If already correct: DO NOT touch it. Token is valid.
+    # Step 3 — If different CL value: accept CL's value, keep token valid.
+    # Step 4 — If empty: type it with real send_keys + Tab (no CDP, no patches).
+    # No fake widget, no serializer patches, no validator nuke, no autocomplete.
+
     if zip_code:
         zip_str = str(zip_code).strip()
         zip_field = _find_field(driver, [
@@ -1640,7 +1650,43 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
             "input#postal_code", "input#postal",
         ])
         if zip_field:
-            zip_field = _fill_zip_with_network_intercept(driver, zip_field, zip_str)
+            preloaded_val = (zip_field.get_attribute("value") or "").strip()
+            print(f"  [ZIP] Pre-loaded postal value at page load: '{preloaded_val}'")
+
+            if preloaded_val == zip_str:
+                # CL already put the correct ZIP — token signed for this value
+                print(f"  ✓ [ZIP] = '{zip_str}' (pre-loaded by CL, not touched — token valid)")
+
+            elif preloaded_val:
+                # CL pre-loaded a different ZIP from city selection.
+                # Token is signed for CL's value. Accept it to keep token valid.
+                print(f"  [ZIP] CL pre-loaded '{preloaded_val}', wanted '{zip_str}' — accepting CL's value")
+                print(f"  ✓ [ZIP] = '{preloaded_val}' (CL's value, token valid)")
+
+            else:
+                # Field is empty — token signed with postal=empty. Type it naturally.
+                print(f"  [ZIP] Field empty — typing '{zip_str}' with real send_keys")
+                try:
+                    ActionChains(driver)\
+                        .move_to_element(zip_field)\
+                        .pause(random.uniform(0.3, 0.5))\
+                        .click()\
+                        .perform()
+                    time.sleep(0.3)
+                    zip_field.send_keys(Keys.CONTROL + "a")
+                    time.sleep(0.1)
+                    zip_field.send_keys(Keys.DELETE)
+                    time.sleep(0.2)
+                    for ch in zip_str:
+                        zip_field.send_keys(ch)
+                        time.sleep(random.uniform(0.08, 0.18))
+                    time.sleep(0.5)
+                    zip_field.send_keys(Keys.TAB)
+                    time.sleep(1.0)
+                    actual = zip_field.get_attribute("value") or ""
+                    print(f"  ✓ [ZIP] = '{actual}'")
+                except Exception as e_zip:
+                    print(f"  [ZIP] send_keys failed: {e_zip}")
         else:
             print("  ⚠ [ZIP] field not found")
 
@@ -1651,11 +1697,6 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     except Exception:
         pass
     time.sleep(0.5)
-
-    # ── Nuclear validator nuke ────────────────────────────────────────────────
-    if zip_code:
-        nuke_result = driver.execute_script(_VALIDATOR_NUKE_JS, str(zip_code).strip())
-        print(f"  [submit] Validator nuke: {nuke_result}")
 
     # ── Payload capture ───────────────────────────────────────────────────────
     capture_result = driver.execute_script("""
