@@ -1070,29 +1070,114 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
         pass
     time.sleep(0.5)
 
-    # ── Nuclear validator nuke right before submit ────────────────────────────
+    # ── Nuclear validator nuke ────────────────────────────────────────────────
     if zip_code:
         nuke_result = driver.execute_script(_VALIDATOR_NUKE_JS, str(zip_code).strip())
         print(f"  [submit] Validator nuke: {nuke_result}")
 
-    # ── Verify ZIP is still in DOM ────────────────────────────────────────────
-    try:
-        pf = driver.find_element(By.CSS_SELECTOR,
-            "[name='postal'], [name='postal_code'], #postal_code")
-        v = pf.get_attribute("value") or ""
-        if not v and zip_code:
-            # Last chance — set it
-            driver.execute_script("""
-                var el = arguments[0], v = arguments[1];
-                Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(el, v);
-                el.setAttribute('value', v);
-                if (window.jQuery) jQuery(el).val(v).trigger('input').trigger('change');
-            """, pf, str(zip_code).strip())
-            print(f"  [submit] Last-chance ZIP set")
-    except Exception:
-        pass
+    # ── PAYLOAD CAPTURE: intercept the form submit to read exact POST body ────
+    # This is the key diagnostic — we capture what CL actually sends to the
+    # server so we can compare with a real manual submission.
+    # Strategy: override XMLHttpRequest.send AND fetch AND form.submit to
+    # capture the serialized body before it leaves the browser.
+    capture_result = driver.execute_script("""
+        var zipVal = arguments[0];
+        window._clCapturedPayloads = [];
+        window._clSubmitIntercepted = false;
 
-    # ── Submit button: ActionChains click (primary) ───────────────────────────
+        // 1. Intercept XHR.send to capture POST bodies
+        var OrigXHR2 = window.XMLHttpRequest;
+        var OrigOpen2 = OrigXHR2.prototype.open;
+        var OrigSend2 = OrigXHR2.prototype.send;
+        OrigXHR2.prototype.open = function(method, url) {
+            this._captureMethod = method;
+            this._captureUrl = url;
+            return OrigOpen2.apply(this, arguments);
+        };
+        OrigXHR2.prototype.send = function(body) {
+            var url = this._captureUrl || '';
+            // Capture ALL posts to craigslist (not just postal)
+            if (this._captureMethod && this._captureMethod.toUpperCase() === 'POST') {
+                window._clCapturedPayloads.push({
+                    type: 'xhr',
+                    url: url,
+                    body: body ? String(body).substring(0, 2000) : null
+                });
+                window._clSubmitIntercepted = true;
+            }
+            return OrigSend2.apply(this, arguments);
+        };
+
+        // 2. Intercept fetch
+        var origFetch2 = window.fetch;
+        window.fetch = function(input, init) {
+            var url = (typeof input === 'string') ? input : (input && input.url) || '';
+            var method = (init && init.method || 'GET').toUpperCase();
+            if (method === 'POST') {
+                var body = init && init.body;
+                var bodyStr = null;
+                if (body instanceof FormData) {
+                    // Can't read FormData directly — serialize what we can
+                    var pairs = [];
+                    try { body.forEach(function(v,k){ pairs.push(k+'='+encodeURIComponent(v)); }); } catch(e){}
+                    bodyStr = pairs.join('&');
+                } else if (body) {
+                    bodyStr = String(body).substring(0, 2000);
+                }
+                window._clCapturedPayloads.push({
+                    type: 'fetch',
+                    url: url,
+                    body: bodyStr
+                });
+                window._clSubmitIntercepted = true;
+            }
+            return origFetch2.apply(this, arguments);
+        };
+
+        // 3. Capture what jQuery serializeArray gives us RIGHT NOW
+        // This is what CL's submit handler reads when it calls $(form).serialize()
+        var form = document.getElementById('postingForm');
+        var jqSerialized = null;
+        var jqSerializedArray = null;
+        if (form && window.jQuery) {
+            try {
+                jqSerialized = jQuery(form).serialize();
+                jqSerializedArray = jQuery(form).serializeArray();
+            } catch(e) { jqSerialized = 'error:' + e.message; }
+        }
+
+        // 4. Capture native FormData serialization
+        var nativeFormData = null;
+        try {
+            var fd = new FormData(form);
+            var fdPairs = [];
+            fd.forEach(function(v, k) { fdPairs.push(k + '=' + String(v).substring(0,100)); });
+            nativeFormData = fdPairs.join('&');
+        } catch(e) { nativeFormData = 'error:' + e.message; }
+
+        // 5. Find what 'postal' value appears in each
+        var postalInJQ = null;
+        if (jqSerializedArray) {
+            jqSerializedArray.forEach(function(item) {
+                if (item.name === 'postal' || item.name === 'postal_code') {
+                    postalInJQ = item.name + '=' + item.value;
+                }
+            });
+        }
+
+        return {
+            jqSerialize: jqSerialized ? jqSerialized.substring(0, 500) : null,
+            postalInJQ: postalInJQ,
+            nativeFormData: nativeFormData ? nativeFormData.substring(0, 500) : null,
+            interceptorsInstalled: true
+        };
+    """, str(zip_code).strip() if zip_code else "")
+
+    print(f"  [payload] jQuery serialize (first 500): {capture_result.get('jqSerialize', 'N/A')}")
+    print(f"  [payload] postal in jQuery serialized : {capture_result.get('postalInJQ', 'MISSING')}")
+    print(f"  [payload] native FormData             : {capture_result.get('nativeFormData', 'N/A')}")
+
+    # ── Find submit button ────────────────────────────────────────────────────
     print("  [submit] Finding and clicking Continue button...")
     submitted = False
     submit_btn = None
@@ -1118,66 +1203,84 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
         except Exception:
             continue
 
-    if submit_btn:
-        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", submit_btn)
-        time.sleep(0.5)
-
-        # One final ZIP check right before the click
-        if zip_code:
-            driver.execute_script("""
-                var pEl = document.querySelector('[name="postal"]') ||
-                          document.querySelector('[name="postal_code"]') ||
-                          document.querySelector('#postal_code');
-                if (pEl) {
-                    var nativeSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
-                    nativeSetter.call(pEl, arguments[0]);
-                    pEl.setAttribute('value', arguments[0]);
-                }
-            """, str(zip_code).strip())
-
-        # Primary: ActionChains real mouse click
-        try:
-            ActionChains(driver).move_to_element(submit_btn).pause(
-                random.uniform(0.3, 0.6)).click().perform()
-            submitted = True
-            print("  [submit] Clicked via ActionChains ✓")
-        except Exception as e:
-            print(f"  [submit] ActionChains failed ({e})")
-
-        # Immediately re-set ZIP after click (before CL's handler can clear it)
-        if submitted and zip_code:
-            time.sleep(0.1)
-            driver.execute_script("""
-                var pEl = document.querySelector('[name="postal"]') ||
-                          document.querySelector('[name="postal_code"]') ||
-                          document.querySelector('#postal_code');
-                if (pEl) {
-                    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(pEl, arguments[0]);
-                }
-            """, str(zip_code).strip())
-
-        # Fallback: requestSubmit
-        if not submitted:
-            try:
-                result = driver.execute_script("""
-                    var form = document.getElementById('postingForm');
-                    var btn  = arguments[0];
-                    if (form && typeof form.requestSubmit === 'function') {
-                        form.requestSubmit(btn);
-                        return 'requestSubmit';
-                    }
-                    btn.click();
-                    return 'direct-click';
-                """, submit_btn)
-                submitted = True
-                print(f"  [submit] Fallback: {result} ✓")
-            except Exception as e:
-                print(f"  [submit] Fallback also failed: {e}")
-    else:
+    if not submit_btn:
         print("  [submit] ✗ No submit button found!")
+        return None
+
+    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", submit_btn)
+    time.sleep(0.5)
+
+    # Final ZIP force-set right before click
+    if zip_code:
+        driver.execute_script("""
+            var pEl = document.querySelector('[name="postal"]') ||
+                      document.querySelector('[name="postal_code"]') ||
+                      document.querySelector('#postal_code');
+            if (pEl) {
+                Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(pEl, arguments[0]);
+                pEl.setAttribute('value', arguments[0]);
+                if (window.jQuery) jQuery(pEl).val(arguments[0]);
+            }
+        """, str(zip_code).strip())
+
+    # Primary: ActionChains click
+    try:
+        ActionChains(driver).move_to_element(submit_btn).pause(
+            random.uniform(0.3, 0.6)).click().perform()
+        submitted = True
+        print("  [submit] Clicked via ActionChains ✓")
+    except Exception as e:
+        print(f"  [submit] ActionChains failed ({e})")
+
+    # Immediately re-set ZIP after click
+    if submitted and zip_code:
+        time.sleep(0.15)
+        driver.execute_script("""
+            var pEl = document.querySelector('[name="postal"]') ||
+                      document.querySelector('[name="postal_code"]') ||
+                      document.querySelector('#postal_code');
+            if (pEl) {
+                Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(pEl, arguments[0]);
+            }
+        """, str(zip_code).strip())
+
+    # Fallback: requestSubmit
+    if not submitted:
+        try:
+            result = driver.execute_script("""
+                var form = document.getElementById('postingForm');
+                var btn  = arguments[0];
+                if (form && typeof form.requestSubmit === 'function') {
+                    form.requestSubmit(btn);
+                    return 'requestSubmit';
+                }
+                btn.click();
+                return 'direct-click';
+            """, submit_btn)
+            submitted = True
+            print(f"  [submit] Fallback: {result} ✓")
+        except Exception as e:
+            print(f"  [submit] Fallback also failed: {e}")
 
     if not submitted:
         return None
+
+    # Brief wait then dump captured payloads
+    time.sleep(3)
+    captured = driver.execute_script("return window._clCapturedPayloads || [];")
+    if captured:
+        print(f"  [payload] CAPTURED {len(captured)} POST request(s) after submit click:")
+        for i, p in enumerate(captured):
+            print(f"  [payload] [{i}] type={p.get('type')} url={p.get('url','')[:80]}")
+            body = p.get('body') or ''
+            print(f"  [payload] [{i}] body={body[:600]}")
+            # Highlight postal value in body
+            if 'postal' in body.lower():
+                import re as _re
+                matches = _re.findall(r'postal[^=&]*=[^&]{0,20}', body, _re.IGNORECASE)
+                print(f"  [payload] [{i}] POSTAL in body: {matches}")
+    else:
+        print("  [payload] No XHR/fetch POST captured — CL may use native form submit")
 
     # ── Wait to leave the edit page ───────────────────────────────────────────
     deadline = time.time() + 35
