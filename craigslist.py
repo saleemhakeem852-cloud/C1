@@ -1273,89 +1273,108 @@ def _fill_zip_with_network_intercept(driver, zip_field, zip_str):
 
     suggestion_clicked = False
 
-    # Try clicking by viewport coordinates (most reliable for jQuery UI autocomplete)
-    items_with_coords = driver.execute_script("""
-        var r = [];
-        document.querySelectorAll(
-            '.ui-autocomplete li.ui-menu-item, .ui-autocomplete li, [role="option"]'
-        ).forEach(function(li) {
-            var rect = li.getBoundingClientRect();
-            if (rect.height > 0 && rect.width > 0) {
-                r.push({
-                    text: li.textContent.trim().substring(0, 60),
-                    x: Math.round(rect.left + rect.width / 2),
-                    y: Math.round(rect.top + rect.height / 2)
-                });
+    # ── CONFIRMED ROOT CAUSE FROM LOGS ────────────────────────────────────────
+    # 1. Coord click → always fails with "move target out of bounds" because
+    #    window.scrollTo(0,0) moves the page AFTER capturing getBoundingClientRect
+    #    coords, making them stale.
+    # 2. JS mousedown/click events → CL's jQuery UI autocomplete ignores raw DOM
+    #    mouse events on the <li>. It only listens via its internal widget handler.
+    # 3. Selenium element click → fails same as coord click (viewport mismatch).
+    #
+    # THE FIX: ArrowDown + Enter on the focused postal field.
+    # This is the ONLY path that:
+    #   a) Works regardless of where dropdown renders (no viewport dependency)
+    #   b) Goes through Chrome's native key pipeline
+    #   c) Triggers jQuery UI's internal menu navigation (_move)
+    #   d) Fires the widget's internal select → autocompleteselect callback
+    #   e) Causes CL's handler to update form state + cryptedStepCheck
+    # ─────────────────────────────────────────────────────────────────────────
+
+    # Check if dropdown appeared
+    dropdown_visible = driver.execute_script("""
+        var menus = document.querySelectorAll('.ui-autocomplete, .ui-menu, [role="listbox"]');
+        for (var i = 0; i < menus.length; i++) {
+            var rect = menus[i].getBoundingClientRect();
+            var lis = menus[i].querySelectorAll('li');
+            if (lis.length > 0 && rect.height > 0) {
+                return {
+                    found: true,
+                    id: menus[i].id,
+                    items: lis.length,
+                    firstText: lis[0].textContent.trim().substring(0, 60)
+                };
             }
-        });
-        return r;
+        }
+        return {found: false};
     """)
+    print(f"  [ZIP] Dropdown visible: {dropdown_visible}")
 
-    if items_with_coords:
-        print(f"  [ZIP] Real dropdown items: {[i['text'] for i in items_with_coords[:3]]}")
-        item = items_with_coords[0]
+    # Capture cryptedStepCheck BEFORE selection attempt
+    token_before = driver.execute_script(
+        "var e=document.querySelector('[name=\"cryptedStepCheck\"]'); return e?e.value:null;")
+
+    if dropdown_visible.get('found'):
+        # ArrowDown + Enter — goes through native key pipeline into jQuery UI internal handler
+        print("  [ZIP] Dropdown found — selecting with ArrowDown + Enter...")
         try:
-            # Scroll to top so viewport coords match, then click
-            driver.execute_script("window.scrollTo(0, 0);")
-            time.sleep(0.2)
-            body = driver.find_element(By.TAG_NAME, "body")
-            ActionChains(driver)\
-                .move_to_element_with_offset(body, item["x"], item["y"])\
-                .pause(random.uniform(0.25, 0.45))\
-                .click()\
-                .perform()
-            suggestion_clicked = True
-            print("  [ZIP] Clicked real CL dropdown item by coords ✓")
+            # Ensure postal field has focus
+            zip_field = _find_field(driver, [
+                "[name='postal']", "[name='postal_code']",
+                "input#postal_code", "input#postal",
+            ]) or zip_field
+            ActionChains(driver).click(zip_field).perform()
+            time.sleep(0.3)
+
+            # ArrowDown navigates to first item in jQuery UI menu
+            ActionChains(driver).key_down(Keys.ARROW_DOWN, zip_field).perform()
+            time.sleep(0.5)
+            ActionChains(driver).key_up(Keys.ARROW_DOWN, zip_field).perform()
+            time.sleep(0.8)
+
+            # Enter selects the highlighted item — triggers autocompleteselect internally
+            ActionChains(driver).key_down(Keys.RETURN, zip_field).perform()
+            time.sleep(0.3)
+            ActionChains(driver).key_up(Keys.RETURN, zip_field).perform()
             time.sleep(2.0)
+
+            suggestion_clicked = True
+            print("  [ZIP] ArrowDown + Enter sent ✓")
+
+            # Check if cryptedStepCheck rotated — proves CL's handler fired
+            token_after = driver.execute_script(
+                "return (function(){var e=document.querySelector('[name=\'cryptedStepCheck\']');return e?e.value:null;})();")
+            if token_after and token_before and token_after != token_before:
+                print("  [ZIP] ✅ cryptedStepCheck ROTATED — CL confirmed the ZIP!")
+                print(f"  [ZIP] before: {str(token_before)[:50]}")
+                print(f"  [ZIP] after:  {str(token_after)[:50]}")
+            else:
+                print("  [ZIP] ⚠ cryptedStepCheck did NOT rotate after ArrowDown+Enter")
+                print(f"  [ZIP] token: {str(token_before)[:50]}")
+
         except Exception as e:
-            print(f"  [ZIP] Coord click failed: {e}")
-            # Fallback: JS mousedown/click events
-            try:
-                driver.execute_script("""
-                    var items = document.querySelectorAll(
-                        '.ui-autocomplete li.ui-menu-item, .ui-autocomplete li');
-                    if (items.length > 0) {
-                        ['mouseenter','mousedown','mouseup','click'].forEach(function(evName) {
-                            items[0].dispatchEvent(
-                                new MouseEvent(evName, {bubbles:true, cancelable:true}));
-                        });
-                    }
-                """)
-                suggestion_clicked = True
-                print("  [ZIP] JS mouse event fallback on dropdown ✓")
-                time.sleep(2.0)
-            except Exception as e2:
-                print(f"  [ZIP] JS fallback also failed: {e2}")
+            print(f"  [ZIP] ArrowDown+Enter failed: {e}")
+            suggestion_clicked = False
+    else:
+        print("  [ZIP] No dropdown appeared")
 
-    # Try standard Selenium element click as last resort
+    # If ArrowDown+Enter didn't work or no dropdown, try Tab blur
     if not suggestion_clicked:
-        for sel in [
-            ".ui-autocomplete li.ui-menu-item",
-            ".ui-autocomplete li",
-            "ul.ui-menu li.ui-menu-item",
-            "[role='listbox'] [role='option']",
-        ]:
-            try:
-                items = driver.find_elements(By.CSS_SELECTOR, sel)
-                visible = [s for s in items if s.is_displayed() and s.text.strip()]
-                if visible:
-                    print(f"  [ZIP] Selenium dropdown: {[v.text[:30] for v in visible[:3]]}")
-                    ActionChains(driver).move_to_element(visible[0]).pause(
-                        random.uniform(0.3, 0.5)).click().perform()
-                    suggestion_clicked = True
-                    print("  [ZIP] Clicked via Selenium element ✓")
-                    time.sleep(2.0)
-                    break
-            except Exception:
-                pass
-
-    if not suggestion_clicked:
-        print("  [ZIP] No real CL dropdown appeared — pressing Tab to confirm")
+        print("  [ZIP] Falling back to Tab blur")
         try:
-            zip_field.send_keys(Keys.TAB)
+            ActionChains(driver).key_down(Keys.TAB, zip_field).perform()
+            time.sleep(0.2)
+            ActionChains(driver).key_up(Keys.TAB, zip_field).perform()
         except Exception:
             driver.execute_script("arguments[0].blur();", zip_field)
         time.sleep(2.0)
+
+        # Check token rotation even after Tab
+        token_after_tab = driver.execute_script(
+            "return (function(){var el=document.querySelectorAll('input');for(var i=0;i<el.length;i++){if(el[i].name==='cryptedStepCheck')return el[i].value;}return null;})();")
+        if token_after_tab and token_before and token_after_tab != token_before:
+            print("  [ZIP] ✅ cryptedStepCheck rotated after Tab — ZIP accepted!")
+        else:
+            print("  [ZIP] ⚠ cryptedStepCheck unchanged after Tab")
 
     # ── Step 6: Wait for AJAX to complete ────────────────────────────────────
     print("  [ZIP] Waiting for AJAX after ZIP entry...")
