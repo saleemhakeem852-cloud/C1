@@ -667,66 +667,96 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
         ])
         if zip_field:
             _cdp_type(driver, zip_field, zip_code)
-            # Wait for autocomplete dropdown
+
+            # ── Wait for autocomplete dropdown and click first suggestion ────
+            suggestion_clicked = False
             try:
-                WebDriverWait(driver, 5).until(
+                WebDriverWait(driver, 6).until(
                     lambda d: d.find_elements(By.CSS_SELECTOR,
-                        ".ui-autocomplete li, .ui-menu-item, [class*='autocomplete'] li"))
-                # Move mouse to first suggestion and click it — most natural
+                        ".ui-autocomplete li.ui-menu-item, .ui-autocomplete li"))
                 suggestions = driver.find_elements(By.CSS_SELECTOR,
-                    ".ui-autocomplete li, .ui-menu-item, [class*='autocomplete'] li")
+                    ".ui-autocomplete li.ui-menu-item, .ui-autocomplete li")
                 if suggestions:
                     try:
                         ActionChains(driver).move_to_element(suggestions[0]).pause(
-                            random.uniform(0.2, 0.4)).click().perform()
-                        print("  [ZIP] Clicked first autocomplete suggestion ✓")
+                            random.uniform(0.3, 0.5)).click().perform()
+                        suggestion_clicked = True
+                        print("  [ZIP] Clicked autocomplete suggestion ✓")
                     except Exception:
                         zip_field.send_keys(Keys.RETURN)
-                        print("  [ZIP] Autocomplete appeared — confirmed with Enter")
-                else:
-                    zip_field.send_keys(Keys.RETURN)
+                        suggestion_clicked = True
+                        print("  [ZIP] Confirmed with Enter")
             except TimeoutException:
-                # No dropdown shown — press Tab to blur and trigger validation
                 zip_field.send_keys(Keys.TAB)
-                print("  [ZIP] No autocomplete — pressed Tab to blur")
-            time.sleep(2.0)
-            # Re-find field after possible DOM rebuild
+                print("  [ZIP] No autocomplete dropdown — pressed Tab")
+
+            # ── Wait for CL's AJAX location lookup to fully complete ─────────
+            # After ZIP selection CL fires an AJAX call that populates hidden
+            # location fields (geo_area_id etc). We wait until jQuery.active == 0
+            # meaning all pending AJAX requests have finished.
+            print("  [ZIP] Waiting for location AJAX to complete...")
+            try:
+                WebDriverWait(driver, 8).until(
+                    lambda d: d.execute_script("return jQuery.active == 0"))
+                print("  [ZIP] AJAX complete ✓")
+            except Exception:
+                print("  [ZIP] AJAX wait timed out — continuing")
+            time.sleep(1.0)
+
+            # ── Log all hidden fields so we can see what CL populated ────────
+            hidden = driver.execute_script("""
+                var r = {};
+                document.querySelectorAll('input[type="hidden"]').forEach(function(e) {
+                    r[e.name || e.id || '?'] = e.value;
+                });
+                return r;
+            """)
+            print(f"  [ZIP] Hidden fields after selection: {hidden}")
+
+            # ── Verify postal field still has value ──────────────────────────
             zip_field = _find_field(driver, [
                 "[name='postal']", "[name='postal_code']",
                 "input#postal_code", "input#postal",
             ])
             actual = (zip_field.get_attribute("value") if zip_field else "") or ""
+
             if not actual and zip_field:
-                print("  [ZIP] Autocomplete cleared value — re-typing once more")
+                print("  [ZIP] Value lost — re-typing after AJAX settled")
                 _cdp_type(driver, zip_field, zip_code)
-                zip_field.send_keys(Keys.TAB)
+                # Try autocomplete again
+                try:
+                    WebDriverWait(driver, 5).until(
+                        lambda d: d.find_elements(By.CSS_SELECTOR,
+                            ".ui-autocomplete li.ui-menu-item, .ui-autocomplete li"))
+                    suggestions = driver.find_elements(By.CSS_SELECTOR,
+                        ".ui-autocomplete li.ui-menu-item, .ui-autocomplete li")
+                    if suggestions:
+                        ActionChains(driver).move_to_element(suggestions[0]).pause(0.3).click().perform()
+                        print("  [ZIP] Re-selected suggestion ✓")
+                    else:
+                        zip_field.send_keys(Keys.RETURN)
+                except TimeoutException:
+                    zip_field.send_keys(Keys.TAB)
+                # Wait for AJAX again
+                try:
+                    WebDriverWait(driver, 6).until(
+                        lambda d: d.execute_script("return jQuery.active == 0"))
+                except Exception:
+                    pass
                 time.sleep(1.0)
                 actual = zip_field.get_attribute("value") or ""
-            # Last resort: if still empty, force value via JS + jQuery trigger
-            # The postal field accepts a direct value set when typed chars are lost
-            if not actual and zip_field:
-                print("  [ZIP] Still empty — forcing value via JS")
-                driver.execute_script("""
-                    var el = arguments[0];
-                    var val = arguments[1];
-                    // Use native input value setter to bypass React/Vue if present
-                    var nativeInputValueSetter = Object.getOwnPropertyDescriptor(
-                        window.HTMLInputElement.prototype, 'value').set;
-                    nativeInputValueSetter.call(el, val);
-                    el.dispatchEvent(new Event('input',  {bubbles: true}));
-                    el.dispatchEvent(new Event('change', {bubbles: true}));
-                    el.dispatchEvent(new Event('blur',   {bubbles: true}));
-                    if (window.jQuery) {
-                        jQuery(el).val(val).trigger('input').trigger('change').trigger('blur');
-                    }
-                """, zip_field, zip_code)
-                time.sleep(0.5)
-                actual = zip_field.get_attribute("value") or ""
+
             print(f"  ✓ [ZIP] = '{actual}'")
         else:
             print("  ⚠ [ZIP] field not found")
 
-    time.sleep(0.8)
+    # ── Wait for all AJAX to settle before submitting ────────────────────────
+    try:
+        WebDriverWait(driver, 8).until(
+            lambda d: d.execute_script("return jQuery.active == 0"))
+    except Exception:
+        pass
+    time.sleep(0.5)
 
     # ── SUBMIT: use Selenium ActionChains to click — NOT JS click ────────────
     # JS click bypasses browser form validation events.
