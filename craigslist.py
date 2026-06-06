@@ -1025,27 +1025,6 @@ try {
     results.push('formdata-patched');
 } catch(e) { results.push('formdata-err:' + e.message); }
 
-                jq.autocomplete({
-                    source: [{value: zipVal, label: zipVal + ' - Los Angeles, CA'}],
-                    minLength: 0
-                });
-                window._clZipWidgetCreated = true;
-            }
-
-            // Fire select event
-            var selectEvent = jQuery.Event('autocompleteselect');
-            selectEvent.item = {value: zipVal, label: zipVal + ' - Los Angeles, CA'};
-            jq.trigger(selectEvent);
-            jq.trigger(jQuery.Event('autocompletechange'), {item: {value: zipVal}});
-            window._clZipAutoconfirmed = true;
-            window._clZipFired = 'autocomplete-events-fired';
-        } catch(e2) {
-            window._clZipWidgetErr = e2.message;
-        }
-    }, 2500);
-    results.push('autocomplete-timer-set');
-} catch(e) { results.push('autocomplete-timer-err:' + e.message); }
-
 window._clZipPatchInstalled = true;
 window._clZipPatchResults = results;
 return results.join(',');
