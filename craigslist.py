@@ -1,26 +1,24 @@
 """
 craigslist.py — CLBlast Craigslist automation
-FIX v2: CDP Network event listener captures real autocomplete XHR response
-         and re-injects any hidden fields (geo_id, location_id, updated
-         cryptedStepCheck) that CL's server sends back — the root cause of
-         the "ZIP code • autofilled" rejection.
+FIX v3: Real CDP performance-log network capture + real ActionChains key events
 
-ROOT CAUSE SUMMARY:
-  - postal=90001 WAS being sent correctly (confirmed by payload logs)
-  - _ZIP_PATCH_JS was returning None (silent JS crash) — patches not installing
-  - cryptedStepCheck value rotated between fill and submit, proving CL's server
-    issues a new token only after a real autocomplete network call is made
-  - Our fake widget fired UI events but never hit CL's geo endpoint, so the
-    server never saw a confirmed location and rejected the submission
+ROOT CAUSE (confirmed from logs):
+  - _allNetworkCalls: [] because JS XHR/fetch spy wraps window.XMLHttpRequest
+    AFTER CL's autocomplete module already captured the original reference.
+    The spy is invisible to CL's autocomplete.
+  - cryptedStepCheck rotates server-side only when CL's real autocomplete
+    endpoint is hit. Our fake widget fired UI events but never hit the server.
+  - widgetCreated: True proved we clicked our OWN fake widget, not CL's real one.
 
-THE FIX:
-  1. Enable CDP Network events BEFORE navigating to the posting form
-  2. Listen for any XHR/fetch to CL's geo/suggest/postal endpoint during a
-     real manual-style interaction (or during our automated run)
-  3. Capture the full response body from that network call
-  4. Parse it and inject any hidden fields (geo_id, location_id, new
-     cryptedStepCheck, etc.) directly into the DOM before submit
-  5. Fixed all JS syntax issues in patch scripts that caused None returns
+THE FIX (2 changes):
+  1. Add goog:loggingPrefs {"performance":"ALL"} to ChromeOptions so that
+     driver.get_log("performance") returns CDP Network events — this captures
+     ALL network activity at the browser level, regardless of JS spy timing.
+  2. Use ActionChains.key_down/key_up for ZIP typing instead of send_keys or
+     CDP Input.dispatchKeyEvent — fires real OS-level key events through
+     Chrome's input pipeline that CL's keypress/keydown handlers intercept.
+  3. Poll CDP perf log for Network.responseReceived matching CL's geo endpoint,
+     then call Network.getResponseBody to get the signed token back.
 """
 
 import re
@@ -226,22 +224,10 @@ _FINGERPRINT_JS = """
 }})();
 """
 
-
 # ─────────────────────────────────────────────────────────────────────────────
-#  CDP Network Interceptor
-#
-#  This is the core fix. We attach a Network.responseReceived listener via
-#  CDP BEFORE the page loads. When CL's JS makes the postal/geo lookup XHR
-#  (which our previous approach proved it does NOT do via JS-visible XHR —
-#  it may be a fetch with credentials, or a navigation-level request), we
-#  capture the full response body using Network.getResponseBody.
-#
-#  If the response contains new hidden fields (geo_id, location_id, a
-#  rotated cryptedStepCheck), we store them in window._clGeoResponse so
-#  that _inject_geo_hidden_fields() can write them into the DOM before submit.
+#  CDP Network Interceptor (JS-side spy — belt-and-suspenders fallback)
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Patterns that identify CL's location/postal validation endpoint
 _GEO_URL_PATTERNS = [
     "suggest", "postal", "geo", "location", "zip", "area",
     "geoCode", "geocode", "postcode",
@@ -249,12 +235,11 @@ _GEO_URL_PATTERNS = [
 
 def _start_cdp_network_capture(driver):
     """
-    Enable CDP Network domain and register a Python-side listener that
-    captures any response whose URL looks like a geo/postal lookup.
-    Stores captured responses in driver._cl_geo_responses (list of dicts).
+    Enable CDP Network domain and register JS-side XHR/fetch spy.
+    Primary capture is via CDP perf log (Python-side). This is the fallback.
     """
     driver._cl_geo_responses = []
-    driver._cl_network_request_map = {}  # requestId -> url
+    driver._cl_network_request_map = {}
 
     try:
         driver.execute_cdp_cmd("Network.enable", {})
@@ -263,9 +248,6 @@ def _start_cdp_network_capture(driver):
         print(f"  [CDP] Could not enable Network domain: {e}")
         return
 
-    # We poll for new network events using a JS-side XHR spy instead of
-    # Python CDP callbacks (Selenium's CDP event API is unreliable across
-    # driver versions). The JS spy writes intercepted responses to a global.
     _NETWORK_SPY_JS = """
 (function() {
     if (window._clNetworkSpyInstalled) return 'already-installed';
@@ -273,7 +255,6 @@ def _start_cdp_network_capture(driver):
     window._clCapturedGeoResponses = [];
     window._clAllNetworkCalls = [];
 
-    // Patterns to watch for
     var GEO_PATTERNS = ['suggest','postal','geo','location','zip','area','geocode','postcode'];
     function looksLikeGeo(url) {
         if (!url) return false;
@@ -284,33 +265,21 @@ def _start_cdp_network_capture(driver):
         return false;
     }
 
-    // Wrap XHR
     var OrigXHR = window.XMLHttpRequest;
     function SpyXHR() {
         var xhr = new OrigXHR();
         var _url = '', _method = '';
         var origOpen = xhr.open.bind(xhr);
         var origSend = xhr.send.bind(xhr);
-
-        xhr.open = function(method, url) {
-            _method = method; _url = url || '';
-            return origOpen(method, url);
-        };
+        xhr.open = function(method, url) { _method = method; _url = url || ''; return origOpen(method, url); };
         xhr.send = function(body) {
             var captureUrl = _url;
             var origRSC = xhr.onreadystatechange;
             xhr.onreadystatechange = function() {
                 if (xhr.readyState === 4) {
-                    var entry = {
-                        type: 'xhr', url: captureUrl,
-                        status: xhr.status,
-                        responseText: xhr.responseText || ''
-                    };
+                    var entry = { type: 'xhr', url: captureUrl, status: xhr.status, responseText: xhr.responseText || '' };
                     window._clAllNetworkCalls.push(entry);
-                    if (looksLikeGeo(captureUrl)) {
-                        window._clCapturedGeoResponses.push(entry);
-                        window._clLastGeoResponse = entry;
-                    }
+                    if (looksLikeGeo(captureUrl)) { window._clCapturedGeoResponses.push(entry); window._clLastGeoResponse = entry; }
                 }
                 if (origRSC) origRSC.apply(this, arguments);
             };
@@ -318,28 +287,19 @@ def _start_cdp_network_capture(driver):
         };
         return xhr;
     }
-    // Copy static props
     for (var k in OrigXHR) { try { SpyXHR[k] = OrigXHR[k]; } catch(e) {} }
     SpyXHR.prototype = OrigXHR.prototype;
     window.XMLHttpRequest = SpyXHR;
 
-    // Wrap fetch
     var origFetch = window.fetch;
     window.fetch = function(input, init) {
         var url = (typeof input === 'string') ? input : (input && input.url) || '';
         var p = origFetch.apply(this, arguments);
         p.then(function(resp) {
             resp.clone().text().then(function(text) {
-                var entry = {
-                    type: 'fetch', url: url,
-                    status: resp.status,
-                    responseText: text || ''
-                };
+                var entry = { type: 'fetch', url: url, status: resp.status, responseText: text || '' };
                 window._clAllNetworkCalls.push(entry);
-                if (looksLikeGeo(url)) {
-                    window._clCapturedGeoResponses.push(entry);
-                    window._clLastGeoResponse = entry;
-                }
+                if (looksLikeGeo(url)) { window._clCapturedGeoResponses.push(entry); window._clLastGeoResponse = entry; }
             }).catch(function(){});
         }).catch(function(){});
         return p;
@@ -357,7 +317,7 @@ def _start_cdp_network_capture(driver):
 
 
 def _install_network_spy_now(driver):
-    """Install the network spy into the already-loaded page (not just new docs)."""
+    """Install the network spy into the already-loaded page."""
     _NETWORK_SPY_JS = """
 (function() {
     if (window._clNetworkSpyInstalled) return 'already-installed';
@@ -437,16 +397,7 @@ def _get_geo_responses(driver):
 def _inject_geo_hidden_fields(driver, geo_response_text, zip_str):
     """
     Parse the geo/postal lookup response and inject any returned fields
-    (geo_id, location_id, updated cryptedStepCheck, etc.) as hidden inputs
-    into the posting form.
-
-    CL's response format is typically one of:
-      - JSON array: [{"id":"...", "value":"90001", "label":"...", "geo_id":"..."}]
-      - JSON object: {"geo_id":"...", "cryptedStepCheck":"...", ...}
-      - Plain text ZIP confirmation
-
-    We inject ALL top-level string/number fields from the response as hidden
-    inputs, then specifically look for known field names.
+    into the posting form as hidden inputs.
     """
     if not geo_response_text:
         return False
@@ -454,7 +405,6 @@ def _inject_geo_hidden_fields(driver, geo_response_text, zip_str):
     injected = {}
     try:
         data = json.loads(geo_response_text)
-        # Normalize to a flat dict
         if isinstance(data, list) and data:
             data = data[0]
         if isinstance(data, dict):
@@ -462,7 +412,6 @@ def _inject_geo_hidden_fields(driver, geo_response_text, zip_str):
                 if isinstance(val, (str, int, float)) and val:
                     injected[key] = str(val)
     except Exception:
-        # Not JSON — maybe plain text, ignore
         pass
 
     if not injected:
@@ -471,7 +420,6 @@ def _inject_geo_hidden_fields(driver, geo_response_text, zip_str):
 
     print(f"  [GEO] Injecting fields from geo response: {list(injected.keys())}")
 
-    # Inject each field as a hidden input (or update existing)
     inject_js = """
 (function(fields) {
     var form = document.getElementById('postingForm');
@@ -479,7 +427,6 @@ def _inject_geo_hidden_fields(driver, geo_response_text, zip_str):
     var injected = [];
     for (var name in fields) {
         var val = fields[name];
-        // Check if field already exists
         var existing = form.querySelector('[name="' + name + '"]');
         if (existing) {
             var old = existing.value;
@@ -504,24 +451,13 @@ def _inject_geo_hidden_fields(driver, geo_response_text, zip_str):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  DIRECT GEO FETCH — if the autocomplete never fires a real network call,
-#  we make the call ourselves using requests (from Python, bypassing JS) and
-#  inject the result. This is the guaranteed fallback.
+#  DIRECT GEO FETCH — Python-side fallback
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _fetch_cl_geo_direct(driver, zip_str, city="Los Angeles", state="CA"):
     """
-    Make the postal lookup request directly from Python using the same
-    session cookies as the browser. CL's geo endpoint accepts GET requests.
-
-    Known CL geo/suggest endpoint patterns (may vary by city):
-      https://losangeles.craigslist.org/suggest?fieldname=postal&typing=90001
-      https://post.craigslist.org/suggest?fieldname=postal&typing=90001
-      https://post.craigslist.org/c/sss?s=geo&q=90001
-
-    We try each and return the first successful response.
+    Make the postal lookup request directly from Python using browser cookies.
     """
-    # Extract cookies from browser
     cookies = {}
     try:
         for cookie in driver.get_cookies():
@@ -567,10 +503,6 @@ def _trigger_real_geo_lookup(driver, zip_str):
     """
     Force CL's own JS to make the postal lookup XHR/fetch by calling their
     internal autocomplete source function directly.
-
-    CL's autocomplete source is defined in postingform-concat.min.js.
-    We find it by walking jQuery UI autocomplete instances on the form.
-    If found, we call it with the ZIP and wait for the callback.
     """
     trigger_js = """
 (function(zipVal, callback) {
@@ -584,8 +516,6 @@ def _trigger_real_geo_lookup(driver, zip_str):
     }
 
     var jq = jQuery(postalEl);
-
-    // Try to get the autocomplete instance's source function
     var acData = jq.data('ui-autocomplete') || jq.data('autocomplete');
     if (!acData || !acData.options || !acData.options.source) {
         return {ok: false, reason: 'no-autocomplete-instance', data: Object.keys(jq.data() || {})};
@@ -593,11 +523,9 @@ def _trigger_real_geo_lookup(driver, zip_str):
 
     var sourceFn = acData.options.source;
     if (typeof sourceFn !== 'function') {
-        // It's a URL string or array — that's the source directly
         return {ok: false, reason: 'source-not-function', sourceType: typeof sourceFn, source: String(sourceFn).substring(0,100)};
     }
 
-    // Call the source function as CL does internally
     window._clGeoLookupTriggered = false;
     window._clGeoLookupResponse = null;
 
@@ -616,7 +544,6 @@ def _trigger_real_geo_lookup(driver, zip_str):
     print(f"  [GEO-trigger] Direct source call result: {result}")
 
     if result and result.get("ok"):
-        # Wait for async callback
         try:
             WebDriverWait(driver, 8).until(
                 lambda d: d.execute_script("return !!window._clGeoLookupTriggered;"))
@@ -627,6 +554,70 @@ def _trigger_real_geo_lookup(driver, zip_str):
             print("  [GEO-trigger] Source callback timed out")
 
     return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  CDP PERFORMANCE LOG — Python-side geo response capture (THE REAL FIX)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _drain_perf_log(driver):
+    """
+    Drain Chrome performance log entries and return parsed CDP events.
+    Returns list of (method, params) tuples.
+    Requires goog:loggingPrefs {"performance":"ALL"} in ChromeOptions.
+    """
+    try:
+        entries = driver.get_log("performance")
+    except Exception:
+        return []
+    events = []
+    for entry in entries:
+        try:
+            msg = json.loads(entry["message"])
+            event = msg.get("message", {})
+            events.append((event.get("method", ""), event.get("params", {})))
+        except Exception:
+            pass
+    return events
+
+
+def _poll_perf_log_for_geo(driver, timeout=8):
+    """
+    Poll Chrome perf log for Network.responseReceived events matching
+    CL's geo/suggest endpoint. Fetches body via CDP Network.getResponseBody.
+    Returns (response_body_str, request_url) or (None, None).
+    """
+    GEO_PATTERNS = ["suggest", "postal", "geo", "location", "zip", "area", "geocode", "postcode"]
+    deadline = time.time() + timeout
+    request_id_map = {}
+
+    while time.time() < deadline:
+        events = _drain_perf_log(driver)
+        for method, params in events:
+            if method == "Network.requestWillBeSent":
+                rid = params.get("requestId", "")
+                url = params.get("request", {}).get("url", "")
+                if rid:
+                    request_id_map[rid] = url
+
+            elif method == "Network.responseReceived":
+                rid = params.get("requestId", "")
+                url = (params.get("response", {}).get("url", "")
+                       or request_id_map.get(rid, ""))
+                if any(p in url.lower() for p in GEO_PATTERNS):
+                    print(f"  [CDP-perf] Geo response detected: {url}")
+                    try:
+                        body_resp = driver.execute_cdp_cmd(
+                            "Network.getResponseBody", {"requestId": rid})
+                        body = body_resp.get("body", "")
+                        print(f"  [CDP-perf] Body: {body[:300]}")
+                        return body, url
+                    except Exception as e:
+                        print(f"  [CDP-perf] getResponseBody failed: {e}")
+
+        time.sleep(0.35)
+
+    return None, None
 
 
 def make_driver(proxy_url=None):
@@ -693,6 +684,12 @@ def make_driver(proxy_url=None):
         "intl.accept_languages": fp["lang"],
     })
 
+    # ── FIX: Enable CDP performance log for Python-side network capture ───────
+    # This is required for driver.get_log("performance") to return CDP Network
+    # events. Without this, _poll_perf_log_for_geo() returns nothing.
+    options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
+    # ─────────────────────────────────────────────────────────────────────────
+
     chromium_bin = _find_binary(
         ["google-chrome", "chromium", "chromium-browser"],
         ["/usr/local/bin/google-chrome", "/usr/bin/chromium", "/usr/bin/chromium-browser"])
@@ -745,7 +742,7 @@ def make_driver(proxy_url=None):
     except Exception:
         pass
 
-    # Register network spy for all new documents
+    # Register network spy for all new documents (fallback)
     _start_cdp_network_capture(driver)
 
     # Native form submit interceptor
@@ -909,7 +906,6 @@ def _cdp_type(driver, element, value):
         driver.execute_script("arguments[0].focus();", element)
     time.sleep(random.uniform(0.15, 0.3))
 
-    # Select all + delete
     for key_action in [
         {"type": "keyDown", "key": "Control", "code": "ControlLeft",  "keyCode": 17, "modifiers": 0},
         {"type": "keyDown", "key": "a",       "code": "KeyA",         "keyCode": 65, "modifiers": 2},
@@ -946,19 +942,7 @@ def _cdp_type(driver, element, value):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  FIXED ZIP PATCH JS
-#
-#  Previous version returned None because:
-#  1. The IIFE was wrapped as `(function(zipVal) { ... })(arguments[0])` but
-#     execute_script wraps the code in another function, so `arguments[0]` at
-#     the outer IIFE call referred to the execute_script arguments, not the
-#     passed zipVal. Fixed by using the standard execute_script argument passing.
-#  2. Several inner try/catch blocks were swallowing errors silently.
-#  3. The return value was inside the IIFE but execute_script needs the OUTER
-#     function to return it.
-#
-#  This version is structured as a plain script (not IIFE) that uses
-#  `arguments[0]` directly as execute_script passes it.
+#  ZIP PATCH JS — serializer + FormData patches
 # ─────────────────────────────────────────────────────────────────────────────
 
 _ZIP_PATCH_JS = """
@@ -966,7 +950,6 @@ var zipVal = arguments[0];
 var results = [];
 
 try {
-    // ── Step 1: Patch jQuery serializeArray ──────────────────────────────────
     if (window.jQuery) {
         var origSerializeArray = jQuery.fn.serializeArray;
         jQuery.fn.serializeArray = function() {
@@ -998,7 +981,6 @@ try {
 } catch(e) { results.push('serializer-err:' + e.message); }
 
 try {
-    // ── Step 2: Patch FormData ───────────────────────────────────────────────
     var OrigFormData = window.FormData;
     function PatchedFormData(form) {
         var fd = form ? new OrigFormData(form) : new OrigFormData();
@@ -1025,6 +1007,35 @@ try {
     results.push('formdata-patched');
 } catch(e) { results.push('formdata-err:' + e.message); }
 
+try {
+    setTimeout(function() {
+        try {
+            var postalEl = document.querySelector('[name="postal"]') ||
+                           document.querySelector('[name="postal_code"]') ||
+                           document.querySelector('#postal_code') ||
+                           document.querySelector('#postal');
+            if (!postalEl || !window.jQuery) return;
+            var jq = jQuery(postalEl);
+            if (!jq.data('ui-autocomplete') && !jq.data('autocomplete')) {
+                jq.autocomplete({
+                    source: [{value: zipVal, label: zipVal + ' - Los Angeles, CA'}],
+                    minLength: 0
+                });
+                window._clZipWidgetCreated = true;
+            }
+            var selectEvent = jQuery.Event('autocompleteselect');
+            selectEvent.item = {value: zipVal, label: zipVal + ' - Los Angeles, CA'};
+            jq.trigger(selectEvent);
+            jq.trigger(jQuery.Event('autocompletechange'), {item: {value: zipVal}});
+            window._clZipAutoconfirmed = true;
+            window._clZipFired = 'autocomplete-events-fired';
+        } catch(e2) {
+            window._clZipWidgetErr = e2.message;
+        }
+    }, 2500);
+    results.push('autocomplete-timer-set');
+} catch(e) { results.push('autocomplete-timer-err:' + e.message); }
+
 window._clZipPatchInstalled = true;
 window._clZipPatchResults = results;
 return results.join(',');
@@ -1044,7 +1055,6 @@ try {
         return ['no-postal-el'];
     }
 
-    // 1. Force the DOM value using native setter
     var nativeSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
     nativeSetter.call(postalEl, zipVal);
     postalEl.setAttribute('value', zipVal);
@@ -1053,10 +1063,8 @@ try {
     if (window.jQuery) {
         var jq = jQuery(postalEl);
 
-        // 2. Remove ALL jQuery validation rules on this field
         try { jq.rules('remove'); results.push('rules-removed'); } catch(e) {}
 
-        // 3. Remove from validator internal registry
         var form = document.getElementById('postingForm');
         if (form) {
             var validator = jQuery(form).data('validator');
@@ -1073,7 +1081,6 @@ try {
                 results.push('added-to-success-list');
                 try { validator.resetElements([postalEl]); results.push('element-reset'); } catch(e) {}
 
-                // 4. Walk custom validation methods and disable for postal
                 if (jQuery.validator && jQuery.validator.methods) {
                     var nuked = 0;
                     var builtins = ['required','email','url','number','digits','min','max',
@@ -1094,7 +1101,6 @@ try {
             }
         }
 
-        // 5. Clear error UI
         jq.removeClass('error invalid required')
           .removeAttr('aria-invalid')
           .removeAttr('aria-required')
@@ -1106,7 +1112,6 @@ try {
         }).remove();
         results.push('error-ui-cleared');
 
-        // 6. Fire events so CL's validator marks it valid
         jq.val(zipVal)
           .trigger(jQuery.Event('focus',  {bubbles: true}))
           .trigger(jQuery.Event('input',  {bubbles: true}))
@@ -1114,7 +1119,6 @@ try {
           .trigger(jQuery.Event('blur',   {bubbles: true}));
         results.push('events-fired');
 
-        // 7. Mark in success lists of all ancestor validators
         jQuery('[name="postal_code"],[name="postal"]').each(function() {
             var el = this;
             jQuery('form').each(function() {
@@ -1137,334 +1141,364 @@ return results;
 """
 
 
-def _call_cl_internal_location_setter(driver, zip_str, city_str="Los Angeles"):
-    """
-    CL's postingform-concat.min.js embeds the autocomplete dataset locally
-    (no network call — confirmed by _allNetworkCalls: [] in logs).
-
-    When a user selects from the autocomplete, CL's select handler calls an
-    internal function that sets location state in a JS object. We find and
-    call that function directly.
-
-    Strategies tried in order:
-    1. Find the autocomplete widget's select handler and call it with fake item data
-    2. Find cl.postingProcess.setLocation or similar internal setter
-    3. Walk all jQuery event handlers on the postal field and fire the select handler
-    4. Simulate the exact event sequence CL's autocomplete fires on real selection
-    """
-    result = driver.execute_script("""
-        var zipVal = arguments[0];
-        var cityVal = arguments[1];
-        var log = [];
-
-        var postalEl = document.querySelector('[name="postal"]') ||
-                       document.querySelector('[name="postal_code"]') ||
-                       document.querySelector('#postal_code') ||
-                       document.querySelector('#postal');
-
-        if (!postalEl || !window.jQuery) {
-            return {ok: false, reason: 'no-postal-or-jquery', log: log};
-        }
-
-        var jq = jQuery(postalEl);
-        var fakeItem = {
-            value: zipVal,
-            label: zipVal + ' - ' + cityVal + ', CA',
-            id: zipVal,
-            geo_id: zipVal,
-            postal: zipVal,
-            area: cityVal
-        };
-
-        // ── Strategy 1: Fire the autocomplete uiAutocomplete select handler ──
-        // CL attaches handler via jQuery('input.postal').on('autocompleteselect', ...)
-        // We fire this exact event with a fake item object.
-        try {
-            var selectEvt = jQuery.Event('autocompleteselect');
-            selectEvt.item = fakeItem;
-            jq.trigger(selectEvt, [{item: fakeItem}]);
-            log.push('fired-autocompleteselect');
-        } catch(e) { log.push('autocompleteselect-err:' + e.message); }
-
-        // ── Strategy 2: Find all jQuery handlers on the postal field ─────────
-        try {
-            var events = jQuery._data(postalEl, 'events') || {};
-            var evNames = Object.keys(events);
-            log.push('postal-events:' + evNames.join(','));
-            // Fire each handler that looks like a select/change handler
-            ['autocompleteselect', 'autocompletechange', 'autocompletefocus',
-             'select', 'change', 'chosen:updated'].forEach(function(evName) {
-                if (events[evName]) {
-                    events[evName].forEach(function(h) {
-                        try {
-                            var fakeEvent = jQuery.Event(evName);
-                            fakeEvent.item = fakeItem;
-                            h.handler.call(postalEl, fakeEvent, {item: fakeItem});
-                            log.push('called-handler:' + evName);
-                        } catch(e2) { log.push('handler-err:' + evName + ':' + e2.message); }
-                    });
-                }
-            });
-        } catch(e) { log.push('events-walk-err:' + e.message); }
-
-        // ── Strategy 3: Call CL's internal postingProcess location functions ─
-        try {
-            var clObj = window.cl || window.CL || {};
-            var pp = clObj.postingProcess || clObj.posting || clObj.form || {};
-            var fnNames = Object.keys(pp).filter(function(k) {
-                return typeof pp[k] === 'function' && (
-                    k.toLowerCase().indexOf('loc') !== -1 ||
-                    k.toLowerCase().indexOf('geo') !== -1 ||
-                    k.toLowerCase().indexOf('zip') !== -1 ||
-                    k.toLowerCase().indexOf('postal') !== -1 ||
-                    k.toLowerCase().indexOf('area') !== -1
-                );
-            });
-            log.push('cl-location-fns:' + fnNames.join(','));
-            fnNames.forEach(function(fn) {
-                try {
-                    pp[fn].call(pp, zipVal, fakeItem);
-                    log.push('called:' + fn);
-                } catch(e3) { log.push('fn-err:' + fn + ':' + e3.message); }
-            });
-        } catch(e) { log.push('cl-pp-err:' + e.message); }
-
-        // ── Strategy 4: Walk ALL global objects for location setter ──────────
-        try {
-            var globalFns = [];
-            ['cl','CL','clp','clPosting','posting','postingForm'].forEach(function(objName) {
-                var obj = window[objName];
-                if (!obj) return;
-                var walk = function(o, prefix, depth) {
-                    if (depth > 3) return;
-                    Object.keys(o || {}).forEach(function(k) {
-                        try {
-                            if (typeof o[k] === 'function') {
-                                var kl = k.toLowerCase();
-                                if (kl.indexOf('loc') !== -1 || kl.indexOf('geo') !== -1 ||
-                                    kl.indexOf('zip') !== -1 || kl.indexOf('postal') !== -1 ||
-                                    kl.indexOf('area') !== -1 || kl.indexOf('set') !== -1) {
-                                    globalFns.push(prefix + '.' + k);
-                                }
-                            } else if (typeof o[k] === 'object' && o[k] !== null) {
-                                walk(o[k], prefix + '.' + k, depth + 1);
-                            }
-                        } catch(e) {}
-                    });
-                };
-                walk(obj, objName, 0);
-            });
-            log.push('global-loc-fns:' + globalFns.join(','));
-        } catch(e) { log.push('global-walk-err:' + e.message); }
-
-        // ── Strategy 5: Simulate exact event sequence of real autocomplete ───
-        // Real sequence: mouseenter → mousemove → mousedown → mouseup → click
-        // on the suggestion LI, which jQuery UI translates to 'autocompleteselect'
-        // We already fired autocompleteselect above. Also fire the full sequence:
-        try {
-            jq.triggerHandler('focus');
-            setTimeout(function() {
-                jq.val(zipVal);
-                jq.triggerHandler(jQuery.Event('keydown',  {keyCode: 49})); // '1'
-                jq.triggerHandler(jQuery.Event('input',    {bubbles: true}));
-                jq.triggerHandler(jQuery.Event('keyup',    {keyCode: 49}));
-                // Simulate dropdown item click
-                var selectEv = jQuery.Event('autocompleteselect');
-                selectEv.item = fakeItem;
-                jq.trigger(selectEv, [{item: fakeItem}]);
-                jq.triggerHandler(jQuery.Event('change',   {bubbles: true}));
-                jq.triggerHandler(jQuery.Event('blur',     {bubbles: true}));
-            }, 300);
-            log.push('delayed-sequence-set');
-        } catch(e) { log.push('sequence-err:' + e.message); }
-
-        return {ok: true, log: log};
-    """, zip_str, city_str)
-
-    print(f"  [ZIP-internal] Location setter result: {result}")
-    return result
-
+# ─────────────────────────────────────────────────────────────────────────────
+#  FILL ZIP — V3: Real ActionChains key events + CDP perf log capture
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _fill_zip_with_network_intercept(driver, zip_field, zip_str):
     """
-    The definitive ZIP fill strategy — v3:
+    V3 ZIP fill strategy — real CDP perf-log capture + real ActionChains key events.
 
-    Root cause confirmed: CL makes ZERO network calls (_allNetworkCalls: []).
-    The autocomplete dataset is local. The server rejects because CL's internal
-    JS location state object is never updated — only the DOM input value is set.
+    Why previous versions failed:
+    - JS XHR/fetch spy: installed after CL's autocomplete already captured
+      original XMLHttpRequest reference — invisible to CL's AJAX calls.
+    - CDP Input.dispatchKeyEvent: bypasses Chrome's native input pipeline
+      that CL's keypress/keydown handlers hook into.
+    - Fake autocomplete widget: fires UI events but never hits CL's server,
+      so cryptedStepCheck is never re-signed with a confirmed ZIP.
 
     This version:
-    1. Types ZIP with real native send_keys to trigger CL's autocomplete naturally
-    2. Clicks the dropdown if it appears
-    3. Calls _call_cl_internal_location_setter to fire CL's select handlers directly
-    4. Keeps serializer + FormData patches as safety net
-    5. Validator nuke to clear error state
+    1. Drains stale perf log entries before typing.
+    2. Uses ActionChains.key_down/key_up which sends real synthesized OS
+       key events through Chrome's full input pipeline.
+    3. Pauses after 3 digits to let CL's autocomplete threshold trigger.
+    4. Polls CDP perf log (Python-side) for Network.responseReceived events
+       matching CL's geo endpoint — captures at browser network layer,
+       not JS layer, so spy timing doesn't matter.
+    5. Calls Network.getResponseBody to get the actual signed response.
+    6. Injects any new tokens from the response into the DOM.
+    7. Falls back to direct Python requests if CDP capture fails.
+    8. Runs validator nuke before submit.
     """
-    _install_network_spy_now(driver)
-    time.sleep(0.3)
 
+    # ── Step 0: Clear stale perf log entries ─────────────────────────────────
+    try:
+        driver.get_log("performance")
+        print("  [ZIP] Perf log drained (stale entries cleared)")
+    except Exception as e:
+        print(f"  [ZIP] Perf log drain failed (performance logging may not be enabled): {e}")
+    time.sleep(0.2)
+
+    # ── Step 1: Install JS spy (belt-and-suspenders fallback) ─────────────────
+    _install_network_spy_now(driver)
+    time.sleep(0.2)
+
+    # ── Step 2: Install serializer + FormData patches ─────────────────────────
     patch_result = driver.execute_script(_ZIP_PATCH_JS, zip_str)
     print(f"  [ZIP] Patch install: {patch_result}")
     time.sleep(0.3)
 
-    # Read CL's real autocomplete config before touching anything
-    ac_config = driver.execute_script("""
-        var el = document.querySelector('[name="postal"]') ||
-                 document.querySelector('[name="postal_code"]') ||
-                 document.querySelector('#postal_code') ||
-                 document.querySelector('#postal');
-        if (!el || !window.jQuery) return {err: 'no-el-or-jquery'};
-        var acData = jQuery(el).data('ui-autocomplete') || jQuery(el).data('autocomplete');
-        var events = jQuery._data(el, 'events') || {};
-        return {
-            hasAC: !!acData,
-            minLength: acData ? acData.options.minLength : null,
-            delay: acData ? acData.options.delay : null,
-            source: acData ? String(acData.options.source).substring(0, 300) : null,
-            events: Object.keys(events)
-        };
-    """)
-    print(f"  [ZIP] CL autocomplete config: {ac_config}")
-
-    min_len = 3
-    ac_delay = 0.35
-    if ac_config and ac_config.get('hasAC'):
-        try: min_len = int(ac_config.get('minLength') or 3)
-        except: pass
-        try: ac_delay = float(ac_config.get('delay') or 350) / 1000.0
-        except: pass
-    print(f"  [ZIP] Using minLength={min_len}, delay={ac_delay:.2f}s")
-
-    # Focus via Tab from description field
-    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", zip_field)
+    # ── Step 3: Scroll to field and focus with real mouse click ───────────────
+    driver.execute_script(
+        "arguments[0].scrollIntoView({block:'center', inline:'nearest'});", zip_field)
     time.sleep(0.4)
+
+    # Triple-click selects existing content, then delete clears it
     try:
-        prev = driver.find_element(By.CSS_SELECTOR, "[name='PostingBody'], textarea#PostingBody")
-        ActionChains(driver).move_to_element(prev).click().perform()
-        time.sleep(0.3)
-        prev.send_keys(Keys.TAB)
-        time.sleep(0.6)
-        focused_name = driver.execute_script("return document.activeElement ? document.activeElement.name : null")
-        if focused_name not in ('postal', 'postal_code'):
-            ActionChains(driver).move_to_element(zip_field).click().perform()
-            time.sleep(0.4)
+        ActionChains(driver)\
+            .move_to_element(zip_field)\
+            .pause(random.uniform(0.2, 0.4))\
+            .triple_click(zip_field)\
+            .pause(0.15)\
+            .send_keys_to_element(zip_field, Keys.DELETE)\
+            .pause(0.2)\
+            .perform()
     except Exception:
         ActionChains(driver).move_to_element(zip_field).click().perform()
-        time.sleep(0.4)
+        time.sleep(0.2)
+        zip_field.send_keys(Keys.CONTROL + "a")
+        time.sleep(0.1)
+        zip_field.send_keys(Keys.DELETE)
+    time.sleep(0.3)
 
-    zip_field = _find_field(driver, [
-        "[name='postal']", "[name='postal_code']", "input#postal_code", "input#postal",
-    ]) or zip_field
+    # Verify focus
+    if not driver.execute_script("return document.activeElement===arguments[0];", zip_field):
+        ActionChains(driver).click(zip_field).perform()
+        time.sleep(0.3)
 
-    # Clear field
-    zip_field.send_keys(Keys.CONTROL + "a")
-    time.sleep(0.1)
-    zip_field.send_keys(Keys.DELETE)
-    time.sleep(0.2)
-
-    # Type with real send_keys so CL's native keydown handlers fire
-    print(f"  [ZIP] Typing {zip_str} with real send_keys...")
+    # ── Step 4: Type ZIP with real ActionChains key_down/key_up ──────────────
+    # These fire through Chrome's native input pipeline — CL's keypress/keydown
+    # handlers receive them correctly, which is what triggers autocomplete.
+    print(f"  [ZIP] Typing '{zip_str}' with real ActionChains key events...")
     for i, ch in enumerate(zip_str):
-        zip_field.send_keys(ch)
-        delay = random.uniform(0.12, 0.22)
-        if i + 1 == min_len:
-            delay = ac_delay + random.uniform(0.3, 0.6)
-            print(f"  [ZIP] Reached minLength ({min_len}) — pausing {delay:.2f}s for CL debounce")
-        time.sleep(delay)
+        ActionChains(driver)\
+            .key_down(ch, zip_field)\
+            .pause(random.uniform(0.03, 0.06))\
+            .key_up(ch, zip_field)\
+            .perform()
+        time.sleep(random.uniform(0.13, 0.22))
 
-    time.sleep(ac_delay + 0.5)
+        if i == 2:
+            # After 3rd digit — most autocomplete minLength is 3 or 5
+            # Give CL's debounced handler time to fire
+            print("  [ZIP] 3-digit pause (3.5s) — waiting for CL autocomplete trigger...")
+            time.sleep(3.5)
 
-    # Wait for CL's real dropdown and click it
-    suggestion_clicked = False
-    print(f"  [ZIP] Waiting up to 3s for CL real dropdown...")
-    deadline = time.time() + 3.0
-    while time.time() < deadline:
-        visible_items = driver.execute_script("""
-            var items = [];
-            document.querySelectorAll('.ui-autocomplete, .ui-menu, [role="listbox"]').forEach(function(menu) {
-                var rect = menu.getBoundingClientRect();
-                if (rect.width > 0 && rect.height > 0 && window.getComputedStyle(menu).display !== 'none') {
-                    menu.querySelectorAll('li.ui-menu-item, li, [role="option"]').forEach(function(li) {
-                        var txt = (li.textContent || '').trim();
-                        if (txt && li.offsetParent !== null) items.push(txt.substring(0,60));
-                    });
-                }
+            # Log autocomplete state
+            ac_state = driver.execute_script("""
+                var el = document.querySelector('[name="postal"]') ||
+                         document.querySelector('[name="postal_code"]');
+                if (!el || !window.jQuery) return {err: 'no-el-or-jquery'};
+                var ac = jQuery(el).data('ui-autocomplete') || jQuery(el).data('autocomplete');
+                if (!ac) return {err: 'no-ac-instance', keys: Object.keys(jQuery(el).data()||{})};
+                return {
+                    minLength: ac.options.minLength,
+                    delay: ac.options.delay,
+                    term: ac.term,
+                    pending: ac.pending,
+                    sourceType: typeof ac.options.source
+                };
+            """)
+            print(f"  [ZIP] CL autocomplete state after 3 digits: {ac_state}")
+
+    time.sleep(2.5)
+
+    # ── Step 5: Check for real CL dropdown and click it ───────────────────────
+    dropdown_info = driver.execute_script("""
+        var result = [];
+        document.querySelectorAll('.ui-autocomplete, .ui-menu, [role="listbox"]').forEach(function(m) {
+            var lis = m.querySelectorAll('li');
+            var rect = m.getBoundingClientRect();
+            result.push({
+                id: m.id, cls: m.className.substring(0,60),
+                visible: rect.width > 0 && rect.height > 0 && m.style.display !== 'none',
+                items: lis.length,
+                display: m.style.display,
+                texts: Array.from(lis).slice(0,5).map(function(li){return li.textContent.trim().substring(0,40);})
             });
-            return items;
-        """)
-        if visible_items:
-            print(f"  [ZIP] Dropdown items: {visible_items[:4]}")
-            break
-        time.sleep(0.15)
+        });
+        return result;
+    """)
+    print(f"  [ZIP] Dropdown state: {dropdown_info}")
 
-    for sel in [".ui-autocomplete li.ui-menu-item", ".ui-autocomplete li", "ul.ui-menu li.ui-menu-item"]:
+    suggestion_clicked = False
+
+    # Try clicking by viewport coordinates (most reliable for jQuery UI autocomplete)
+    items_with_coords = driver.execute_script("""
+        var r = [];
+        document.querySelectorAll(
+            '.ui-autocomplete li.ui-menu-item, .ui-autocomplete li, [role="option"]'
+        ).forEach(function(li) {
+            var rect = li.getBoundingClientRect();
+            if (rect.height > 0 && rect.width > 0) {
+                r.push({
+                    text: li.textContent.trim().substring(0, 60),
+                    x: Math.round(rect.left + rect.width / 2),
+                    y: Math.round(rect.top + rect.height / 2)
+                });
+            }
+        });
+        return r;
+    """)
+
+    if items_with_coords:
+        print(f"  [ZIP] Real dropdown items: {[i['text'] for i in items_with_coords[:3]]}")
+        item = items_with_coords[0]
         try:
-            items = driver.find_elements(By.CSS_SELECTOR, sel)
-            visible = [s for s in items if s.is_displayed() and s.text.strip()]
-            if visible:
-                best = next((x for x in visible if zip_str[:3] in x.text), visible[0])
-                print(f"  [ZIP] Clicking real CL suggestion: '{best.text[:50]}'")
-                ActionChains(driver).move_to_element(best).pause(random.uniform(0.2, 0.4)).click().perform()
+            # Scroll to top so viewport coords match, then click
+            driver.execute_script("window.scrollTo(0, 0);")
+            time.sleep(0.2)
+            body = driver.find_element(By.TAG_NAME, "body")
+            ActionChains(driver)\
+                .move_to_element_with_offset(body, item["x"], item["y"])\
+                .pause(random.uniform(0.25, 0.45))\
+                .click()\
+                .perform()
+            suggestion_clicked = True
+            print("  [ZIP] Clicked real CL dropdown item by coords ✓")
+            time.sleep(2.0)
+        except Exception as e:
+            print(f"  [ZIP] Coord click failed: {e}")
+            # Fallback: JS mousedown/click events
+            try:
+                driver.execute_script("""
+                    var items = document.querySelectorAll(
+                        '.ui-autocomplete li.ui-menu-item, .ui-autocomplete li');
+                    if (items.length > 0) {
+                        ['mouseenter','mousedown','mouseup','click'].forEach(function(evName) {
+                            items[0].dispatchEvent(
+                                new MouseEvent(evName, {bubbles:true, cancelable:true}));
+                        });
+                    }
+                """)
                 suggestion_clicked = True
-                print("  [ZIP] Real suggestion clicked ✓")
-                break
-        except Exception:
-            pass
+                print("  [ZIP] JS mouse event fallback on dropdown ✓")
+                time.sleep(2.0)
+            except Exception as e2:
+                print(f"  [ZIP] JS fallback also failed: {e2}")
+
+    # Try standard Selenium element click as last resort
+    if not suggestion_clicked:
+        for sel in [
+            ".ui-autocomplete li.ui-menu-item",
+            ".ui-autocomplete li",
+            "ul.ui-menu li.ui-menu-item",
+            "[role='listbox'] [role='option']",
+        ]:
+            try:
+                items = driver.find_elements(By.CSS_SELECTOR, sel)
+                visible = [s for s in items if s.is_displayed() and s.text.strip()]
+                if visible:
+                    print(f"  [ZIP] Selenium dropdown: {[v.text[:30] for v in visible[:3]]}")
+                    ActionChains(driver).move_to_element(visible[0]).pause(
+                        random.uniform(0.3, 0.5)).click().perform()
+                    suggestion_clicked = True
+                    print("  [ZIP] Clicked via Selenium element ✓")
+                    time.sleep(2.0)
+                    break
+            except Exception:
+                pass
 
     if not suggestion_clicked:
-        print("  [ZIP] No real dropdown — Tabbing out")
-        zip_field.send_keys(Keys.TAB)
-        time.sleep(0.4)
+        print("  [ZIP] No real CL dropdown appeared — pressing Tab to confirm")
+        try:
+            zip_field.send_keys(Keys.TAB)
+        except Exception:
+            driver.execute_script("arguments[0].blur();", zip_field)
+        time.sleep(2.0)
 
-    # Wait for AJAX
+    # ── Step 6: Wait for AJAX to complete ────────────────────────────────────
+    print("  [ZIP] Waiting for AJAX after ZIP entry...")
     try:
         WebDriverWait(driver, 10).until(
             lambda d: d.execute_script("return typeof jQuery==='undefined' || jQuery.active===0"))
-        print("  [ZIP] AJAX settled ✓")
+        print("  [ZIP] AJAX complete ✓")
     except Exception:
-        pass
+        print("  [ZIP] AJAX wait timed out")
     time.sleep(1.5)
 
-    # Check network captures
-    geo_responses, all_calls = _get_geo_responses(driver)
-    print(f"  [GEO] {len(geo_responses)} geo responses, {len(all_calls)} total network calls")
-    for c in all_calls:
-        print(f"    {c.get('type')} {c.get('status')} {c.get('url','')[:100]}")
+    # ── Step 7: CDP perf log — primary geo capture ────────────────────────────
+    print("  [ZIP] Polling CDP perf log for geo response...")
+    geo_body = None
+    geo_url_found = None
+    GEO_PATTERNS = ["suggest", "postal", "geo", "location", "geocode", "postcode", "zip", "area"]
+    request_id_map = {}
 
+    deadline = time.time() + 6
+    while time.time() < deadline:
+        try:
+            entries = driver.get_log("performance")
+        except Exception:
+            entries = []
+
+        for entry in entries:
+            try:
+                msg = json.loads(entry["message"])
+                event = msg.get("message", {})
+                method = event.get("method", "")
+                params = event.get("params", {})
+
+                if method == "Network.requestWillBeSent":
+                    rid = params.get("requestId", "")
+                    url = params.get("request", {}).get("url", "")
+                    if rid:
+                        request_id_map[rid] = url
+                        if any(p in url.lower() for p in GEO_PATTERNS):
+                            print(f"  [CDP-perf] Geo request sent: {url}")
+
+                elif method == "Network.responseReceived":
+                    rid = params.get("requestId", "")
+                    url = (params.get("response", {}).get("url", "")
+                           or request_id_map.get(rid, ""))
+                    if any(p in url.lower() for p in GEO_PATTERNS):
+                        print(f"  [CDP-perf] Geo response received: {url}")
+                        try:
+                            body_resp = driver.execute_cdp_cmd(
+                                "Network.getResponseBody", {"requestId": rid})
+                            geo_body = body_resp.get("body", "")
+                            geo_url_found = url
+                            print(f"  [CDP-perf] Body ({len(geo_body)} bytes): {geo_body[:300]}")
+                        except Exception as e:
+                            print(f"  [CDP-perf] getResponseBody failed: {e}")
+            except Exception:
+                pass
+
+        if geo_body is not None:
+            break
+        time.sleep(0.35)
+
+    # ── Step 8: Inject geo fields ─────────────────────────────────────────────
     geo_injected = False
-    if geo_responses:
-        for geo_resp in geo_responses:
-            print(f"  [GEO] Response from: {geo_resp.get('url','')}")
-            print(f"  [GEO] Body: {geo_resp.get('responseText','')[:400]}")
-            if _inject_geo_hidden_fields(driver, geo_resp.get('responseText',''), zip_str):
-                geo_injected = True
-                break
 
+    if geo_body and geo_body.strip() not in ("", "[]"):
+        print(f"  [GEO] ✓ Real geo response captured via CDP perf log from: {geo_url_found}")
+        geo_injected = _inject_geo_hidden_fields(driver, geo_body, zip_str)
+    else:
+        print("  [GEO] CDP perf log: no geo response captured")
+
+    # Fallback 1: JS spy (catches cases where CDP perf log missed it)
     if not geo_injected:
-        print("  [GEO] No XHR — direct Python geo request")
+        js_responses, js_calls = _get_geo_responses(driver)
+        print(f"  [GEO] JS spy: {len(js_responses)} geo response(s), {len(js_calls)} total calls")
+        if js_calls:
+            print(f"  [GEO] JS spy network calls:")
+            for call in js_calls:
+                print(f"    {call.get('type','?')} {call.get('status','?')} {call.get('url','')[:100]}")
+        if js_responses:
+            for resp in js_responses:
+                print(f"  [GEO] JS spy geo response: {resp.get('url','')}")
+                if _inject_geo_hidden_fields(driver, resp.get("responseText", ""), zip_str):
+                    geo_injected = True
+                    break
+
+    # Fallback 2: Try calling CL's autocomplete source function directly
+    if not geo_injected:
+        print("  [GEO] Trying direct autocomplete source function call...")
+        items = _trigger_real_geo_lookup(driver, zip_str)
+        if items:
+            time.sleep(2)
+            # Re-check CDP perf log after the source call
+            deadline2 = time.time() + 4
+            while time.time() < deadline2:
+                try:
+                    entries = driver.get_log("performance")
+                except Exception:
+                    entries = []
+                for entry in entries:
+                    try:
+                        msg = json.loads(entry["message"])
+                        event = msg.get("message", {})
+                        if event.get("method") == "Network.responseReceived":
+                            params = event.get("params", {})
+                            rid = params.get("requestId", "")
+                            url = params.get("response", {}).get("url", "")
+                            if any(p in url.lower() for p in GEO_PATTERNS):
+                                try:
+                                    body_resp = driver.execute_cdp_cmd(
+                                        "Network.getResponseBody", {"requestId": rid})
+                                    b = body_resp.get("body", "")
+                                    if b and b.strip() not in ("", "[]"):
+                                        if _inject_geo_hidden_fields(driver, b, zip_str):
+                                            geo_injected = True
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+                if geo_injected:
+                    break
+                time.sleep(0.35)
+
+    # Fallback 3: Direct Python requests
+    if not geo_injected:
+        print("  [GEO] Falling back to direct Python geo request...")
         geo_text, geo_url = _fetch_cl_geo_direct(driver, zip_str)
-        if geo_text and geo_text.strip() not in ('[]', '', 'null'):
+        if geo_text and geo_text.strip() not in ("", "[]"):
+            print(f"  [GEO] Direct fetch from: {geo_url}")
             _inject_geo_hidden_fields(driver, geo_text, zip_str)
+        else:
+            print("  [GEO] ⚠ No geo response from any method")
+            print("  [GEO] ⚠ cryptedStepCheck will not include confirmed ZIP")
+            print("  [GEO] ⚠ Verify goog:loggingPrefs is set in ChromeOptions")
 
-    # Status
-    patch_status = driver.execute_script("""
-        return {
-            patchInstalled:   window._clZipPatchInstalled,
-            serializerPatched: window._clSerializerPatched,
-            widgetCreated:    window._clZipWidgetCreated || false,
-            geoResponses:     (window._clCapturedGeoResponses || []).length,
-            allNetworkCalls:  (window._clAllNetworkCalls || []).length
-        };
-    """)
-    print(f"  [ZIP] Patch status: {patch_status}")
-    # widgetCreated must now be false — if True the fake widget snuck back in
-
+    # ── Step 9: Force-set field value ─────────────────────────────────────────
     zip_field = _find_field(driver, [
-        "[name='postal']", "[name='postal_code']", "input#postal_code", "input#postal",
+        "[name='postal']", "[name='postal_code']",
+        "input#postal_code", "input#postal",
     ]) or zip_field
-    actual = (zip_field.get_attribute("value") if zip_field else "") or ""
 
-    if not actual:
+    actual = (zip_field.get_attribute("value") or "") if zip_field else ""
+    if actual != zip_str and zip_field:
+        print(f"  [ZIP] Value is '{actual}' — force-setting to '{zip_str}'")
         driver.execute_script("""
             var el = arguments[0], v = arguments[1];
             Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(el, v);
@@ -1472,18 +1506,32 @@ def _fill_zip_with_network_intercept(driver, zip_field, zip_str):
             if (window.jQuery) jQuery(el).val(v).trigger('input').trigger('change');
         """, zip_field, zip_str)
         time.sleep(0.3)
-        actual = zip_field.get_attribute("value") or ""
 
+    actual = (zip_field.get_attribute("value") or "") if zip_field else zip_str
     print(f"  ✓ [ZIP] = '{actual}'")
 
+    # ── Step 10: Log hidden fields ────────────────────────────────────────────
     hidden = driver.execute_script("""
         var r = {};
         document.querySelectorAll('input[type="hidden"]').forEach(function(e) {
-            r[e.name || e.id || '?'] = e.value;
+            r[e.name || e.id || '?'] = (e.value || '').substring(0, 60);
         });
         return r;
     """)
-    print(f"  [ZIP] Hidden fields: {hidden}")
+    print(f"  [ZIP] Hidden fields after geo injection: {hidden}")
+
+    # Log patch status
+    patch_status = driver.execute_script("""
+        return {
+            patchInstalled: window._clZipPatchInstalled,
+            serializerPatched: window._clSerializerPatched,
+            widgetCreated: window._clZipWidgetCreated,
+            autoconfirmed: window._clZipAutoconfirmed,
+            geoResponses: (window._clCapturedGeoResponses || []).length,
+            allCalls: (window._clAllNetworkCalls || []).length
+        };
+    """)
+    print(f"  [ZIP] Patch status: {patch_status}")
 
     return zip_field
 
@@ -1503,7 +1551,6 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     handle_captcha_if_present(driver)
     _wait_for_cl_js_init(driver)
 
-    # Build values
     title = (product.get("title") or product.get("name") or "Quality Item For Sale").strip()
     description = (product.get("description") or (
         f"{title} in excellent condition. Well maintained and ready for a new home. "
@@ -1697,7 +1744,7 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     except Exception as e:
         print(f"  [submit] ActionChains failed ({e})")
 
-    # Immediately re-set ZIP after click
+    # Re-set ZIP immediately after click
     if submitted and zip_code:
         time.sleep(0.15)
         driver.execute_script("""
@@ -1731,8 +1778,8 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     if not submitted:
         return None
 
-    # Brief wait then dump captured payloads
     time.sleep(3)
+
     captured = driver.execute_script("return window._clCapturedPayloads || [];")
     if captured:
         print(f"  [payload] CAPTURED {len(captured)} POST request(s) after submit click:")
@@ -1762,7 +1809,8 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
             if (!form) return 'no-form';
             var inputs = [];
             form.querySelectorAll('input,textarea,select').forEach(function(el) {
-                inputs.push({name: el.name || el.id, type: el.type || el.tagName, value: (el.value || '').substring(0, 100)});
+                inputs.push({name: el.name || el.id, type: el.type || el.tagName,
+                             value: (el.value || '').substring(0, 100)});
             });
             return inputs;
         """)
@@ -1777,7 +1825,7 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
             return cur
         time.sleep(0.5)
 
-    # Still stuck — log validation errors
+    # Still stuck — log validation errors and attempt recovery
     print("  [submit] Still on edit page after 35s — checking for validation errors...")
     try:
         for fname, selectors in [
@@ -1809,16 +1857,11 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
         else:
             print("  [fail-errors] No .error elements found")
 
-        # ── MANUAL SUBMISSION DIFF HELPER ─────────────────────────────────────
-        # Print the DevTools snippet output for comparison against a real run.
-        # If you run the DevTools snippet from the debug note on a real manual
-        # submission and compare the output, you will see exactly which field
-        # is present in the manual run but missing here.
-        print("  [diagnostic] Current browser state for manual diff:")
+        print("  [diagnostic] Current browser state:")
         state = driver.execute_script("""
             var r = {};
             document.querySelectorAll('input[type="hidden"]').forEach(function(e) {
-                r[e.name || e.id || '?'] = e.value;
+                r[e.name || e.id || '?'] = (e.value||'').substring(0,60);
             });
             document.querySelectorAll('input,textarea,select').forEach(function(e) {
                 if (e.value && e.name) r['_field_' + e.name] = e.value.substring(0,50);
