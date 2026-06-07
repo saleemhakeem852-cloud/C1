@@ -3256,28 +3256,46 @@ def main():
     print("  CLBlast — Craigslist Automation")
     print("=" * 50)
 
-    # Email poochna
-    default_email = os.environ.get("CL_EMAIL", "").strip()
-    email_input = input(f"  Email [{default_email}]: ").strip()
-    email = email_input if email_input else default_email
+    # If running on server (Railway/Docker), CL_EMAIL and CL_PASSWORD are
+    # already injected as environment variables — skip all interactive prompts.
+    env_email    = os.environ.get("CL_EMAIL", "").strip()
+    env_password = os.environ.get("CL_PASSWORD", "").strip() or os.environ.get("CL_EMAIL_PASSWORD", "").strip()
 
-    if not email:
-        print("✗ Email required!")
-        return
-
-    # Password .env se dhundho email ke hisaab se
-    password = _get_saved_password(email)
-
-    if not password:
-        # Pehli baar — password poochna
-        import getpass
-        password = getpass.getpass(f"  Password (pehli baar): ").strip()
-        if not password:
-            print("✗ Password required!")
+    if env_email and env_password:
+        # Server / non-interactive mode — use env vars directly
+        email    = env_email
+        password = env_password
+        print(f"  ✓ Using account from environment: {email}")
+    else:
+        # Local / interactive mode — ask via terminal as before
+        default_email = env_email
+        try:
+            email_input = input(f"  Email [{default_email}]: ").strip()
+        except EOFError:
+            print("✗ No TTY available and CL_EMAIL/CL_PASSWORD env vars not set. "
+                  "Please save the account credentials in the web dashboard.")
             return
-        # Save karo
-        _save_password(email, password)
-        print(f"  ✓ Password saved!")
+        email = email_input if email_input else default_email
+
+        if not email:
+            print("✗ Email required!")
+            return
+
+        # Password — try saved .env first, then prompt
+        password = _get_saved_password(email)
+
+        if not password:
+            import getpass
+            try:
+                password = getpass.getpass(f"  Password (pehli baar): ").strip()
+            except EOFError:
+                print("✗ No TTY available. Set CL_PASSWORD env var or save credentials in dashboard.")
+                return
+            if not password:
+                print("✗ Password required!")
+                return
+            _save_password(email, password)
+            print(f"  ✓ Password saved!")
 
     os.environ["CL_EMAIL"]          = email
     os.environ["CL_PASSWORD"]       = password

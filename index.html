@@ -2554,7 +2554,6 @@ function renderPlatformAccounts(platform, containerId) {
             <label>Email</label>
             <input type="email" id="email-${acc.id}" value="${escHtml(acc.email)}" placeholder="you@example.com" oninput="onAccountChange('${platform}', '${acc.id}')" autocomplete="username" />
           </div>
-          ${platform !== 'craigslist' ? `
           <div class="form-group">
             <label>Password</label>
             <div class="pw-wrap">
@@ -2562,12 +2561,6 @@ function renderPlatformAccounts(platform, containerId) {
               <button class="pw-eye" onclick="togglePw('password-${acc.id}', this)" type="button" aria-label="Show/hide password">👁</button>
             </div>
           </div>
-          ` : `
-          <div class="form-group" style="display:flex;align-items:center;gap:8px;padding:10px 12px;background:rgba(168,85,247,.06);border:1px solid rgba(168,85,247,.2);border-radius:var(--radius-md);grid-column:1/-1;">
-            <span style="font-size:1rem;">ℹ️</span>
-            <span style="font-size:.78rem;color:var(--text2);line-height:1.4;">Craigslist uses <strong style="color:var(--cl);">email-only</strong> login — no password required.</span>
-          </div>
-          `}
           ${platform === 'craigslist' ? `
 
           <div class="form-group full-width" style="margin-top:4px;">
@@ -2613,7 +2606,7 @@ function updatePlatformBadge(platform) {
   if (!badge) return;
   const accounts = getAccounts(platform);
   const total = accounts.length;
-  const savedCount = accounts.filter(a => a.isSaved && a.email && (platform === 'craigslist' || a.password)).length;
+  const savedCount = accounts.filter(a => a.isSaved && a.email && a.password).length;
   const unsavedCount = total - savedCount;
   if (unsavedCount === 0 && savedCount > 0) {
     badge.className = 'account-status-pill status-saved';
@@ -2686,8 +2679,8 @@ async function saveAccount(platform, id) {
 
   const label    = document.getElementById(`label-${id}`)?.value?.trim() || 'Account';
   const email    = document.getElementById(`email-${id}`)?.value?.trim() || '';
-  // CL uses email-only login; other platforms use email+password
-  const password = platform === 'craigslist' ? '' : (document.getElementById(`password-${id}`)?.value || '');
+  // All platforms use email + password
+  const password = document.getElementById(`password-${id}`)?.value || '';
   const city     = platform === 'craigslist' ? (document.getElementById(`city-${id}`)?.value?.trim() || '') : '';
 
   const accounts = getAccounts(platform);
