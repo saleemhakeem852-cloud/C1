@@ -2552,20 +2552,86 @@ def _click_first(driver, selectors, label="button"):
     return False
 
 
-def _wait_for_images_page(driver, timeout=20):
+def _wait_for_images_page(driver, timeout=30):
     print("  [images] Waiting for image upload page...")
-    try:
-        WebDriverWait(driver, timeout).until(lambda d: (
-            "s=images" in d.current_url
+
+    def _on_images_or_preview(d):
+        url = d.current_url
+        return (
+            "s=images" in url
+            or "s=preview" in url
             or d.find_elements(By.ID, "done_with_images_button")
             or d.find_elements(By.ID, "add_photos_button")
             or "done with images" in (d.page_source or "").lower()
+        )
+
+    try:
+        # Phase 1: wait for images/preview OR geoverify
+        WebDriverWait(driver, timeout).until(lambda d: (
+            _on_images_or_preview(d) or "s=geoverify" in d.current_url
         ))
-        print(f"  [images] Page ready → {driver.current_url}")
-        return True
     except TimeoutException:
         print(f"  [images] Timed out — URL: {driver.current_url}")
         return False
+
+    # Phase 2: if on geoverify, try to click through it
+    if "s=geoverify" in driver.current_url:
+        print("  [images] ⚠ Geoverify page detected — attempting bypass...")
+        for attempt in range(3):
+            try:
+                WebDriverWait(driver, 12).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR,
+                        "button[type='submit'], button.go, button, input[type='submit']")))
+                time.sleep(0.8)
+                btns = driver.find_elements(By.CSS_SELECTOR,
+                    "button[type='submit'], button.go, button, input[type='submit']")
+                btn = None
+                for b in btns:
+                    txt = (b.text or b.get_attribute("value") or "").strip().lower()
+                    if any(k in txt for k in ("continue","confirm","looks good","ok","next","accept")):
+                        btn = b; break
+                if not btn:
+                    for b in btns:
+                        if b.is_displayed() and b.is_enabled():
+                            btn = b; break
+                if btn:
+                    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
+                    time.sleep(0.3)
+                    try:
+                        driver.execute_script("arguments[0].click();", btn)
+                    except Exception:
+                        ActionChains(driver).move_to_element(btn).click().perform()
+                    print(f"  [images] ✓ Clicked geoverify button (attempt {attempt+1})")
+                    try:
+                        WebDriverWait(driver, 15).until(lambda d: "s=geoverify" not in d.current_url)
+                        print(f"  [images] ✓ Left geoverify → {driver.current_url}")
+                        break
+                    except TimeoutException:
+                        print(f"  [images] Still on geoverify after attempt {attempt+1}")
+                        time.sleep(2)
+                        continue
+            except Exception as e:
+                print(f"  [images] Geoverify attempt {attempt+1} error: {e}")
+                time.sleep(2)
+
+        if "s=geoverify" in driver.current_url:
+            # Non-US IP block — can't pass geoverify. The listing was already
+            # submitted to CL. Skip images and go straight to publish.
+            print("  [images] ⚠ Cannot pass geoverify (non-US IP). Skipping images — attempting publish.")
+            return True
+
+        # After geoverify, wait for images/preview (fresh 20s budget)
+        try:
+            WebDriverWait(driver, 20).until(_on_images_or_preview)
+        except TimeoutException:
+            if _on_images_or_preview(driver):
+                pass
+            else:
+                print(f"  [images] Post-geoverify: CL skipped images — URL: {driver.current_url}")
+                return True
+
+    print(f"  [images] Page ready → {driver.current_url}")
+    return True
 
 
 def complete_images_step(driver, product: dict):
@@ -2578,6 +2644,9 @@ def complete_images_step(driver, product: dict):
         if "s=preview" in driver.current_url:
             print("  [images] Timed out but on preview — continuing ✓")
             return True
+        if "s=geoverify" in driver.current_url:
+            print("  [images] Still on geoverify — skipping images, attempting publish...")
+            return True  # non-fatal: listing submitted, publish may still work
         return False
 
     handle_captcha_if_present(driver)
@@ -3189,13 +3258,23 @@ def main():
         driver.quit()
         return
 
-    products_file = os.environ.get("PRODUCTS_FILE", "products.json")
+    # FIX: CLB_PRODUCTS_FILE is the unique env var set by server.py for each job.
+    # PRODUCTS_FILE is kept as fallback. Without this, the script reads all of
+    # products.json and posts the first raw entry (Men's Hanes T-Shirt index 0).
+    products_file = (
+        os.environ.get("CLB_PRODUCTS_FILE", "").strip()
+        or os.environ.get("PRODUCTS_FILE", "").strip()
+        or "products.json"
+    )
+    print(f"  [products] Reading from: {products_file}")
     if not os.path.exists(products_file):
-        print(f"✗ {products_file} not found.")
+        print(f"  ✗ Products file not found: {products_file}")
         driver.quit()
         return
     with open(products_file) as f:
         products = json.load(f)
+    print(f"  [products] Loaded {len(products)} product(s): " +
+          str([p.get('title') or p.get('name') for p in products[:3]]))
 
     threading.Thread(target=update_ad_analytics_periodically, daemon=True).start()
 

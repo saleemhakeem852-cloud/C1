@@ -3552,7 +3552,9 @@
     /* ═══════════════════════════════════════════════════════════
        CONSTANTS & STATE
      ═══════════════════════════════════════════════════════════ */
-    const SERVER = 'https://clblast.up.railway.app';
+    const SERVER = window.location.protocol.startsWith('http')
+      ? window.location.origin
+      : 'http://localhost:5000';
     let serverOnline = false;
     let _productsSynced = false;
 
@@ -4707,7 +4709,7 @@
       }
       container.innerHTML = allProducts.map((p, idx) => `
     <label class="product-checkbox-item">
-      <input type="checkbox" name="post-product" value="${idx}" checked />
+      <input type="checkbox" name="post-product" value="${idx}" />
       <div>
         <div class="product-checkbox-label">${escHtml(p.title || 'Untitled')}</div>
         <div class="product-checkbox-meta">$${(p.price || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} · ${escHtml(p.category || '')}</div>

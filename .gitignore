@@ -2,3 +2,6 @@ __pycache__/
 *.pyc
 .DS_Store
 .env
+accounts.json
+clb_subset_*.json
+products_subset.json

@@ -1,5 +1,9 @@
+# Windows cp1252 fix -- must be first thing that runs
+
+import sys
+
 """
-craigslist.py — CLBlast Craigslist automation
+craigslist.py -- CLBlast Craigslist automation
 FIX v3: Real CDP performance-log network capture + real ActionChains key events
 
 ROOT CAUSE (confirmed from logs):
@@ -12,10 +16,10 @@ ROOT CAUSE (confirmed from logs):
 
 THE FIX (2 changes):
   1. Add goog:loggingPrefs {"performance":"ALL"} to ChromeOptions so that
-     driver.get_log("performance") returns CDP Network events — this captures
+     driver.get_log("performance") returns CDP Network events -- this captures
      ALL network activity at the browser level, regardless of JS spy timing.
   2. Use ActionChains.key_down/key_up for ZIP typing instead of send_keys or
-     CDP Input.dispatchKeyEvent — fires real OS-level key events through
+     CDP Input.dispatchKeyEvent -- fires real OS-level key events through
      Chrome's input pipeline that CL's keypress/keydown handlers intercept.
   3. Poll CDP perf log for Network.responseReceived matching CL's geo endpoint,
      then call Network.getResponseBody to get the signed token back.
@@ -41,9 +45,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.keys import Keys
-# Existing imports ke baad add karo
-from dotenv import load_dotenv
-load_dotenv()  # .env file automatically load ho jaayegi
+
 try:
     from twocaptcha import TwoCaptcha
     CAPTCHA_SOLVER_AVAILABLE = True
@@ -52,12 +54,9 @@ except ImportError:
 
 TWO_CAPTCHA_API_KEY = os.environ.get("TWO_CAPTCHA_KEY", "YOUR_2CAPTCHA_API_KEY")
 LISTINGS_JSON       = "posted_listings.json"
-# GMAIL_EMAIL    = os.environ.get("CL_EMAIL",          "hunzla.khalid07@gmail.com")
-# GMAIL_PASSWORD = os.environ.get("CL_EMAIL_PASSWORD", "N.aruto07")
-# CL_PASSWORD    = os.environ.get("CL_PASSWORD",       "N.aruto07")  # CL account password
-GMAIL_EMAIL    = os.environ.get("CL_EMAIL",          "")
-GMAIL_PASSWORD = os.environ.get("CL_EMAIL_PASSWORD", "")
-CL_PASSWORD    = os.environ.get("CL_PASSWORD",       "")
+GMAIL_EMAIL    = os.environ.get("CL_EMAIL",          "hunzla.khalid07@gmail.com")
+GMAIL_PASSWORD = os.environ.get("CL_EMAIL_PASSWORD", "N.aruto07")
+CL_PASSWORD    = os.environ.get("CL_PASSWORD",       "N.aruto07")  # CL account password
 _cl_logged_in: bool = False
 CL_CITY             = os.environ.get("CL_CITY", "losangeles")
 IS_FAST_MODE        = os.environ.get("FAST_MODE", "1") == "1"
@@ -233,9 +232,9 @@ _FINGERPRINT_JS = """
 }})();
 """
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  CDP Network Interceptor (JS-side spy — belt-and-suspenders fallback)
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
+#  CDP Network Interceptor (JS-side spy -- belt-and-suspenders fallback)
+# -----------------------------------------------------------------------------
 
 _GEO_URL_PATTERNS = [
     "suggest", "postal", "geo", "location", "zip", "area",
@@ -459,9 +458,9 @@ def _inject_geo_hidden_fields(driver, geo_response_text, zip_str):
     return bool(result and result.get("ok"))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  DIRECT GEO FETCH — Python-side fallback
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
+#  DIRECT GEO FETCH -- Python-side fallback
+# -----------------------------------------------------------------------------
 
 def _fetch_cl_geo_direct(driver, zip_str, city="Los Angeles", state="CA"):
     """
@@ -497,7 +496,7 @@ def _fetch_cl_geo_direct(driver, zip_str, city="Los Angeles", state="CA"):
         try:
             resp = requests.get(url, headers=headers, cookies=cookies,
                                 timeout=8, allow_redirects=True)
-            print(f"  [GEO-direct] {url} → {resp.status_code} ({len(resp.text)} bytes)")
+            print(f"  [GEO-direct] {url} -> {resp.status_code} ({len(resp.text)} bytes)")
             if resp.status_code == 200 and resp.text.strip():
                 print(f"  [GEO-direct] Response: {resp.text[:300]}")
                 return resp.text, url
@@ -565,9 +564,9 @@ def _trigger_real_geo_lookup(driver, zip_str):
     return None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  CDP PERFORMANCE LOG — Python-side geo response capture (THE REAL FIX)
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
+#  CDP PERFORMANCE LOG -- Python-side geo response capture (THE REAL FIX)
+# -----------------------------------------------------------------------------
 
 def _drain_perf_log(driver):
     """
@@ -693,11 +692,11 @@ def make_driver(proxy_url=None):
         "intl.accept_languages": fp["lang"],
     })
 
-    # ── FIX: Enable CDP performance log for Python-side network capture ───────
+    # -- FIX: Enable CDP performance log for Python-side network capture -------
     # This is required for driver.get_log("performance") to return CDP Network
     # events. Without this, _poll_perf_log_for_geo() returns nothing.
     options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
 
     chromium_bin = _find_binary(
         ["google-chrome", "chromium", "chromium-browser"],
@@ -823,13 +822,13 @@ def handle_captcha_if_present(driver):
                 driver.execute_script(
                     "document.getElementById('g-recaptcha-response').innerHTML=arguments[0];",
                     result["code"])
-                print("  CAPTCHA solved ✓")
+                print("  CAPTCHA solved [OK]")
             except Exception as e:
                 print(f"  CAPTCHA solve failed: {e}")
     except NoSuchElementException:
         pass
     if "Just a moment" in driver.title:
-        print("  Cloudflare — waiting 8s…")
+        print("  Cloudflare -- waiting 8s...")
         time.sleep(8)
 
 
@@ -846,30 +845,25 @@ def _is_cl_logged_in(driver):
 
 def craigslist_login(driver, email):
     """
-    CL Login — Screenshot shows:
+    CL Login -- Screenshot shows:
       - Email / Handle field  (id="inputEmailHandle")
       - Password field        (visible on same page)
       - "Log in" button       (right side)
-      - "E-mail a login link" button (left side — we don't use this)
+      - "E-mail a login link" button (left side -- we don't use this)
 
-    So: fill email → fill password → click "Log in"
+    So: fill email -> fill password -> click "Log in"
     """
     # Skip if already logged in
     try:
         driver.get("https://accounts.craigslist.org/login/home")
         time.sleep(2)
         if _is_cl_logged_in(driver):
-            print("✓ Already logged in to CL — skipping login")
+            print("[OK] Already logged in to CL -- skipping login")
             return True
     except Exception:
         pass
 
-    cl_password      = os.environ.get("CL_PASSWORD", CL_PASSWORD).strip()
-    # Gmail App Password for IMAP OTP fetching (separate from CL password).
-    # Set GMAIL_APP_PASSWORD in Railway env vars (generate at myaccount.google.com/apppasswords).
-    gmail_app_password = (os.environ.get("GMAIL_APP_PASSWORD", "").strip()
-                          or os.environ.get("CL_EMAIL_PASSWORD", "").strip()
-                          or cl_password)
+    cl_password = os.environ.get("CL_PASSWORD", CL_PASSWORD).strip()
 
     print(f"  [login] Going to CL login page...")
     driver.get("https://accounts.craigslist.org/login")
@@ -877,17 +871,17 @@ def craigslist_login(driver, email):
     handle_captcha_if_present(driver)
 
     try:
-        # ── Step 1: Fill Email ────────────────────────────────────────────────
+        # -- Step 1: Fill Email ------------------------------------------------
         email_field = WebDriverWait(driver, 15).until(
             EC.presence_of_element_located((By.ID, "inputEmailHandle")))
         email_field.clear()
         for ch in email:
             email_field.send_keys(ch)
             time.sleep(random.uniform(0.05, 0.10))
-        print(f"  [login] ✓ Email filled: {email}")
+        print(f"  [login] [OK] Email filled: {email}")
         time.sleep(0.5)
 
-        # ── Step 2: Fill Password ─────────────────────────────────────────────
+        # -- Step 2: Fill Password ---------------------------------------------
         # Password field is on the SAME page (not a separate step)
         pwd_field = WebDriverWait(driver, 10).until(
             EC.presence_of_element_located((By.CSS_SELECTOR,
@@ -897,10 +891,10 @@ def craigslist_login(driver, email):
         for ch in cl_password:
             pwd_field.send_keys(ch)
             time.sleep(random.uniform(0.04, 0.09))
-        print(f"  [login] ✓ Password filled")
+        print(f"  [login] [OK] Password filled")
         time.sleep(0.5)
 
-        # ── Step 3: Click "Log in" button (NOT "E-mail a login link") ─────────
+        # -- Step 3: Click "Log in" button (NOT "E-mail a login link") ---------
         # There are 2 buttons: "E-mail a login link" and "Log in"
         # We need the "Log in" button on the RIGHT side
         login_btn = None
@@ -922,85 +916,65 @@ def craigslist_login(driver, email):
                 print(f"  [login] Using last button: '{login_btn.text}'")
 
         if not login_btn:
-            print("  [login] ✗ Could not find Log in button!")
+            print("  [login] [FAIL] Could not find Log in button!")
             return False
 
         # Scroll to and click
         driver.execute_script("arguments[0].scrollIntoView({block:'center'});", login_btn)
         time.sleep(0.3)
         driver.execute_script("arguments[0].click();", login_btn)
-        print("  [login] ✓ Log in button clicked!")
+        print("  [login] [OK] Log in button clicked!")
         time.sleep(4)
         handle_captcha_if_present(driver)
 
     except TimeoutException as e:
-        print(f"  [login] ✗ Field not found: {e}")
+        print(f"  [login] [FAIL] Field not found: {e}")
         return False
     except Exception as e:
-        print(f"  [login] ✗ Error: {e}")
+        print(f"  [login] [FAIL] Error: {e}")
         return False
 
-    # ── Step 4: Check result ──────────────────────────────────────────────────
+    # -- Step 4: Check result --------------------------------------------------
     current_url = driver.current_url
     print(f"  [login] URL after login click: {current_url}")
 
     if _is_cl_logged_in(driver):
-        print("  [login] ✓ Logged in to Craigslist!")
+        print("  [login] [OK] Logged in to Craigslist!")
         return True
 
-    # Maybe redirected to home page — check again
+    # Maybe redirected to home page -- check again
     time.sleep(2)
     if _is_cl_logged_in(driver):
-        print("  [login] ✓ Logged in!")
+        print("  [login] [OK] Logged in!")
         return True
 
     # Check for wrong password error
     page_src = driver.page_source.lower()
     if "invalid" in page_src or "incorrect" in page_src or "wrong" in page_src:
-        print("  [login] ✗ Wrong password — check CL_PASSWORD env var")
+        print("  [login] [FAIL] Wrong password -- check CL_PASSWORD env var")
         return False
 
     # Check for OTP/verification
     try:
-        # CL uses several different OTP input variants — cast a wide net
-        otp_input = WebDriverWait(driver, 8).until(
+        otp_input = WebDriverWait(driver, 5).until(
             EC.presence_of_element_located((By.CSS_SELECTOR,
-                "input[name='otp'], "
-                "input[type='number'][maxlength='6'], "
-                "input[name='code'], "
-                "input[id*='otp'], input[id*='code'], input[id*='token'], "
-                "input[placeholder*='code' i], input[placeholder*='verification' i]")))
-        print("  [login] OTP/verification required — fetching from Gmail...")
-        otp = _get_otp_from_gmail_imap(email, gmail_app_password)
+                "input[name='otp'], input[type='number'][maxlength='6']")))
+        print("  [login] OTP required -- fetching from Gmail...")
+        otp = _get_otp_from_gmail_imap(email, cl_password)
         if otp:
             otp_input.clear()
             otp_input.send_keys(otp)
             otp_input.send_keys(Keys.RETURN)
             time.sleep(3)
             if _is_cl_logged_in(driver):
-                print("  [login] ✓ Logged in via OTP!")
+                print("  [login] [OK] Logged in via OTP!")
                 return True
-        else:
-            print("  [login] ✗ Could not fetch OTP from Gmail. "
-                  "Make sure GMAIL_APP_PASSWORD is set in Railway env vars "
-                  "(generate at myaccount.google.com/apppasswords).")
     except TimeoutException:
         pass
 
-    # Dump page source to help diagnose what CL is showing
-    try:
-        with open("/tmp/cl_login_debug.html", "w", encoding="utf-8") as _f:
-            _f.write(driver.page_source)
-        print("  [login] Debug: page source saved to /tmp/cl_login_debug.html")
-        # Print a small snippet of page text for Railway logs
-        _body_text = driver.find_element(By.TAG_NAME, "body").text[:600]
-        print(f"  [login] Page text snippet:\n{_body_text}")
-    except Exception:
-        pass
-
-    print(f"  [login] ⚠ Login status unclear — proceeding optimistically. URL: {driver.current_url}")
-    # Optimistic: if we're no longer on the /login page itself, assume success
-    return True
+    print(f"  [login] [WARN] Login status unclear -- proceeding. URL: {driver.current_url}")
+    # Optimistic -- sometimes CL just redirects oddly
+    return "accounts.craigslist.org" not in driver.current_url or _is_cl_logged_in(driver)
 
 
 def _get_otp_from_gmail_imap(cl_email, gmail_password, timeout_minutes=3):
@@ -1082,7 +1056,7 @@ def _get_cl_magic_link_from_imap(cl_email, gmail_password, timeout_minutes=5):
                 matches = CL_LINK.findall(body)
                 if matches:
                     url = max(matches, key=len)
-                    print(f"  [imap-magic] ✓ Found: {url[:80]}")
+                    print(f"  [imap-magic] [OK] Found: {url[:80]}")
                     return url
             else:
                 mail.logout()
@@ -1101,7 +1075,7 @@ def click_relocation_if_needed(driver, ad_name):
         local_btn = WebDriverWait(driver, 6).until(
             EC.element_to_be_clickable((By.CSS_SELECTOR, "#localAreaButton")))
         safe_click(driver, local_btn)
-        print("  Relocation handled ✓")
+        print("  Relocation handled [OK]")
     except TimeoutException:
         pass
 
@@ -1121,9 +1095,9 @@ def _wait_for_cl_js_init(driver, timeout=20):
                 return jQuery('#postingForm').length > 0;
             } catch(e) { return false; }
         """))
-        print("  [init] CL form JS ready ✓")
+        print("  [init] CL form JS ready [OK]")
     except TimeoutException:
-        print("  [init] Timeout waiting for CL JS — proceeding anyway")
+        print("  [init] Timeout waiting for CL JS -- proceeding anyway")
     time.sleep(1.5)
 
 
@@ -1193,9 +1167,9 @@ def _cdp_type(driver, element, value):
     time.sleep(0.25)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  ZIP PATCH JS — serializer + FormData patches
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
+#  ZIP PATCH JS -- serializer + FormData patches
+# -----------------------------------------------------------------------------
 
 _ZIP_PATCH_JS = """
 var zipVal = arguments[0];
@@ -1393,17 +1367,17 @@ return results;
 """
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  FILL ZIP — V3: Real ActionChains key events + CDP perf log capture
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
+#  FILL ZIP -- V3: Real ActionChains key events + CDP perf log capture
+# -----------------------------------------------------------------------------
 
 def _fill_zip_with_network_intercept(driver, zip_field, zip_str):
     """
-    V3 ZIP fill strategy — real CDP perf-log capture + real ActionChains key events.
+    V3 ZIP fill strategy -- real CDP perf-log capture + real ActionChains key events.
 
     Why previous versions failed:
     - JS XHR/fetch spy: installed after CL's autocomplete already captured
-      original XMLHttpRequest reference — invisible to CL's AJAX calls.
+      original XMLHttpRequest reference -- invisible to CL's AJAX calls.
     - CDP Input.dispatchKeyEvent: bypasses Chrome's native input pipeline
       that CL's keypress/keydown handlers hook into.
     - Fake autocomplete widget: fires UI events but never hits CL's server,
@@ -1415,7 +1389,7 @@ def _fill_zip_with_network_intercept(driver, zip_field, zip_str):
        key events through Chrome's full input pipeline.
     3. Pauses after 3 digits to let CL's autocomplete threshold trigger.
     4. Polls CDP perf log (Python-side) for Network.responseReceived events
-       matching CL's geo endpoint — captures at browser network layer,
+       matching CL's geo endpoint -- captures at browser network layer,
        not JS layer, so spy timing doesn't matter.
     5. Calls Network.getResponseBody to get the actual signed response.
     6. Injects any new tokens from the response into the DOM.
@@ -1423,7 +1397,7 @@ def _fill_zip_with_network_intercept(driver, zip_field, zip_str):
     8. Runs validator nuke before submit.
     """
 
-    # ── Step 0: Clear stale perf log entries ─────────────────────────────────
+    # -- Step 0: Clear stale perf log entries ---------------------------------
     try:
         driver.get_log("performance")
         print("  [ZIP] Perf log drained (stale entries cleared)")
@@ -1431,16 +1405,16 @@ def _fill_zip_with_network_intercept(driver, zip_field, zip_str):
         print(f"  [ZIP] Perf log drain failed (performance logging may not be enabled): {e}")
     time.sleep(0.2)
 
-    # ── Step 1: Install JS spy (belt-and-suspenders fallback) ─────────────────
+    # -- Step 1: Install JS spy (belt-and-suspenders fallback) -----------------
     _install_network_spy_now(driver)
     time.sleep(0.2)
 
-    # ── Step 2: Install serializer + FormData patches ─────────────────────────
+    # -- Step 2: Install serializer + FormData patches -------------------------
     patch_result = driver.execute_script(_ZIP_PATCH_JS, zip_str)
     print(f"  [ZIP] Patch install: {patch_result}")
     time.sleep(0.3)
 
-    # ── Step 3: Scroll to field and focus with real mouse click ───────────────
+    # -- Step 3: Scroll to field and focus with real mouse click ---------------
     driver.execute_script(
         "arguments[0].scrollIntoView({block:'center', inline:'nearest'});", zip_field)
     time.sleep(0.4)
@@ -1468,8 +1442,8 @@ def _fill_zip_with_network_intercept(driver, zip_field, zip_str):
         ActionChains(driver).click(zip_field).perform()
         time.sleep(0.3)
 
-    # ── Step 4: Type ZIP with real ActionChains key_down/key_up ──────────────
-    # These fire through Chrome's native input pipeline — CL's keypress/keydown
+    # -- Step 4: Type ZIP with real ActionChains key_down/key_up --------------
+    # These fire through Chrome's native input pipeline -- CL's keypress/keydown
     # handlers receive them correctly, which is what triggers autocomplete.
     print(f"  [ZIP] Typing '{zip_str}' with real ActionChains key events...")
     for i, ch in enumerate(zip_str):
@@ -1481,9 +1455,9 @@ def _fill_zip_with_network_intercept(driver, zip_field, zip_str):
         time.sleep(random.uniform(0.13, 0.22))
 
         if i == 2:
-            # After 3rd digit — most autocomplete minLength is 3 or 5
+            # After 3rd digit -- most autocomplete minLength is 3 or 5
             # Give CL's debounced handler time to fire
-            print("  [ZIP] 3-digit pause (3.5s) — waiting for CL autocomplete trigger...")
+            print("  [ZIP] 3-digit pause (3.5s) -- waiting for CL autocomplete trigger...")
             time.sleep(3.5)
 
             # Log autocomplete state
@@ -1505,7 +1479,7 @@ def _fill_zip_with_network_intercept(driver, zip_field, zip_str):
 
     time.sleep(2.5)
 
-    # ── Step 5: Check for real CL dropdown and click it ───────────────────────
+    # -- Step 5: Check for real CL dropdown and click it -----------------------
     dropdown_info = driver.execute_script("""
         var result = [];
         document.querySelectorAll('.ui-autocomplete, .ui-menu, [role="listbox"]').forEach(function(m) {
@@ -1525,22 +1499,22 @@ def _fill_zip_with_network_intercept(driver, zip_field, zip_str):
 
     suggestion_clicked = False
 
-    # ── CONFIRMED ROOT CAUSE FROM LOGS ────────────────────────────────────────
-    # 1. Coord click → always fails with "move target out of bounds" because
+    # -- CONFIRMED ROOT CAUSE FROM LOGS ----------------------------------------
+    # 1. Coord click -> always fails with "move target out of bounds" because
     #    window.scrollTo(0,0) moves the page AFTER capturing getBoundingClientRect
     #    coords, making them stale.
-    # 2. JS mousedown/click events → CL's jQuery UI autocomplete ignores raw DOM
+    # 2. JS mousedown/click events -> CL's jQuery UI autocomplete ignores raw DOM
     #    mouse events on the <li>. It only listens via its internal widget handler.
-    # 3. Selenium element click → fails same as coord click (viewport mismatch).
+    # 3. Selenium element click -> fails same as coord click (viewport mismatch).
     #
     # THE FIX: ArrowDown + Enter on the focused postal field.
     # This is the ONLY path that:
     #   a) Works regardless of where dropdown renders (no viewport dependency)
     #   b) Goes through Chrome's native key pipeline
     #   c) Triggers jQuery UI's internal menu navigation (_move)
-    #   d) Fires the widget's internal select → autocompleteselect callback
+    #   d) Fires the widget's internal select -> autocompleteselect callback
     #   e) Causes CL's handler to update form state + cryptedStepCheck
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
 
     # Check if dropdown appeared
     dropdown_visible = driver.execute_script("""
@@ -1566,9 +1540,9 @@ def _fill_zip_with_network_intercept(driver, zip_field, zip_str):
         "return (function(){var inputs=document.querySelectorAll('input[type=hidden]');for(var i=0;i<inputs.length;i++){if(inputs[i].name==='cryptedStepCheck')return inputs[i].value;}return null;})();")
 
     if dropdown_visible.get('found'):
-        print("  [ZIP] Dropdown found — selecting with ArrowDown + Enter...")
+        print("  [ZIP] Dropdown found -- selecting with ArrowDown + Enter...")
         try:
-            # Re-find the element FRESH — the old reference is stale because
+            # Re-find the element FRESH -- the old reference is stale because
             # CL's autocomplete JS rebuilt the DOM when the dropdown appeared.
             # This is why StaleElementReferenceException was happening.
             zip_field = WebDriverWait(driver, 5).until(
@@ -1600,15 +1574,15 @@ def _fill_zip_with_network_intercept(driver, zip_field, zip_str):
             time.sleep(2.0)
 
             suggestion_clicked = True
-            print("  [ZIP] ArrowDown + Enter sent ✓")
+            print("  [ZIP] ArrowDown + Enter sent [OK]")
 
             # Verify value was set by the selection
             selected_val = zip_field.get_attribute("value") or ""
             print(f"  [ZIP] Value after selection: '{selected_val}'")
 
-            # ── ROOT CAUSE FIX ────────────────────────────────────────────────
+            # -- ROOT CAUSE FIX ------------------------------------------------
             # Log says: sourceType='object' = CL uses LOCAL zip dataset (no server call)
-            # Log says: 'ZIP code • autofilled' error = CL marks field as autofilled=true
+            # Log says: 'ZIP code ? autofilled' error = CL marks field as autofilled=true
             # Fix: clear the autofilled flag + directly trigger CL's internal
             # location confirmation by simulating what a real user click does.
             fix_result = driver.execute_script("""
@@ -1618,7 +1592,7 @@ def _fill_zip_with_network_intercept(driver, zip_field, zip_str):
                                document.querySelector('[name=postal_code]');
                 if (!postalEl) return ['no-postal'];
 
-                // 1. Clear CL's autofilled flag — this is what causes the error
+                // 1. Clear CL's autofilled flag -- this is what causes the error
                 postalEl.removeAttribute('data-autofilled');
                 postalEl.setAttribute('data-autofilled', 'false');
                 postalEl.removeAttribute('readonly');
@@ -1717,7 +1691,7 @@ def _fill_zip_with_network_intercept(driver, zip_field, zip_str):
             print(f"  [ZIP] Root cause fix result: {fix_result}")
             time.sleep(0.5)
 
-            # ── Directly invoke CL's autocompleteselect handler ───────────────
+            # -- Directly invoke CL's autocompleteselect handler ---------------
             # ArrowDown+Enter fires on our fake widget (from _ZIP_PATCH_JS).
             # CL's real handler is bound to the postingForm or the postal field
             # via jQuery's event system. We call it directly with the item object.
@@ -1782,7 +1756,7 @@ def _fill_zip_with_network_intercept(driver, zip_field, zip_str):
                 results.push('ancestor-fires:' + fired);
 
                 // 5. Force-set CL's internal confirmed state via any known path
-                // CL's postingform JS uses a module pattern — try known variable names
+                // CL's postingform JS uses a module pattern -- try known variable names
                 ['cl', 'CL', 'posting', 'postForm', 'pf'].forEach(function(name) {
                     if (window[name] && typeof window[name] === 'object') {
                         results.push('global:' + name + ':' + Object.keys(window[name]).slice(0,5).join(','));
@@ -1801,18 +1775,18 @@ def _fill_zip_with_network_intercept(driver, zip_field, zip_str):
             """, zip_str)
             print(f"  [ZIP] Callback invocation result: {callback_result}")
 
-            # Check cryptedStepCheck rotation — proves CL's handler fired
+            # Check cryptedStepCheck rotation -- proves CL's handler fired
             token_after = driver.execute_script(
                 "return (function(){var inputs=document.querySelectorAll('input[type=hidden]');"
                 "for(var i=0;i<inputs.length;i++){"
                 "if(inputs[i].name==='cryptedStepCheck')return inputs[i].value;"
                 "}return null;})()")
             if token_after and token_before and token_after != token_before:
-                print("  [ZIP] ✅ cryptedStepCheck ROTATED — CL confirmed the ZIP!")
+                print("  [ZIP] [OK] cryptedStepCheck ROTATED -- CL confirmed the ZIP!")
                 print(f"  [ZIP] before: {str(token_before)[:60]}")
                 print(f"  [ZIP] after:  {str(token_after)[:60]}")
             else:
-                print("  [ZIP] ⚠ cryptedStepCheck did NOT rotate after callback")
+                print("  [ZIP] [WARN] cryptedStepCheck did NOT rotate after callback")
                 print(f"  [ZIP] token: {str(token_before)[:60]}")
 
         except Exception as e:
@@ -1840,21 +1814,21 @@ def _fill_zip_with_network_intercept(driver, zip_field, zip_str):
             "if(inputs[i].name==='cryptedStepCheck')return inputs[i].value;"
             "}return null;})()")
         if token_after_tab and token_before and token_after_tab != token_before:
-            print("  [ZIP] ✅ cryptedStepCheck rotated after Tab — ZIP accepted!")
+            print("  [ZIP] [OK] cryptedStepCheck rotated after Tab -- ZIP accepted!")
         else:
-            print("  [ZIP] ⚠ cryptedStepCheck unchanged after Tab")
+            print("  [ZIP] [WARN] cryptedStepCheck unchanged after Tab")
 
-    # ── Step 6: Wait for AJAX to complete ────────────────────────────────────
+    # -- Step 6: Wait for AJAX to complete ------------------------------------
     print("  [ZIP] Waiting for AJAX after ZIP entry...")
     try:
         WebDriverWait(driver, 10).until(
             lambda d: d.execute_script("return typeof jQuery==='undefined' || jQuery.active===0"))
-        print("  [ZIP] AJAX complete ✓")
+        print("  [ZIP] AJAX complete [OK]")
     except Exception:
         print("  [ZIP] AJAX wait timed out")
     time.sleep(1.5)
 
-    # ── Step 7: CDP perf log — primary geo capture ────────────────────────────
+    # -- Step 7: CDP perf log -- primary geo capture ----------------------------
     print("  [ZIP] Polling CDP perf log for geo response...")
     geo_body = None
     geo_url_found = None
@@ -1904,11 +1878,11 @@ def _fill_zip_with_network_intercept(driver, zip_field, zip_str):
             break
         time.sleep(0.35)
 
-    # ── Step 8: Inject geo fields ─────────────────────────────────────────────
+    # -- Step 8: Inject geo fields ---------------------------------------------
     geo_injected = False
 
     if geo_body and geo_body.strip() not in ("", "[]"):
-        print(f"  [GEO] ✓ Real geo response captured via CDP perf log from: {geo_url_found}")
+        print(f"  [GEO] [OK] Real geo response captured via CDP perf log from: {geo_url_found}")
         geo_injected = _inject_geo_hidden_fields(driver, geo_body, zip_str)
     else:
         print("  [GEO] CDP perf log: no geo response captured")
@@ -1973,11 +1947,11 @@ def _fill_zip_with_network_intercept(driver, zip_field, zip_str):
             print(f"  [GEO] Direct fetch from: {geo_url}")
             _inject_geo_hidden_fields(driver, geo_text, zip_str)
         else:
-            print("  [GEO] ⚠ No geo response from any method")
-            print("  [GEO] ⚠ cryptedStepCheck will not include confirmed ZIP")
-            print("  [GEO] ⚠ Verify goog:loggingPrefs is set in ChromeOptions")
+            print("  [GEO] [WARN] No geo response from any method")
+            print("  [GEO] [WARN] cryptedStepCheck will not include confirmed ZIP")
+            print("  [GEO] [WARN] Verify goog:loggingPrefs is set in ChromeOptions")
 
-    # ── Step 9: Force-set field value ─────────────────────────────────────────
+    # -- Step 9: Force-set field value -----------------------------------------
     zip_field = _find_field(driver, [
         "[name='postal']", "[name='postal_code']",
         "input#postal_code", "input#postal",
@@ -1985,7 +1959,7 @@ def _fill_zip_with_network_intercept(driver, zip_field, zip_str):
 
     actual = (zip_field.get_attribute("value") or "") if zip_field else ""
     if actual != zip_str and zip_field:
-        print(f"  [ZIP] Value is '{actual}' — force-setting to '{zip_str}'")
+        print(f"  [ZIP] Value is '{actual}' -- force-setting to '{zip_str}'")
         driver.execute_script("""
             var el = arguments[0], v = arguments[1];
             Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(el, v);
@@ -1995,9 +1969,9 @@ def _fill_zip_with_network_intercept(driver, zip_field, zip_str):
         time.sleep(0.3)
 
     actual = (zip_field.get_attribute("value") or "") if zip_field else zip_str
-    print(f"  ✓ [ZIP] = '{actual}'")
+    print(f"  [OK] [ZIP] = '{actual}'")
 
-    # ── Step 10: Log hidden fields ────────────────────────────────────────────
+    # -- Step 10: Log hidden fields --------------------------------------------
     hidden = driver.execute_script("""
         var r = {};
         document.querySelectorAll('input[type="hidden"]').forEach(function(e) {
@@ -2032,13 +2006,13 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
         WebDriverWait(driver, 15).until(
             EC.presence_of_element_located((By.ID, "postingForm")))
     except TimeoutException:
-        print("  ✗ postingForm not found")
+        print("  [FAIL] postingForm not found")
         return None
 
     handle_captcha_if_present(driver)
     _wait_for_cl_js_init(driver)
 
-    # ── DIAGNOSTIC: Read edit page initial state BEFORE touching anything ─────
+    # -- DIAGNOSTIC: Read edit page initial state BEFORE touching anything -----
     try:
         initial_state = driver.execute_script("""
             var r = {};
@@ -2069,42 +2043,42 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
 
     print(f"  [fill] title='{title[:50]}' price={price} zip={zip_code} city={city_name}")
 
-    # ── 1. Title ──────────────────────────────────────────────────────────────
+    # -- 1. Title --------------------------------------------------------------
     title_field = _find_field(driver, [
         "[name='PostingTitle']", "input#PostingTitle", "input#title",
     ])
     if title_field:
         _cdp_type(driver, title_field, title)
         actual = title_field.get_attribute("value") or ""
-        print(f"  ✓ [title] = '{actual[:60]}'")
+        print(f"  [OK] [title] = '{actual[:60]}'")
     else:
-        print("  ✗ [title] field not found!")
+        print("  [FAIL] [title] field not found!")
         return None
     time.sleep(random.uniform(0.4, 0.7))
 
-    # ── 2. Price ──────────────────────────────────────────────────────────────
+    # -- 2. Price --------------------------------------------------------------
     price_field = _find_field(driver, [
         "[name='price']", "[name='AskingPrice']", "[name='AskPrice']", "input#price",
     ])
     if price_field:
         _cdp_type(driver, price_field, price)
         actual = price_field.get_attribute("value") or ""
-        print(f"  ✓ [price] = '{actual}'")
+        print(f"  [OK] [price] = '{actual}'")
     else:
-        print("  ⚠ [price] field not found")
+        print("  [WARN] [price] field not found")
     time.sleep(random.uniform(0.3, 0.6))
 
-    # ── 3. City / neighborhood ────────────────────────────────────────────────
+    # -- 3. City / neighborhood ------------------------------------------------
     city_field = _find_field(driver, [
         "[name='geographic_area']", "input#geographic_area", "[name='city']",
     ])
     if city_field and city_name:
         _cdp_type(driver, city_field, city_name)
         actual = city_field.get_attribute("value") or ""
-        print(f"  ✓ [city] = '{actual}'")
+        print(f"  [OK] [city] = '{actual}'")
     time.sleep(random.uniform(0.3, 0.5))
 
-    # ── 4. ZIP — simple fill like price field, no dropdown magic ────────────
+    # -- 4. ZIP -- simple fill like price field, no dropdown magic ------------
     if zip_code:
         zip_str = str(zip_code).strip()
         zip_field = _find_field(driver, [
@@ -2114,37 +2088,37 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
         if zip_field:
             _cdp_type(driver, zip_field, zip_str)
             actual = zip_field.get_attribute("value") or ""
-            print(f"  ✓ [ZIP] = '{actual}'")
+            print(f"  [OK] [ZIP] = '{actual}'")
         else:
-            print("  ⚠ [ZIP] field not found")
+            print("  [WARN] [ZIP] field not found")
 
-    # ── 5. Description ────────────────────────────────────────────────────────
+    # -- 5. Description --------------------------------------------------------
     desc_field = _find_field(driver, [
         "[name='PostingBody']", "textarea#PostingBody", "textarea#description",
     ])
     if desc_field:
         _cdp_type(driver, desc_field, description)
         actual = (desc_field.get_attribute("value") or "")[:40]
-        print(f"  ✓ [description] = '{actual}'")
+        print(f"  [OK] [description] = '{actual}'")
     else:
-        print("  ✗ [description] field not found!")
+        print("  [FAIL] [description] field not found!")
         return None
     time.sleep(random.uniform(0.4, 0.7))
 
-    # ── 6. Email if editable ──────────────────────────────────────────────────
+    # -- 6. Email if editable --------------------------------------------------
     try:
         email_el = driver.find_element(By.CSS_SELECTOR, "[name='FromEMail']")
         if not email_el.get_attribute("disabled") and not email_el.get_attribute("readOnly"):
             if cl_email:
                 _cdp_type(driver, email_el, cl_email)
-                print(f"  ✓ [email] = '{cl_email}'")
+                print(f"  [OK] [email] = '{cl_email}'")
         else:
             print("  [email] Pre-filled by account")
     except Exception:
         pass
     time.sleep(random.uniform(0.4, 0.6))
 
-    # ── Wait for AJAX ─────────────────────────────────────────────────────────
+    # -- Wait for AJAX ---------------------------------------------------------
     try:
         WebDriverWait(driver, 8).until(
             lambda d: d.execute_script("return typeof jQuery==='undefined' || jQuery.active == 0"))
@@ -2152,7 +2126,7 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
         pass
     time.sleep(0.5)
 
-    # ── Payload capture ───────────────────────────────────────────────────────
+    # -- Payload capture -------------------------------------------------------
     capture_result = driver.execute_script("""
         var zipVal = arguments[0];
         var form = document.getElementById('postingForm');
@@ -2191,7 +2165,7 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     print(f"  [payload] postal in jQuery serialized : {capture_result.get('postalInJQ', 'MISSING')}")
     print(f"  [payload] native FormData             : {capture_result.get('nativeFormData', 'N/A')}")
 
-    # ── Find submit button ────────────────────────────────────────────────────
+    # -- Find submit button ----------------------------------------------------
     print("  [submit] Finding and clicking Continue button...")
     submitted = False
     submit_btn = None
@@ -2219,9 +2193,9 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
         except Exception:
             continue
 
-    # JS fallback — find any submit button on page
+    # JS fallback -- find any submit button on page
     if not submit_btn:
-        print("  [submit] Selenium selectors failed — trying JS button find...")
+        print("  [submit] Selenium selectors failed -- trying JS button find...")
         try:
             result = driver.execute_script("""
                 var btns = Array.from(document.querySelectorAll('button,input[type=submit]'));
@@ -2249,12 +2223,12 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
                     }
                 """)
                 submitted = True
-                print("  [submit] JS click sent ✓")
+                print("  [submit] JS click sent [OK]")
         except Exception as je:
             print(f"  [submit] JS fallback failed: {je}")
 
     if not submit_btn and not submitted:
-        print("  [submit] ✗ No submit button found!")
+        print("  [submit] [FAIL] No submit button found!")
         return None
 
     if submit_btn:
@@ -2274,7 +2248,7 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
         #         if (window.jQuery) jQuery(pEl).val(arguments[0]);
         #     }
         # """, str(zip_code).strip())
-        # ✅ FORCE FILL ALL FIELDS + ZIP BYPASS before submit
+        # [OK] FORCE FILL ALL FIELDS + ZIP BYPASS before submit
         driver.execute_script("""
             (function(t, p, d, e, z) {
                 function setVal(sel, val) {
@@ -2331,13 +2305,13 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
             ActionChains(driver).move_to_element(submit_btn).pause(
                 random.uniform(0.3, 0.6)).click().perform()
             submitted = True
-            print("  [submit] Clicked via ActionChains ✓")
+            print("  [submit] Clicked via ActionChains [OK]")
         except Exception as e:
             print(f"  [submit] ActionChains failed ({e})")
             try:
                 driver.execute_script("arguments[0].click();", submit_btn)
                 submitted = True
-                print("  [submit] JS click fallback ✓")
+                print("  [submit] JS click fallback [OK]")
             except Exception as e2:
                 print(f"  [submit] JS click also failed: {e2}")
 
@@ -2368,7 +2342,7 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
                 return 'direct-click';
             """, submit_btn)
             submitted = True
-            print(f"  [submit] Fallback: {result} ✓")
+            print(f"  [submit] Fallback: {result} [OK]")
         except Exception as e:
             print(f"  [submit] Fallback also failed: {e}")
 
@@ -2388,7 +2362,7 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
                 matches = re.findall(r'postal[^=&]*=[^&]{0,20}', body, re.IGNORECASE)
                 print(f"  [payload] [{i}] POSTAL in body: {matches}")
     else:
-        print("  [payload] No XHR/fetch POST captured — CL uses native form submit")
+        print("  [payload] No XHR/fetch POST captured -- CL uses native form submit")
 
     native_payloads = driver.execute_script("return window._clNativeSubmitPayloads || [];")
     if native_payloads:
@@ -2413,17 +2387,17 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
         """)
         print(f"  [payload] All form fields at submit time: {form_html}")
 
-    # ── Wait to leave the edit page ───────────────────────────────────────────
-    deadline = time.time() + 35
+    # -- Wait to leave the edit page -------------------------------------------
+    deadline = time.time() + 15
     while time.time() < deadline:
         cur = driver.current_url
         if "s=edit" not in cur:
-            print(f"  ✅ Left edit page → {cur}")
+            print(f"  [OK] Left edit page -> {cur}")
             return cur
         time.sleep(0.5)
 
-    # Still stuck — log validation errors and attempt recovery
-    print("  [submit] Still on edit page after 35s — checking for validation errors...")
+    # Still stuck -- log validation errors and attempt recovery
+    print("  [submit] Still on edit page after 35s -- checking for validation errors...")
     try:
         for fname, selectors in [
             ("PostingTitle", ["[name='PostingTitle']"]),
@@ -2497,7 +2471,7 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
                     print("  [submit] Recovery click sent")
                     time.sleep(10)
                     if "s=edit" not in driver.current_url:
-                        print(f"  ✅ Recovery worked → {driver.current_url}")
+                        print(f"  [OK] Recovery worked -> {driver.current_url}")
                         return driver.current_url
                     break
             except Exception:
@@ -2505,7 +2479,7 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     except Exception as debug_err:
         print(f"  [debug] Error during debug: {debug_err}")
 
-    print("  ❌ Submit failed")
+    print("  [FAIL] Submit failed")
     return None
 
 
@@ -2557,10 +2531,10 @@ def fill_listing_details(driver, product: dict):
         driver, product, zip_code, city_name, cl_email)
 
     if result_url and "s=edit" not in result_url:
-        print(f"  ✓ Form submitted → {result_url}")
+        print(f"  [OK] Form submitted -> {result_url}")
         return True
 
-    print("  ✗ Still on edit page after form submit")
+    print("  [FAIL] Still on edit page after form submit")
     return False
 
 
@@ -2575,38 +2549,184 @@ def _click_first(driver, selectors, label="button"):
                     random.uniform(0.2, 0.5)).click().perform()
             except Exception:
                 driver.execute_script("arguments[0].click();", el)
-            print(f"  ✓ Clicked {label} ({sel[:50]})")
+            print(f"  [OK] Clicked {label} ({sel[:50]})")
             return True
         except Exception:
             continue
     return False
 
 
-def _wait_for_images_page(driver, timeout=20):
-    print("  [images] Waiting for image upload page...")
+def _click_geoverify_button(driver):
+    """Try clicking through a geoverify page. Returns True if we left it."""
     try:
-        WebDriverWait(driver, timeout).until(lambda d: (
-            "s=images" in d.current_url
-            or d.find_elements(By.ID, "done_with_images_button")
-            or d.find_elements(By.ID, "add_photos_button")
-            or "done with images" in (d.page_source or "").lower()
-        ))
-        print(f"  [images] Page ready → {driver.current_url}")
-        return True
-    except TimeoutException:
-        print(f"  [images] Timed out — URL: {driver.current_url}")
+        WebDriverWait(driver, 12).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR,
+                "button[type='submit'], button.go, input[type='submit'], button")))
+        time.sleep(0.8)
+        btns = driver.find_elements(By.CSS_SELECTOR,
+            "button[type='submit'], button.go, input[type='submit'], button")
+        btn = None
+        for b in btns:
+            txt = (b.text or b.get_attribute("value") or "").strip().lower()
+            if any(k in txt for k in ("continue", "confirm", "looks good",
+                                       "ok", "next", "accept", "proceed", "verify")):
+                btn = b
+                break
+        if not btn:
+            for b in btns:
+                if b.is_displayed() and b.is_enabled():
+                    btn = b
+                    break
+        if not btn:
+            print("  [geoverify] [WARN] No clickable button found")
+            return False
+        txt = (btn.text or btn.get_attribute("value") or "").strip()
+        print(f"  [geoverify] Clicking: '{txt}'")
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
+        time.sleep(0.3)
+        try:
+            driver.execute_script("arguments[0].click();", btn)
+        except Exception:
+            ActionChains(driver).move_to_element(btn).click().perform()
+        try:
+            WebDriverWait(driver, 15).until(
+                lambda d: "s=geoverify" not in d.current_url)
+            print(f"  [geoverify] [OK] Left geoverify -> {driver.current_url}")
+            return True
+        except TimeoutException:
+            print(f"  [geoverify] Still on geoverify after click -- URL: {driver.current_url}")
+            # Dump page source for diagnosis
+            src_snippet = driver.page_source[:2000] if driver.page_source else "N/A"
+            print(f"  [geoverify] Page source snippet: {src_snippet[:500]}")
+            return False
+    except Exception as e:
+        print(f"  [geoverify] Error: {e}")
         return False
 
 
+def _wait_for_images_page(driver, timeout=30):
+    print("  [images] Waiting for image upload page...")
+    print(f"  [images] Current URL before wait: {driver.current_url}")
+
+    def _on_images_or_preview(d):
+        url = d.current_url
+        return (
+            "s=images" in url
+            or "s=preview" in url
+            or d.find_elements(By.ID, "done_with_images_button")
+            or d.find_elements(By.ID, "add_photos_button")
+            or "done with images" in (d.page_source or "").lower()
+        )
+
+    # Phase 1: wait for images/preview OR geoverify (30s)
+    try:
+        WebDriverWait(driver, timeout).until(lambda d: (
+            _on_images_or_preview(d) or "s=geoverify" in d.current_url
+        ))
+    except TimeoutException:
+        print(f"  [images] Timed out waiting -- URL: {driver.current_url}")
+        print(f"  [images] Page title: {driver.title}")
+        return False
+
+    print(f"  [images] Landed on: {driver.current_url}")
+
+    # Phase 2: handle geoverify
+    if "s=geoverify" in driver.current_url:
+        print("  [images] [WARN] Geoverify page -- attempting bypass (3 attempts)...")
+        for attempt in range(3):
+            print(f"  [images] Geoverify attempt {attempt+1}/3")
+            if _click_geoverify_button(driver):
+                break
+            time.sleep(3)
+
+        if "s=geoverify" in driver.current_url:
+            # Non-US IP permanently blocked. The listing IS submitted in CL's
+            # system. Skip images, attempt publish -- ad still goes live.
+            print("  [images] [WARN] Geoverify unpassable (non-US IP / ZIP mismatch).")
+            print("  [images] [WARN] Skipping image step -- going straight to publish.")
+            return True  # non-fatal
+
+        # Wait again for images/preview after geoverify (fresh 20s)
+        try:
+            WebDriverWait(driver, 20).until(_on_images_or_preview)
+        except TimeoutException:
+            if _on_images_or_preview(driver):
+                pass
+            else:
+                print(f"  [images] Post-geoverify: CL skipped images -- URL: {driver.current_url}")
+                return True  # CL sometimes skips images entirely
+
+    print(f"  [images] Page ready -> {driver.current_url}")
+    return True
+
+
 def complete_images_step(driver, product: dict):
-     # ── FIX: Already on preview page (CL skipped images step) ──
+     # -- FIX: Already on preview page (CL skipped images step) --
+    # Wait for editimage if we're not there yet
+    # Wait for editimage or preview after form submit
+    cur = driver.current_url
+    print(f"  [images] Checking URL: {cur}")
+    if "s=editimage" not in cur and "s=preview" not in cur:
+        print(f"  [images] Waiting for editimage/preview...")
+        try:
+            WebDriverWait(driver, 25).until(lambda d: (
+                "s=editimage" in d.current_url
+                or "s=preview" in d.current_url
+                or "s=images" in d.current_url
+                or "s=geoverify" in d.current_url
+                or d.find_elements(By.CSS_SELECTOR, "input[type='file']")
+                or "done with images" in (d.page_source or "").lower()
+            ))
+            print(f"  [images] Landed: {driver.current_url}")
+        except TimeoutException:
+            print(f"  [images] Timed out waiting: {driver.current_url}")
+        # Handle geoverify
+        if "s=geoverify" in driver.current_url:
+            print("  [images] Geoverify -- bypassing...")
+            for _ in range(3):
+                if _click_geoverify_button(driver): break
+                time.sleep(3)
+            try:
+                WebDriverWait(driver, 20).until(lambda d:
+                    "s=editimage" in d.current_url or "s=preview" in d.current_url
+                    or "s=images" in d.current_url)
+                print(f"  [images] Post-geoverify: {driver.current_url}")
+            except TimeoutException:
+                print(f"  [images] Post-geoverify timeout: {driver.current_url}")
+
+    if "s=editimage" not in driver.current_url and "s=preview" not in driver.current_url:
+        print(f"  [images] Waiting for editimage from: {driver.current_url}")
+        try:
+            WebDriverWait(driver, 25).until(lambda d: (
+                "s=editimage" in d.current_url or "s=preview" in d.current_url
+                or "s=images" in d.current_url or "s=geoverify" in d.current_url
+                or d.find_elements(By.CSS_SELECTOR, "input[type='file']")
+            ))
+            print(f"  [images] Landed: {driver.current_url}")
+        except TimeoutException:
+            print(f"  [images] Timed out: {driver.current_url}")
+        # Handle geoverify
+        if "s=geoverify" in driver.current_url:
+            print("  [images] Geoverify -- bypassing...")
+            for _ in range(3):
+                if _click_geoverify_button(driver): break
+                time.sleep(3)
+            try:
+                WebDriverWait(driver, 20).until(lambda d:
+                    "s=editimage" in d.current_url or "s=preview" in d.current_url)
+            except TimeoutException:
+                pass
     if "s=preview" in driver.current_url:
-        print("  [images] Already on preview — CL skipped images step ✓")
+        print("  [images] Already on preview -- CL skipped images step [OK]")
         return True
 
     if not _wait_for_images_page(driver):
         if "s=preview" in driver.current_url:
-            print("  [images] Timed out but on preview — continuing ✓")
+            print("  [images] Timed out but on preview -- continuing [OK]")
+            return True
+        if "s=geoverify" in driver.current_url:
+            # Still stuck -- can't pass geoverify. Skip images.
+            print("  [images] Stuck on geoverify after all attempts -- skipping images, trying publish.")
             return True
         return False
 
@@ -2621,9 +2741,16 @@ def complete_images_step(driver, product: dict):
             try:
                 tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
                 tmp.close()
+                print(f"  [images] Downloading: {p[:80]}")
                 urllib.request.urlretrieve(p, tmp.name)
-                valid.append(tmp.name)
-                temp_files.append(tmp.name)
+                size = os.path.getsize(tmp.name)
+                print(f"  [images] Downloaded {size} bytes -> {tmp.name}")
+                if size > 1000:  # skip tiny/failed downloads
+                    valid.append(tmp.name)
+                    temp_files.append(tmp.name)
+                else:
+                    print(f"  [images] Skipping tiny file ({size} bytes)")
+                    os.unlink(tmp.name)
             except Exception as e:
                 print(f"  [images] Could not download {p}: {e}")
         elif isinstance(p, str) and os.path.isfile(p):
@@ -2632,30 +2759,50 @@ def complete_images_step(driver, product: dict):
     try:
         if valid:
             print(f"  [images] Uploading {len(valid)} photo(s)...")
-            try:
-                file_input = None
-                for by, sel in [
-                    (By.ID, "fileInput"),
-                    (By.CSS_SELECTOR, "input[type='file']"),
-                ]:
-                    try:
-                        file_input = driver.find_element(by, sel)
-                        break
-                    except NoSuchElementException:
-                        continue
+            # Make file input visible if hidden (CL editimage page hides it)
+            driver.execute_script("""
+                var inputs = document.querySelectorAll('input[type="file"]');
+                inputs.forEach(function(el) {
+                    el.style.display = 'block';
+                    el.style.opacity = '1';
+                    el.style.visibility = 'visible';
+                    el.removeAttribute('hidden');
+                });
+            """)
+            time.sleep(0.5)
 
-                if file_input:
-                    for path in valid:
-                        file_input.send_keys(os.path.abspath(path))
-                        human_delay(1.5, 3)
-                    print(f"  [images] Sent {len(valid)} file(s) to input")
-                    human_delay(6, 10)
-                else:
-                    print("  [images] ⚠ No file input found")
-            except Exception as e:
-                print(f"  [images] Upload error: {e}")
+            file_input = None
+            for by, sel in [
+                (By.ID, "fileInput"),
+                (By.CSS_SELECTOR, "input[type='file']"),
+                (By.XPATH, "//input[@type='file']"),
+            ]:
+                try:
+                    file_input = driver.find_element(by, sel)
+                    print(f"  [images] Found file input: {sel}")
+                    break
+                except NoSuchElementException:
+                    continue
+
+            if file_input:
+                for path in valid:
+                    abs_path = os.path.abspath(path)
+                    print(f"  [images] Sending file: {abs_path}")
+                    file_input.send_keys(abs_path)
+                    human_delay(3, 5)
+                print(f"  [images] Sent {len(valid)} file(s) — waiting for upload...")
+                human_delay(8, 12)
+                # Check if upload happened
+                uploaded = driver.execute_script("""
+                    var imgs = document.querySelectorAll('.thumb img, .upload-thumb img, img.preview');
+                    return imgs.length;
+                """)
+                print(f"  [images] Upload thumbnails visible: {uploaded}")
+            else:
+                print("  [images] [WARN] No file input found on page")
+                print(f"  [images] Page: {driver.current_url}")
         else:
-            print("  [images] No photos — proceeding to done with images")
+            print("  [images] No photos in product -- skipping upload")
 
         done_selectors = [
             (By.ID, "done_with_images_button"),
@@ -2664,7 +2811,7 @@ def complete_images_step(driver, product: dict):
             (By.XPATH, "//input[@type='submit' and contains(translate(@value,'DONE','done'),'done')]"),
         ]
         if not _click_first(driver, done_selectors, "done with images"):
-            print("  [images] ✗ Could not find 'done with images' button")
+            print("  [images] [FAIL] Could not find 'done with images' button")
             return False
 
         human_delay(3, 5)
@@ -2678,10 +2825,10 @@ def complete_images_step(driver, product: dict):
                 or d.find_elements(By.ID, "publish_button")
                 or "unpublished draft" in (d.page_source or "").lower()
             ))
-            print(f"  [images] ✓ Reached draft preview → {driver.current_url}")
+            print(f"  [images] [OK] Reached draft preview -> {driver.current_url}")
             return True
         except TimeoutException:
-            print(f"  [images] ⚠ Preview not detected — URL: {driver.current_url}")
+            print(f"  [images] [WARN] Preview not detected -- URL: {driver.current_url}")
             return "s=edit" not in driver.current_url and "s=images" not in driver.current_url
     finally:
         for tf in temp_files:
@@ -2704,10 +2851,10 @@ def _wait_for_draft_preview(driver, timeout=20):
             or d.find_elements(By.ID, "publish_button")
             or "unpublished draft" in (d.page_source or "").lower()
         ))
-        print(f"  [publish] Draft page ready → {driver.current_url}")
+        print(f"  [publish] Draft page ready -> {driver.current_url}")
         return True
     except TimeoutException:
-        print(f"  [publish] ⚠ Draft page not detected — URL: {driver.current_url}")
+        print(f"  [publish] [WARN] Draft page not detected -- URL: {driver.current_url}")
         return False
 
 
@@ -2741,7 +2888,7 @@ def _submit_publish_form(driver):
             btn.click();
             return {ok: true, method: 'click', form: form.id};
         """) or {}
-        print(f"  [publish] form submit → {result}")
+        print(f"  [publish] form submit -> {result}")
         if result.get("ok"):
             time.sleep(4)
             if "s=preview" not in driver.current_url:
@@ -2763,7 +2910,7 @@ def publish_listing(driver, ad_name, product):
     _wait_for_draft_preview(driver)
     human_delay(2, 4)
 
-    # ── DEBUG: Page source dump karo pehle ──
+    # -- DEBUG: Page source dump karo pehle --
     try:
         page_html = driver.execute_script("return document.body.innerHTML.substring(0, 3000);")
         print(f"  [publish] Page HTML snippet: {page_html[:1500]}")
@@ -2772,7 +2919,7 @@ def publish_listing(driver, ad_name, product):
 
     published = False
 
-    # Method 1: JS direct click — forms + any link with publish/confirm text
+    # Method 1: JS direct click -- forms + any link with publish/confirm text
     try:
         result = driver.execute_script("""
             // Try publish_bottom / publish_top forms
@@ -2829,11 +2976,11 @@ def publish_listing(driver, ad_name, product):
         if "s=preview" not in cur and "s=edit" not in cur:
             published = True
         elif result and result != 'no-clickable-found':
-            # Click hua — URL same hai but maybe page navigated internally
+            # Click hua -- URL same hai but maybe page navigated internally
             # Check page source change
             if "thank" in driver.page_source.lower() or "success" in driver.page_source.lower():
                 published = True
-                print("  [publish] ✓ Success detected in page source")
+                print("  [publish] [OK] Success detected in page source")
     except Exception as e:
         print(f"  [publish] JS click failed: {e}")
 
@@ -2841,7 +2988,7 @@ def publish_listing(driver, ad_name, product):
     if not published:
         try:
             cur_url = driver.current_url
-            # CL preview URL format: ?s=preview — try changing to s=fin or s=done
+            # CL preview URL format: ?s=preview -- try changing to s=fin or s=done
             confirm_url = cur_url.replace("?s=preview", "?s=fin")
             if confirm_url != cur_url:
                 print(f"  [publish] Trying direct navigate: {confirm_url}")
@@ -2849,7 +2996,7 @@ def publish_listing(driver, ad_name, product):
                 time.sleep(4)
                 if "s=preview" not in driver.current_url:
                     published = True
-                    print("  [publish] ✓ Direct navigate worked")
+                    print("  [publish] [OK] Direct navigate worked")
         except Exception as e:
             print(f"  [publish] Direct navigate failed: {e}")
 
@@ -2877,7 +3024,7 @@ def publish_listing(driver, ad_name, product):
             print(f"  [publish] ActionChains sweep failed: {e}")
 
     if not published:
-        print(f"  [publish] ✗ All methods failed — URL: {driver.current_url}")
+        print(f"  [publish] [FAIL] All methods failed -- URL: {driver.current_url}")
         # Full page source for debug
         try:
             print(f"  [publish] Full page title: {driver.title}")
@@ -2891,7 +3038,7 @@ def publish_listing(driver, ad_name, product):
     handle_captcha_if_present(driver)
 
     listing_url = driver.current_url
-    print(f"  [publish] ✓ Published → {listing_url}")
+    print(f"  [publish] [OK] Published -> {listing_url}")
     posted_listings[ad_name] = {
         "url": listing_url, "post_time": datetime.now(),
         "visitors": 0, "platform": "Craigslist",
@@ -2913,11 +3060,11 @@ def post_product(driver, ad_name, product):
             EC.element_to_be_clickable((By.LINK_TEXT, "make new post"))
         )
         driver.execute_script("arguments[0].click();", new_post_link)
-        print("  ✓ Clicked 'make new post'")
+        print("  [OK] Clicked 'make new post'")
         human_delay(3, 5)
     except TimeoutException:
         # Fallback: direct URL
-        print("  'make new post' not found — falling back to direct URL")
+        print("  'make new post' not found -- falling back to direct URL")
         driver.get("https://post.craigslist.org/c/sss")
         human_delay(4, 7)
 
@@ -2935,10 +3082,10 @@ def post_product(driver, ad_name, product):
     print(f"  Current URL: {driver.current_url}")
 
     if "login" in driver.current_url.lower():
-        print("  ✗ Session expired.")
+        print("  [FAIL] Session expired.")
         return False
 
-    # ── DIAGNOSTIC: Dump area page inputs + try to fill ZIP if field exists ────
+    # -- DIAGNOSTIC: Dump area page inputs + try to fill ZIP if field exists ----
     _area_zip = (os.environ.get("CL_ZIP") or "").strip()
     if not _area_zip:
         _AREA_ZIPS = {
@@ -2979,7 +3126,7 @@ def post_product(driver, ad_name, product):
         print(f"  [AREA-DIAG] ZIP field on area page: {zip_on_area}")
         if zip_on_area and zip_on_area.get("found"):
             _fname = zip_on_area.get("name") or zip_on_area.get("id") or ""
-            print(f"  [AREA-DIAG] *** ZIP FIELD FOUND ON AREA PAGE — filling {_area_zip} ***")
+            print(f"  [AREA-DIAG] *** ZIP FIELD FOUND ON AREA PAGE -- filling {_area_zip} ***")
             driver.execute_script("""
                 var n = arguments[0], z = arguments[1];
                 var el = document.getElementById(n) || document.getElementsByName(n)[0];
@@ -2989,114 +3136,99 @@ def post_product(driver, ad_name, product):
                     el.dispatchEvent(new Event('change', {bubbles:true}));
                 }
             """, _fname, _area_zip)
-            print(f"  [AREA-DIAG] ZIP filled on area page ✓")
+            print(f"  [AREA-DIAG] ZIP filled on area page [OK]")
         else:
             print(f"  [AREA-DIAG] No ZIP field on area page (will fill on edit page)")
     except Exception as _e2:
         print(f"  [AREA-DIAG] ZIP check failed: {_e2}")
 
-    # ── Handle "copy from another" page ──────────────────────────────────────
-    if "copyfromanother" in driver.current_url or "s=copyfromanother" in driver.current_url:
-        print("  [copy] CL asking to re-use previous data — clicking 'skip'")
-        try:
-            # "skip" button click karo taake fresh form mile
-            skip_btn = WebDriverWait(driver, 8).until(
-                EC.element_to_be_clickable((By.XPATH,
-                    "//button[normalize-space(.)='skip'] | //input[@value='skip']")))
-            driver.execute_script("arguments[0].click();", skip_btn)
-            print("  [copy] ✓ Skipped copy-from-another")
-            human_delay(2, 3)
-            handle_captcha_if_present(driver)
-        except Exception as e:
-            print(f"  [copy] skip failed: {e}")
+    
+    # -- City selection (robust) -------------------------------------------
+    cur = driver.current_url
+    print(f"  [city] URL before city: {cur}")
+    if "s=area" not in cur and "copyfromanother" not in cur:
+        print(f"  [city] Already past area page")
+    else:
+        # If on copyfromanother, skip it first
+        if "copyfromanother" in driver.current_url:
+            try:
+                skip = WebDriverWait(driver, 5).until(
+                    EC.element_to_be_clickable((By.XPATH,
+                        "//button[normalize-space(.)='skip'] | //input[@value='skip']")))
+                driver.execute_script("arguments[0].click();", skip)
+                human_delay(2, 3)
+                print(f"  [city] Skipped copy page -> {driver.current_url}")
+            except Exception:
+                try:
+                    cont = WebDriverWait(driver, 5).until(
+                        EC.element_to_be_clickable((By.CSS_SELECTOR,
+                            "button[type='submit'], button.go")))
+                    driver.execute_script("arguments[0].click();", cont)
+                    human_delay(2, 3)
+                except Exception as ce:
+                    print(f"  [city] Could not leave copy page: {ce}")
 
-    # ── Handle already on edit page (CL skipped area/type/category) ──────────
-    if "s=edit" in driver.current_url:
-        print("  [edit] Already on edit page — skipping area/type/category steps")
-        try:
-            success = fill_listing_details(driver, product)
-        except Exception as e:
-            print(f"  ✗ fill_listing_details crashed: {e}")
-            import traceback
-            traceback.print_exc()
-            return False
-        if not success:
-            return False
-        if not complete_images_step(driver, product):
-            print("  ✗ Failed at image upload step")
-            return False
-        if not publish_listing(driver, ad_name, product):
-            print("  ✗ Failed at publish step")
-            return False
-        return True
-    # ── City selection ────────────────────────────────────────────────────────
-    try:
-        city_button = WebDriverWait(driver, 5).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "span#ui-id-1-button")))
-        driver.execute_script("arguments[0].click();", city_button)
-        human_delay(2, 3)
-        menu_items = WebDriverWait(driver, 5).until(
-            EC.presence_of_all_elements_located((By.CSS_SELECTOR, "ul#ui-id-1-menu li")))
+        # Try city dropdown
         city_clicked = False
-        target = CL_CITY.lower().replace(" ", "").replace("-", "")
-        for item in menu_items:
-            txt = (item.text.strip() or item.get_attribute("textContent").strip())
-            if target in txt.lower().replace(" ", "") or txt.lower().replace(" ", "") in target:
-                driver.execute_script("arguments[0].click();", item)
-                city_clicked = True
-                print(f"  ✓ Selected city: {txt}")
-                break
-        if not city_clicked:
+        try:
+            city_button = WebDriverWait(driver, 8).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "span#ui-id-1-button")))
+            driver.execute_script("arguments[0].click();", city_button)
+            human_delay(1, 2)
+            menu_items = WebDriverWait(driver, 5).until(
+                EC.presence_of_all_elements_located((By.CSS_SELECTOR, "ul#ui-id-1-menu li")))
+            target = CL_CITY.lower().replace(" ", "").replace("-", "")
             for item in menu_items:
-                txt = (item.text or '').strip().lower()
-                if any(word in txt for word in target.split() if len(word) > 3):
+                txt = (item.text.strip() or item.get_attribute("textContent") or "").strip()
+                if target in txt.lower().replace(" ", "") or txt.lower().replace(" ", "") in target:
                     driver.execute_script("arguments[0].click();", item)
                     city_clicked = True
-                    print(f"  ✓ Partial match city: {item.text.strip()}")
+                    print(f"  [OK] Selected city: {txt}")
                     break
-        if not city_clicked:
-            available = [m.text.strip() for m in menu_items[:8]]
-            print(f"  ✗ City '{CL_CITY}' NOT FOUND. Available: {available}")
-            return False
-        human_delay(2, 3)
-        continue_btn = WebDriverWait(driver, 10).until(
-            EC.element_to_be_clickable((By.CSS_SELECTOR,
-                "button.go.pickbutton, button[class*='pickbutton'], button[type='submit']")))
-        driver.execute_script("arguments[0].click();", continue_btn)
-        print("  ✓ Submitted city selection")
-        try:
-            WebDriverWait(driver, 12).until(lambda d: "s=area" not in d.current_url)
-            print(f"  ✓ Left area page → {driver.current_url}")
+            if not city_clicked:
+                available = [m.text.strip() for m in menu_items[:6]]
+                print(f"  [city] {CL_CITY} not found. Available: {available}")
+                if menu_items:
+                    driver.execute_script("arguments[0].click();", menu_items[0])
+                    city_clicked = True
+                    print(f"  [OK] Fallback city: {menu_items[0].text.strip()}")
         except TimeoutException:
-            print("  ⚠ Still on area page after 12s")
-        handle_captcha_if_present(driver)
-    except Exception as e:
-        print(f"  City selection error: {e}")
+            print(f"  [city] No dropdown at {driver.current_url} — skipping")
+            city_clicked = True
+        except Exception as e:
+            print(f"  [city] Dropdown error: {e}")
+            city_clicked = True
 
-    if "s=area" in driver.current_url:
+        # Click continue
         try:
-            retry_btn = WebDriverWait(driver, 5).until(
+            continue_btn = WebDriverWait(driver, 8).until(
                 EC.element_to_be_clickable((By.CSS_SELECTOR,
                     "button.go.pickbutton, button[class*='pickbutton'], button[type='submit']")))
-            driver.execute_script("arguments[0].click();", retry_btn)
-            WebDriverWait(driver, 10).until(lambda d: "s=area" not in d.current_url)
-        except Exception as e:
-            print(f"  ✗ City retry failed: {e}")
+            driver.execute_script("arguments[0].click();", continue_btn)
+            print("  [OK] Submitted area page")
+            try:
+                WebDriverWait(driver, 15).until(
+                    lambda d: "s=area" not in d.current_url and "copyfromanother" not in d.current_url)
+                print(f"  [OK] Left area page -> {driver.current_url}")
+            except TimeoutException:
+                print(f"  [city] Still on area after 15s: {driver.current_url}")
+        except Exception as ce:
+            print(f"  [city] No continue btn: {ce}")
+
+        if "s=area" in driver.current_url or "copyfromanother" in driver.current_url:
+            print(f"  [FAIL] Could not leave area: {driver.current_url}")
             return False
 
-    if "s=area" in driver.current_url:
-        return False
-
-    print(f"  ✓ Left area → {driver.current_url}")
+    print(f"  [OK] Left area -> {driver.current_url}")
     handle_captcha_if_present(driver)
     human_delay(2, 4)
 
-    # ── Post type ─────────────────────────────────────────────────────────────
+    # -- Post type -------------------------------------------------------------
     try:
         WebDriverWait(driver, 15).until(
             lambda d: d.find_elements(By.CSS_SELECTOR, "input[value='fso']") or
                       d.find_elements(By.CSS_SELECTOR, "input[type='radio']"))
-        print("  ✓ Post type page loaded")
+        print("  [OK] Post type page loaded")
     except TimeoutException:
         return False
 
@@ -3106,18 +3238,18 @@ def post_product(driver, ad_name, product):
             el = driver.find_element(By.CSS_SELECTOR, f"input[value='{val}']")
             driver.execute_script("arguments[0].click();", el)
             fso_clicked = True
-            print(f"  ✓ Selected post type via input value='{val}'")
+            print(f"  [OK] Selected post type via input value='{val}'")
             break
         except NoSuchElementException:
             pass
     if not fso_clicked:
-        print("  ✗ Could not find 'for sale by owner'")
+        print("  [FAIL] Could not find 'for sale by owner'")
         return False
 
     human_delay(3, 5)
     handle_captcha_if_present(driver)
 
-    # ── Category ──────────────────────────────────────────────────────────────
+    # -- Category --------------------------------------------------------------
     cat_clicked = False
     mapped_label = CATEGORY_MAPPING.get(
         product.get("category", "").lower().strip(), (None, ""))[1]
@@ -3135,7 +3267,7 @@ def post_product(driver, ad_name, product):
                 EC.element_to_be_clickable((By.XPATH, xpath)))
             driver.execute_script("arguments[0].click();", label_el)
             cat_clicked = True
-            print(f"  ✓ Selected category via label XPath: '{mapped_label}'")
+            print(f"  [OK] Selected category via label XPath: '{mapped_label}'")
         except Exception as e:
             print(f"  Category label failed: {e}")
 
@@ -3147,7 +3279,7 @@ def post_product(driver, ad_name, product):
                     (By.CSS_SELECTOR, f"input[type='radio'][value='{ul_value}']")))
             driver.execute_script("arguments[0].click();", inp)
             cat_clicked = True
-            print(f"  ✓ Selected category via radio value={ul_value}")
+            print(f"  [OK] Selected category via radio value={ul_value}")
         except Exception:
             pass
 
@@ -3169,12 +3301,12 @@ def post_product(driver, ad_name, product):
             EC.element_to_be_clickable((By.CSS_SELECTOR,
                 "button.go.pickbutton, button[class*='pickbutton'], button[type='submit']")))
         driver.execute_script("arguments[0].click();", continue_btn)
-        print("  ✓ Clicked category continue button")
+        print("  [OK] Clicked category continue button")
         try:
             WebDriverWait(driver, 12).until(
                 EC.presence_of_element_located((By.ID, "postingForm")))
             time.sleep(2)
-            print("  ✓ postingForm visible after category selection")
+            print("  [OK] postingForm visible after category selection")
         except TimeoutException:
             time.sleep(3)
         print(f"  Current URL after category continue: {driver.current_url}")
@@ -3184,11 +3316,11 @@ def post_product(driver, ad_name, product):
 
     click_relocation_if_needed(driver, ad_name)
 
-    # ── Fill and submit ───────────────────────────────────────────────────────
+    # -- Fill and submit -------------------------------------------------------
     try:
         success = fill_listing_details(driver, product)
     except Exception as e:
-        print(f"  ✗ fill_listing_details crashed: {e}")
+        print(f"  [FAIL] fill_listing_details crashed: {e}")
         import traceback
         traceback.print_exc()
         return False
@@ -3196,14 +3328,14 @@ def post_product(driver, ad_name, product):
     if not success:
         return False
 
-    # ── Image upload ──────────────────────────────────────────────────────────
+    # -- Image upload ----------------------------------------------------------
     if not complete_images_step(driver, product):
-        print("  ✗ Failed at image upload step")
+        print("  [FAIL] Failed at image upload step")
         return False
 
-    # ── Publish ───────────────────────────────────────────────────────────────
+    # -- Publish ---------------------------------------------------------------
     if not publish_listing(driver, ad_name, product):
-        print("  ✗ Failed at publish step")
+        print("  [FAIL] Failed at publish step")
         return False
 
     return True
@@ -3215,7 +3347,7 @@ def update_ad_analytics_periodically():
         print("[CL] Analytics thread disabled on Railway (memory constraint). Skipping.")
         return
     while True:
-        print("\n[CL] Refreshing analytics…")
+        print("\n[CL] Refreshing analytics...")
         for ad_name, listing in list(posted_listings.items()):
             if not listing.get("url") or listing.get("platform") != "Craigslist":
                 continue
@@ -3229,89 +3361,20 @@ def update_ad_analytics_periodically():
                 count = int("".join(filter(str.isdigit, views_el.text)) or "0")
                 posted_listings[ad_name]["visitors"] = count
             except Exception as e:
-                print(f"  ⚠ Analytics error for {ad_name}: {e}")
+                print(f"  [WARN] Analytics error for {ad_name}: {e}")
             finally:
                 if tmp:
                     tmp.quit()
         _save_listings()
         time.sleep(300)
 
-def _get_saved_password(email):
-    """Email ke liye saved password dhundho."""
-    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-    if not os.path.exists(env_path):
-        return ""
-    try:
-        with open(env_path) as f:
-            for line in f:
-                line = line.strip()
-                if line.startswith(f"PASS_{email}="):
-                    return line.split("=", 1)[1].strip()
-    except Exception:
-        pass
-    return ""
 
-
-def _save_password(email, password):
-    """Email ka password .env mein save karo."""
-    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-    try:
-        existing_lines = []
-        key = f"PASS_{email}"
-        found = False
-        if os.path.exists(env_path):
-            with open(env_path) as f:
-                for line in f:
-                    if line.strip().startswith(f"{key}="):
-                        existing_lines.append(f"{key}={password}\n")
-                        found = True
-                    else:
-                        existing_lines.append(line)
-        if not found:
-            existing_lines.append(f"{key}={password}\n")
-        with open(env_path, "w") as f:
-            f.writelines(existing_lines)
-    except Exception as e:
-        print(f"  ⚠ Save failed: {e}")
-        
 def main():
     global CL_CITY
-
-    print("=" * 50)
-    print("  CLBlast — Craigslist Automation")
-    print("=" * 50)
-
-    # Email poochna
-    default_email = os.environ.get("CL_EMAIL", "").strip()
-    email_input = input(f"  Email [{default_email}]: ").strip()
-    email = email_input if email_input else default_email
-
+    email = os.environ.get("CL_EMAIL", "").strip()
     if not email:
-        print("✗ Email required!")
+        print("[FAIL] CL_EMAIL environment variable not set. Add it to Railway Variables.")
         return
-
-    # Password .env se dhundho email ke hisaab se
-    password = _get_saved_password(email)
-
-    if not password:
-        # Pehli baar — password poochna
-        import getpass
-        password = getpass.getpass(f"  Password (pehli baar): ").strip()
-        if not password:
-            print("✗ Password required!")
-            return
-        # Save karo
-        _save_password(email, password)
-        print(f"  ✓ Password saved!")
-
-    os.environ["CL_EMAIL"]          = email
-    os.environ["CL_PASSWORD"]       = password
-    os.environ["CL_EMAIL_PASSWORD"] = password
-
-    print(f"  ✓ Using: {email}")
-    print("=" * 50)
-    # ── End prompt ──────────────────────────────────────────────────────
-
     CL_CITY = os.environ.get("CL_CITY", CL_CITY)
     _load_existing_listings()
 
@@ -3321,13 +3384,31 @@ def main():
         driver.quit()
         return
 
-    products_file = os.environ.get("PRODUCTS_FILE", "products.json")
+    # -- DIAGNOSTIC: dump all env vars so we can see what server.py passed ------
+    print(f"  [env] CLB_PRODUCTS_FILE = '{os.environ.get('CLB_PRODUCTS_FILE', 'NOT SET')}'")
+    print(f"  [env] PRODUCTS_FILE     = '{os.environ.get('PRODUCTS_FILE', 'NOT SET')}'")
+    print(f"  [env] CL_CITY           = '{os.environ.get('CL_CITY', 'NOT SET')}'")
+    print(f"  [env] CL_EMAIL          = '{os.environ.get('CL_EMAIL', 'NOT SET')}'")
+
+    # FIX: CLB_PRODUCTS_FILE is the unique key set by server.py per job.
+    # PRODUCTS_FILE kept as fallback. Without this the script reads all of
+    # products.json and always posts index-0 (Men's Hanes T-Shirt).
+    products_file = (
+        os.environ.get("CLB_PRODUCTS_FILE", "").strip()
+        or os.environ.get("PRODUCTS_FILE", "").strip()
+        or "products.json"
+    )
+    print(f"  [products] Reading from: {products_file}")
     if not os.path.exists(products_file):
-        print(f"✗ {products_file} not found.")
+        print(f"  [FAIL] Products file not found: {products_file}")
+        print(f"  [products] cwd = {os.getcwd()}")
+        print(f"  [products] files in cwd = {os.listdir('.')[:20]}")
         driver.quit()
         return
     with open(products_file) as f:
         products = json.load(f)
+    print(f"  [products] Loaded {len(products)} product(s): " +
+          str([p.get('title') or p.get('name') for p in products]))
 
     threading.Thread(target=update_ad_analytics_periodically, daemon=True).start()
 
@@ -3338,16 +3419,16 @@ def main():
         try:
             ok = post_product(driver, ad_name, product)
         except Exception as e:
-            print(f"  ✗ post_product crashed for '{product_title}': {e}")
+            print(f"  [FAIL] post_product crashed for '{product_title}': {e}")
             import traceback
             traceback.print_exc()
             ok = False
-        print("  ✓ Posted" if ok else "  ✗ Failed")
+        print("  [OK] Posted" if ok else "  [FAIL] Failed")
         time.sleep(3)
 
     print("\nAll Craigslist products processed.")
     driver.quit()
-    
+
 
 if __name__ == "__main__":
-        main()
+    main()

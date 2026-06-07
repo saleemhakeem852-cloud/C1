@@ -11,7 +11,7 @@ import requests as req_lib
 
 # ── Flask ────────────────────────────────────────────────────────────────────
 try:
-    from flask import Flask, Response, jsonify, request
+    from flask import Flask, Response, jsonify, request, send_from_directory
     from flask_cors import CORS
 except ImportError:
     sys.exit(
@@ -22,6 +22,20 @@ except ImportError:
 app = Flask(__name__)
 CORS(app)  # enable CORS on all endpoints
 
+@app.get("/")
+def index():
+    # Find the HTML file (try both names)
+    for name in ["index.html", "clblast.html"]:
+        if (BASE_DIR / name).exists():
+            return send_from_directory(str(BASE_DIR), name)
+    return "index.html not found in " + str(BASE_DIR), 404
+
+@app.get("/<path:filename>")
+def static_files(filename):
+    return send_from_directory(str(BASE_DIR), filename)
+
+
+
 # ── Paths ────────────────────────────────────────────────────────────────────
 BASE_DIR      = Path(__file__).parent
 PRODUCTS_JSON = BASE_DIR / "products.json"
@@ -29,7 +43,7 @@ LISTINGS_JSON = BASE_DIR / "posted_listings.json"
 SUBSET_JSON   = BASE_DIR / "products_subset.json"
 ACCOUNTS_JSON = BASE_DIR / "accounts.json"
 SCRIPTS = {
-    "craigslist":    BASE_DIR / "craigslist.py",
+    "craigslist":    BASE_DIR / "craigslist_new.py",
     "adlandpro":     BASE_DIR / "adlandpro.py",
     "classifiedads": BASE_DIR / "classifiedads.py",
 }
@@ -58,8 +72,9 @@ def _read_json(path: Path, default):
     return default
 
 def _read_products():
-    """Load products.json sorted exactly as the /products endpoint returns them.
-    This ensures product_indices from the browser always match the right product."""
+    """Load products sorted exactly like the /products endpoint.
+    CRITICAL: browser checkbox indices are based on this sorted order.
+    Using _read_json directly gives wrong products because products.json is unsorted."""
     products = _read_json(PRODUCTS_JSON, [])
     products.sort(key=lambda p: (p.get("title") or p.get("name") or "").lower())
     return products
@@ -115,6 +130,8 @@ def add_product():
 @app.delete("/products/<int:idx>")
 def delete_product(idx):
     products = _read_json(PRODUCTS_JSON, [])
+    # Re-sort to match frontend indices
+    products.sort(key=lambda p: (p.get("title") or p.get("name") or "").lower())
     if idx < 0 or idx >= len(products):
         return jsonify({"error": "Index out of range"}), 404
     products.pop(idx)
@@ -179,7 +196,6 @@ def _run_bulk(body):
     platform = body.get("platform", "").lower()
     email = body.get("email", "")
     password = body.get("password", "")
-    gmail_app_password = body.get("gmail_app_password", "")
     two_captcha_key = body.get("two_captcha_key", "")
     craigslist_city = body.get("craigslist_city", "losangeles")
     zip_code  = body.get("zip_code", "")
@@ -191,7 +207,7 @@ def _run_bulk(body):
     
     script = SCRIPTS[platform]
     
-    all_prods = _read_products()  # sorted same as /products — indices match browser
+    all_prods = _read_products()   # sorted = matches browser checkbox indices
     
     _bulk_active = True
     post_count = 0
@@ -225,14 +241,20 @@ def _run_bulk(body):
         prod_display = prod.get('title') or prod.get('name', 'Unknown')
         _lines.append(f"\n[CLBlast] Posting product {idx + 1}/{len(product_indices)}: {prod_display}\n")
         
-        _write_json(SUBSET_JSON, [prod])
-        
+        import uuid as _buuid
+        _bulk_file = BASE_DIR / f"clb_subset_{_buuid.uuid4().hex[:10]}.json"
+        _write_json(_bulk_file, [prod])
+        print(f"[server] Bulk subset → {_bulk_file.name}: {prod_display}")
+
         env = os.environ.copy()
         env["CL_EMAIL"]           = email
         env["CL_PASSWORD"]        = password
         env["GMAIL_APP_PASSWORD"] = body.get("gmail_app_password", "")
         env["TWO_CAPTCHA_KEY"]    = two_captcha_key
-        env["PRODUCTS_FILE"]   = str(SUBSET_JSON)
+        env["CLB_PRODUCTS_FILE"] = str(_bulk_file)
+        env["PRODUCTS_FILE"]     = str(_bulk_file)
+        env["PYTHONIOENCODING"]  = "utf-8:replace"
+        env["PYTHONUTF8"]        = "1"
         if platform == "craigslist":
             env["CL_CITY"] = craigslist_city
             if zip_code:  env["CL_ZIP"]       = zip_code
@@ -240,7 +262,7 @@ def _run_bulk(body):
             
         try:
             proc = subprocess.Popen(
-                [sys.executable, str(script)],
+                [sys.executable, "-u", str(script)],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -270,11 +292,11 @@ def _run_bulk(body):
             _lines.append(f"[CLBlast] Error posting product: {e}\n")
             
         try:
-            if SUBSET_JSON.exists():
-                SUBSET_JSON.unlink()
+            if _bulk_file.exists():
+                _bulk_file.unlink()
         except Exception:
             pass
-            
+
         if not _bulk_active:
             break
             
@@ -348,32 +370,47 @@ def launch_post():
         zip_code  = body.get("zip_code", "")
         city_name = body.get("city_name", "")
         state     = body.get("state", "")
+        _subset_file = None  # unique temp file for this job
+
         if isinstance(product_indices, list) and len(product_indices) > 0:
             if not PRODUCTS_JSON.exists():
                 return jsonify({"error": "products.json not found — add products first."}), 400
-            
-            all_prods = _read_products()  # sorted same as /products — indices match browser
-            subset = [all_prods[i] for i in product_indices if i < len(all_prods)]
-            # Inject location data from Location Manager into each product
+
+            all_prods = _read_products()   # sorted — matches browser checkbox indices
+            # Deep-copy each dict so location injection doesn't mutate the shared list
+            subset = [dict(all_prods[i]) for i in product_indices if i < len(all_prods)]
             if zip_code or city_name or state:
                 for p in subset:
                     if zip_code:  p["_location_zip"]   = zip_code
                     if city_name: p["_location_city"]  = city_name
                     if state:     p["_location_state"] = state
-            _write_json(SUBSET_JSON, subset)
-            products_file = str(SUBSET_JSON)
+
+            # Unique filename per job — prevents concurrent jobs from clobbering each other
+            import uuid as _uuid
+            _subset_file = BASE_DIR / f"clb_subset_{_uuid.uuid4().hex[:10]}.json"
+            _write_json(_subset_file, subset)
+            products_file = str(_subset_file)
+            print(f"[server] Subset → {_subset_file.name}: " +
+                  str([p.get('title') or p.get('name') for p in subset]))
         else:
             if not PRODUCTS_JSON.exists():
                 return jsonify({"error": "products.json not found — add products first."}), 400
             products_file = str(PRODUCTS_JSON)
+            print(f"[server] Using full products file: {products_file}")
 
         # Build execution environment
         env = os.environ.copy()
-        env["CL_EMAIL"]            = body.get("email", "")
-        env["CL_PASSWORD"]         = body.get("password", "")
-        env["GMAIL_APP_PASSWORD"]  = body.get("gmail_app_password", "")
-        env["TWO_CAPTCHA_KEY"]     = body.get("two_captcha_key", "")
-        env["PRODUCTS_FILE"]   = products_file
+        env["CL_EMAIL"]           = body.get("email", "")
+        env["CL_PASSWORD"]        = body.get("password", "")
+        env["GMAIL_APP_PASSWORD"] = body.get("gmail_app_password", "")
+        env["TWO_CAPTCHA_KEY"]    = body.get("two_captcha_key", "")
+        # CLB_PRODUCTS_FILE = unique key that craigslist.py reads first.
+        # PRODUCTS_FILE = kept for backwards compat.
+        # Both are set explicitly so .env or OS vars can't shadow them.
+        env["CLB_PRODUCTS_FILE"] = products_file
+        env["PRODUCTS_FILE"]     = products_file
+        env["PYTHONIOENCODING"]  = "utf-8:replace"
+        env["PYTHONUTF8"]        = "1"
         if platform == "craigslist":
             env["CL_CITY"]      = body.get("craigslist_city", "losangeles")
             if zip_code:  env["CL_ZIP"]       = zip_code
@@ -388,7 +425,7 @@ def launch_post():
             global _proc, _status
             try:
                 proc = subprocess.Popen(
-                    [sys.executable, str(script)],
+                    [sys.executable, "-u", str(script)],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True,
@@ -413,10 +450,10 @@ def launch_post():
                     _status = "error"
                     _lines.append(f"[CLBlast] Error: {exc}\n")
             finally:
-                # Python 3.7 compatible clean up of temporary subset file
                 try:
-                    if SUBSET_JSON.exists():
-                        SUBSET_JSON.unlink()
+                    if _subset_file and _subset_file.exists():
+                        _subset_file.unlink()
+                        print(f"[server] Cleaned up {_subset_file.name}")
                 except Exception:
                     pass
 
