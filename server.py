@@ -57,6 +57,13 @@ def _read_json(path: Path, default):
             pass
     return default
 
+def _read_products():
+    """Load products.json sorted exactly as the /products endpoint returns them.
+    This ensures product_indices from the browser always match the right product."""
+    products = _read_json(PRODUCTS_JSON, [])
+    products.sort(key=lambda p: (p.get("title") or p.get("name") or "").lower())
+    return products
+
 def _write_json(path: Path, data):
     try:
         with open(path, "w", encoding="utf-8") as f:
@@ -172,6 +179,7 @@ def _run_bulk(body):
     platform = body.get("platform", "").lower()
     email = body.get("email", "")
     password = body.get("password", "")
+    gmail_app_password = body.get("gmail_app_password", "")
     two_captcha_key = body.get("two_captcha_key", "")
     craigslist_city = body.get("craigslist_city", "losangeles")
     zip_code  = body.get("zip_code", "")
@@ -183,7 +191,7 @@ def _run_bulk(body):
     
     script = SCRIPTS[platform]
     
-    all_prods = _read_json(PRODUCTS_JSON, [])
+    all_prods = _read_products()  # sorted same as /products — indices match browser
     
     _bulk_active = True
     post_count = 0
@@ -220,9 +228,10 @@ def _run_bulk(body):
         _write_json(SUBSET_JSON, [prod])
         
         env = os.environ.copy()
-        env["CL_EMAIL"]        = email
-        env["CL_PASSWORD"]     = password  # used by adlandpro/classifiedads only (not craigslist)
-        env["TWO_CAPTCHA_KEY"] = two_captcha_key
+        env["CL_EMAIL"]           = email
+        env["CL_PASSWORD"]        = password
+        env["GMAIL_APP_PASSWORD"] = body.get("gmail_app_password", "")
+        env["TWO_CAPTCHA_KEY"]    = two_captcha_key
         env["PRODUCTS_FILE"]   = str(SUBSET_JSON)
         if platform == "craigslist":
             env["CL_CITY"] = craigslist_city
@@ -343,7 +352,7 @@ def launch_post():
             if not PRODUCTS_JSON.exists():
                 return jsonify({"error": "products.json not found — add products first."}), 400
             
-            all_prods = _read_json(PRODUCTS_JSON, [])
+            all_prods = _read_products()  # sorted same as /products — indices match browser
             subset = [all_prods[i] for i in product_indices if i < len(all_prods)]
             # Inject location data from Location Manager into each product
             if zip_code or city_name or state:
@@ -360,9 +369,10 @@ def launch_post():
 
         # Build execution environment
         env = os.environ.copy()
-        env["CL_EMAIL"]        = body.get("email", "")
-        env["CL_PASSWORD"]     = body.get("password", "")  # used by adlandpro/classifiedads only
-        env["TWO_CAPTCHA_KEY"] = body.get("two_captcha_key", "")
+        env["CL_EMAIL"]            = body.get("email", "")
+        env["CL_PASSWORD"]         = body.get("password", "")
+        env["GMAIL_APP_PASSWORD"]  = body.get("gmail_app_password", "")
+        env["TWO_CAPTCHA_KEY"]     = body.get("two_captcha_key", "")
         env["PRODUCTS_FILE"]   = products_file
         if platform == "craigslist":
             env["CL_CITY"]      = body.get("craigslist_city", "losangeles")

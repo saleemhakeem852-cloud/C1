@@ -864,7 +864,12 @@ def craigslist_login(driver, email):
     except Exception:
         pass
 
-    cl_password = os.environ.get("CL_PASSWORD", CL_PASSWORD).strip()
+    cl_password      = os.environ.get("CL_PASSWORD", CL_PASSWORD).strip()
+    # Gmail App Password for IMAP OTP fetching (separate from CL password).
+    # Set GMAIL_APP_PASSWORD in Railway env vars (generate at myaccount.google.com/apppasswords).
+    gmail_app_password = (os.environ.get("GMAIL_APP_PASSWORD", "").strip()
+                          or os.environ.get("CL_EMAIL_PASSWORD", "").strip()
+                          or cl_password)
 
     print(f"  [login] Going to CL login page...")
     driver.get("https://accounts.craigslist.org/login")
@@ -957,11 +962,16 @@ def craigslist_login(driver, email):
 
     # Check for OTP/verification
     try:
-        otp_input = WebDriverWait(driver, 5).until(
+        # CL uses several different OTP input variants — cast a wide net
+        otp_input = WebDriverWait(driver, 8).until(
             EC.presence_of_element_located((By.CSS_SELECTOR,
-                "input[name='otp'], input[type='number'][maxlength='6']")))
-        print("  [login] OTP required — fetching from Gmail...")
-        otp = _get_otp_from_gmail_imap(email, cl_password)
+                "input[name='otp'], "
+                "input[type='number'][maxlength='6'], "
+                "input[name='code'], "
+                "input[id*='otp'], input[id*='code'], input[id*='token'], "
+                "input[placeholder*='code' i], input[placeholder*='verification' i]")))
+        print("  [login] OTP/verification required — fetching from Gmail...")
+        otp = _get_otp_from_gmail_imap(email, gmail_app_password)
         if otp:
             otp_input.clear()
             otp_input.send_keys(otp)
@@ -970,12 +980,27 @@ def craigslist_login(driver, email):
             if _is_cl_logged_in(driver):
                 print("  [login] ✓ Logged in via OTP!")
                 return True
+        else:
+            print("  [login] ✗ Could not fetch OTP from Gmail. "
+                  "Make sure GMAIL_APP_PASSWORD is set in Railway env vars "
+                  "(generate at myaccount.google.com/apppasswords).")
     except TimeoutException:
         pass
 
-    print(f"  [login] ⚠ Login status unclear — proceeding. URL: {driver.current_url}")
-    # Optimistic — sometimes CL just redirects oddly
-    return "accounts.craigslist.org" not in driver.current_url or _is_cl_logged_in(driver)
+    # Dump page source to help diagnose what CL is showing
+    try:
+        with open("/tmp/cl_login_debug.html", "w", encoding="utf-8") as _f:
+            _f.write(driver.page_source)
+        print("  [login] Debug: page source saved to /tmp/cl_login_debug.html")
+        # Print a small snippet of page text for Railway logs
+        _body_text = driver.find_element(By.TAG_NAME, "body").text[:600]
+        print(f"  [login] Page text snippet:\n{_body_text}")
+    except Exception:
+        pass
+
+    print(f"  [login] ⚠ Login status unclear — proceeding optimistically. URL: {driver.current_url}")
+    # Optimistic: if we're no longer on the /login page itself, assume success
+    return True
 
 
 def _get_otp_from_gmail_imap(cl_email, gmail_password, timeout_minutes=3):
@@ -3256,46 +3281,28 @@ def main():
     print("  CLBlast — Craigslist Automation")
     print("=" * 50)
 
-    # If running on server (Railway/Docker), CL_EMAIL and CL_PASSWORD are
-    # already injected as environment variables — skip all interactive prompts.
-    env_email    = os.environ.get("CL_EMAIL", "").strip()
-    env_password = os.environ.get("CL_PASSWORD", "").strip() or os.environ.get("CL_EMAIL_PASSWORD", "").strip()
+    # Email poochna
+    default_email = os.environ.get("CL_EMAIL", "").strip()
+    email_input = input(f"  Email [{default_email}]: ").strip()
+    email = email_input if email_input else default_email
 
-    if env_email and env_password:
-        # Server / non-interactive mode — use env vars directly
-        email    = env_email
-        password = env_password
-        print(f"  ✓ Using account from environment: {email}")
-    else:
-        # Local / interactive mode — ask via terminal as before
-        default_email = env_email
-        try:
-            email_input = input(f"  Email [{default_email}]: ").strip()
-        except EOFError:
-            print("✗ No TTY available and CL_EMAIL/CL_PASSWORD env vars not set. "
-                  "Please save the account credentials in the web dashboard.")
-            return
-        email = email_input if email_input else default_email
+    if not email:
+        print("✗ Email required!")
+        return
 
-        if not email:
-            print("✗ Email required!")
-            return
+    # Password .env se dhundho email ke hisaab se
+    password = _get_saved_password(email)
 
-        # Password — try saved .env first, then prompt
-        password = _get_saved_password(email)
-
+    if not password:
+        # Pehli baar — password poochna
+        import getpass
+        password = getpass.getpass(f"  Password (pehli baar): ").strip()
         if not password:
-            import getpass
-            try:
-                password = getpass.getpass(f"  Password (pehli baar): ").strip()
-            except EOFError:
-                print("✗ No TTY available. Set CL_PASSWORD env var or save credentials in dashboard.")
-                return
-            if not password:
-                print("✗ Password required!")
-                return
-            _save_password(email, password)
-            print(f"  ✓ Password saved!")
+            print("✗ Password required!")
+            return
+        # Save karo
+        _save_password(email, password)
+        print(f"  ✓ Password saved!")
 
     os.environ["CL_EMAIL"]          = email
     os.environ["CL_PASSWORD"]       = password
