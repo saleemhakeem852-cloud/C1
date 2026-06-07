@@ -41,7 +41,9 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.keys import Keys
-
+# Existing imports ke baad add karo
+from dotenv import load_dotenv
+load_dotenv()  # .env file automatically load ho jaayegi
 try:
     from twocaptcha import TwoCaptcha
     CAPTCHA_SOLVER_AVAILABLE = True
@@ -50,6 +52,13 @@ except ImportError:
 
 TWO_CAPTCHA_API_KEY = os.environ.get("TWO_CAPTCHA_KEY", "YOUR_2CAPTCHA_API_KEY")
 LISTINGS_JSON       = "posted_listings.json"
+# GMAIL_EMAIL    = os.environ.get("CL_EMAIL",          "hunzla.khalid07@gmail.com")
+# GMAIL_PASSWORD = os.environ.get("CL_EMAIL_PASSWORD", "N.aruto07")
+# CL_PASSWORD    = os.environ.get("CL_PASSWORD",       "N.aruto07")  # CL account password
+GMAIL_EMAIL    = os.environ.get("CL_EMAIL",          "")
+GMAIL_PASSWORD = os.environ.get("CL_EMAIL_PASSWORD", "")
+CL_PASSWORD    = os.environ.get("CL_PASSWORD",       "")
+_cl_logged_in: bool = False
 CL_CITY             = os.environ.get("CL_CITY", "losangeles")
 IS_FAST_MODE        = os.environ.get("FAST_MODE", "1") == "1"
 IS_RAILWAY          = any(os.path.exists(p) for p in [
@@ -703,7 +712,12 @@ def make_driver(proxy_url=None):
     if os.path.exists("/usr/local/bin/chromedriver"):
         chromedriver_bin = "/usr/local/bin/chromedriver"
     if not chromedriver_bin:
-        raise RuntimeError("chromedriver not found")
+        try:
+            from webdriver_manager.chrome import ChromeDriverManager
+            chromedriver_bin = ChromeDriverManager().install()
+            print(f"  [driver] Auto-installed chromedriver: {chromedriver_bin}")
+        except Exception as wdm_err:
+            raise RuntimeError(f"chromedriver not found and auto-install failed: {wdm_err}")
     print(f"  [driver] Using chromedriver: {chromedriver_bin}")
 
     service = ChromeService(
@@ -819,26 +833,239 @@ def handle_captcha_if_present(driver):
         time.sleep(8)
 
 
-def craigslist_login(driver, email):
-    driver.get("https://accounts.craigslist.org/login")
-    human_delay(2, 4)
-    handle_captcha_if_present(driver)
+def _is_cl_logged_in(driver):
+    """Check if browser is currently logged into CL."""
     try:
-        ef = WebDriverWait(driver, 15).until(
-            EC.presence_of_element_located((By.ID, "inputEmailHandle")))
-        for ch in email:
-            ef.send_keys(ch)
-            time.sleep(random.uniform(0.05, 0.12))
-        human_delay(0.5, 1.0)
-        btn = driver.find_element(By.CSS_SELECTOR, "button[type='submit']")
-        safe_click(driver, btn)
-        WebDriverWait(driver, 15).until(EC.url_contains("craigslist.org"))
-        handle_captcha_if_present(driver)
-        print("Logged in to Craigslist ✓")
-        return True
-    except TimeoutException:
-        print("Login failed.")
+        src = driver.page_source
+        return ('log out' in src.lower() or
+                'accounts.craigslist.org/logout' in src or
+                'logged in as' in src.lower())
+    except Exception:
         return False
+
+
+def craigslist_login(driver, email):
+    """
+    CL Login — Screenshot shows:
+      - Email / Handle field  (id="inputEmailHandle")
+      - Password field        (visible on same page)
+      - "Log in" button       (right side)
+      - "E-mail a login link" button (left side — we don't use this)
+
+    So: fill email → fill password → click "Log in"
+    """
+    # Skip if already logged in
+    try:
+        driver.get("https://accounts.craigslist.org/login/home")
+        time.sleep(2)
+        if _is_cl_logged_in(driver):
+            print("✓ Already logged in to CL — skipping login")
+            return True
+    except Exception:
+        pass
+
+    cl_password = os.environ.get("CL_PASSWORD", CL_PASSWORD).strip()
+
+    print(f"  [login] Going to CL login page...")
+    driver.get("https://accounts.craigslist.org/login")
+    human_delay(2, 3)
+    handle_captcha_if_present(driver)
+
+    try:
+        # ── Step 1: Fill Email ────────────────────────────────────────────────
+        email_field = WebDriverWait(driver, 15).until(
+            EC.presence_of_element_located((By.ID, "inputEmailHandle")))
+        email_field.clear()
+        for ch in email:
+            email_field.send_keys(ch)
+            time.sleep(random.uniform(0.05, 0.10))
+        print(f"  [login] ✓ Email filled: {email}")
+        time.sleep(0.5)
+
+        # ── Step 2: Fill Password ─────────────────────────────────────────────
+        # Password field is on the SAME page (not a separate step)
+        pwd_field = WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR,
+                "input[type='password'], input[name='password'], "
+                "input[id='inputPassword'], input[name='passwd']")))
+        pwd_field.clear()
+        for ch in cl_password:
+            pwd_field.send_keys(ch)
+            time.sleep(random.uniform(0.04, 0.09))
+        print(f"  [login] ✓ Password filled")
+        time.sleep(0.5)
+
+        # ── Step 3: Click "Log in" button (NOT "E-mail a login link") ─────────
+        # There are 2 buttons: "E-mail a login link" and "Log in"
+        # We need the "Log in" button on the RIGHT side
+        login_btn = None
+
+        # Try by button text first
+        for btn in driver.find_elements(By.CSS_SELECTOR, "button, input[type='submit']"):
+            txt = (btn.text or btn.get_attribute("value") or "").strip().lower()
+            if txt in ("log in", "login", "sign in", "signin"):
+                login_btn = btn
+                print(f"  [login] Found button by text: '{btn.text or btn.get_attribute('value')}'")
+                break
+
+        # Fallback: last submit button on page (Log in is on the right/last)
+        if not login_btn:
+            all_btns = driver.find_elements(By.CSS_SELECTOR,
+                "button[type='submit'], input[type='submit'], button")
+            if all_btns:
+                login_btn = all_btns[-1]  # Last button = "Log in"
+                print(f"  [login] Using last button: '{login_btn.text}'")
+
+        if not login_btn:
+            print("  [login] ✗ Could not find Log in button!")
+            return False
+
+        # Scroll to and click
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", login_btn)
+        time.sleep(0.3)
+        driver.execute_script("arguments[0].click();", login_btn)
+        print("  [login] ✓ Log in button clicked!")
+        time.sleep(4)
+        handle_captcha_if_present(driver)
+
+    except TimeoutException as e:
+        print(f"  [login] ✗ Field not found: {e}")
+        return False
+    except Exception as e:
+        print(f"  [login] ✗ Error: {e}")
+        return False
+
+    # ── Step 4: Check result ──────────────────────────────────────────────────
+    current_url = driver.current_url
+    print(f"  [login] URL after login click: {current_url}")
+
+    if _is_cl_logged_in(driver):
+        print("  [login] ✓ Logged in to Craigslist!")
+        return True
+
+    # Maybe redirected to home page — check again
+    time.sleep(2)
+    if _is_cl_logged_in(driver):
+        print("  [login] ✓ Logged in!")
+        return True
+
+    # Check for wrong password error
+    page_src = driver.page_source.lower()
+    if "invalid" in page_src or "incorrect" in page_src or "wrong" in page_src:
+        print("  [login] ✗ Wrong password — check CL_PASSWORD env var")
+        return False
+
+    # Check for OTP/verification
+    try:
+        otp_input = WebDriverWait(driver, 5).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR,
+                "input[name='otp'], input[type='number'][maxlength='6']")))
+        print("  [login] OTP required — fetching from Gmail...")
+        otp = _get_otp_from_gmail_imap(email, cl_password)
+        if otp:
+            otp_input.clear()
+            otp_input.send_keys(otp)
+            otp_input.send_keys(Keys.RETURN)
+            time.sleep(3)
+            if _is_cl_logged_in(driver):
+                print("  [login] ✓ Logged in via OTP!")
+                return True
+    except TimeoutException:
+        pass
+
+    print(f"  [login] ⚠ Login status unclear — proceeding. URL: {driver.current_url}")
+    # Optimistic — sometimes CL just redirects oddly
+    return "accounts.craigslist.org" not in driver.current_url or _is_cl_logged_in(driver)
+
+
+def _get_otp_from_gmail_imap(cl_email, gmail_password, timeout_minutes=3):
+    """Fetch 6-digit OTP code from CL email via IMAP."""
+    import re as _re
+    deadline = time.time() + timeout_minutes * 60
+    while time.time() < deadline:
+        try:
+            mail = imaplib.IMAP4_SSL("imap.gmail.com", 993)
+            mail.login(cl_email, gmail_password)
+            mail.select("inbox")
+            status, data = mail.search(None, '(FROM "robot@craigslist.org")')
+            uids = data[0].split() if status == "OK" and data[0] else []
+            if uids:
+                _, msg_data = mail.fetch(uids[-1], "(RFC822)")
+                mail.logout()
+                msg = email_lib.message_from_bytes(msg_data[0][1])
+                body = ""
+                if msg.is_multipart():
+                    for part in msg.walk():
+                        if part.get_content_type() == "text/plain":
+                            try:
+                                body += part.get_payload(decode=True).decode(
+                                    part.get_content_charset() or "utf-8", errors="replace")
+                            except Exception:
+                                pass
+                else:
+                    try:
+                        body = msg.get_payload(decode=True).decode(
+                            msg.get_content_charset() or "utf-8", errors="replace")
+                    except Exception:
+                        pass
+                # Look for 6-digit code
+                codes = _re.findall(r'\b(\d{6})\b', body)
+                if codes:
+                    print(f"  [imap-otp] Found OTP: {codes[0]}")
+                    return codes[0]
+            else:
+                mail.logout()
+            time.sleep(8)
+        except Exception as e:
+            print(f"  [imap-otp] Error: {e}")
+            time.sleep(10)
+    return None
+
+
+def _get_cl_magic_link_from_imap(cl_email, gmail_password, timeout_minutes=5):
+    """Fetch CL magic login link from Gmail via IMAP."""
+    CL_LINK = re.compile(
+        r'https?://(?:accounts\.craigslist\.org|[a-z]+\.craigslist\.org)/\S{10,}',
+        re.IGNORECASE)
+    deadline = time.time() + timeout_minutes * 60
+    while time.time() < deadline:
+        try:
+            mail = imaplib.IMAP4_SSL("imap.gmail.com", 993)
+            mail.login(cl_email, gmail_password)
+            mail.select("inbox")
+            status, data = mail.search(None, '(FROM "robot@craigslist.org")')
+            uids = data[0].split() if status == "OK" and data[0] else []
+            if uids:
+                _, msg_data = mail.fetch(uids[-1], "(RFC822)")
+                mail.logout()
+                msg = email_lib.message_from_bytes(msg_data[0][1])
+                body = ""
+                if msg.is_multipart():
+                    for part in msg.walk():
+                        if part.get_content_type() in ("text/plain", "text/html"):
+                            try:
+                                body += part.get_payload(decode=True).decode(
+                                    part.get_content_charset() or "utf-8", errors="replace")
+                            except Exception:
+                                pass
+                else:
+                    try:
+                        body = msg.get_payload(decode=True).decode(
+                            msg.get_content_charset() or "utf-8", errors="replace")
+                    except Exception:
+                        pass
+                matches = CL_LINK.findall(body)
+                if matches:
+                    url = max(matches, key=len)
+                    print(f"  [imap-magic] ✓ Found: {url[:80]}")
+                    return url
+            else:
+                mail.logout()
+            time.sleep(8)
+        except Exception as e:
+            print(f"  [imap-magic] Error: {e}")
+            time.sleep(10)
+    return None
 
 
 def click_relocation_if_needed(driver, ad_name):
@@ -1333,6 +1560,18 @@ def _fill_zip_with_network_intercept(driver, zip_field, zip_str):
             zip_field.send_keys(Keys.ARROW_DOWN)
             time.sleep(0.8)
             zip_field.send_keys(Keys.RETURN)
+            time.sleep(1.0)
+
+            # FIX: Force hit CL geo endpoint to rotate cryptedStepCheck
+            driver.execute_script("""
+                var z = arguments[0];
+                fetch('/suggest?fieldname=postal&typing=' + z, {
+                    credentials: 'same-origin',
+                    headers: {'X-Requested-With': 'XMLHttpRequest'}
+                }).then(function(r){ return r.text(); })
+                  .then(function(d){ window._clGeoFetchResponse = d; })
+                  .catch(function(e){ window._clGeoFetchErr = e.message; });
+            """, zip_str)
             time.sleep(2.0)
 
             suggestion_clicked = True
@@ -1341,6 +1580,117 @@ def _fill_zip_with_network_intercept(driver, zip_field, zip_str):
             # Verify value was set by the selection
             selected_val = zip_field.get_attribute("value") or ""
             print(f"  [ZIP] Value after selection: '{selected_val}'")
+
+            # ── ROOT CAUSE FIX ────────────────────────────────────────────────
+            # Log says: sourceType='object' = CL uses LOCAL zip dataset (no server call)
+            # Log says: 'ZIP code • autofilled' error = CL marks field as autofilled=true
+            # Fix: clear the autofilled flag + directly trigger CL's internal
+            # location confirmation by simulating what a real user click does.
+            fix_result = driver.execute_script("""
+                var zipVal = arguments[0];
+                var results = [];
+                var postalEl = document.querySelector('[name=postal]') ||
+                               document.querySelector('[name=postal_code]');
+                if (!postalEl) return ['no-postal'];
+
+                // 1. Clear CL's autofilled flag — this is what causes the error
+                postalEl.removeAttribute('data-autofilled');
+                postalEl.setAttribute('data-autofilled', 'false');
+                postalEl.removeAttribute('readonly');
+
+                // 2. Get the autocomplete widget
+                var jq = jQuery(postalEl);
+                var ac = jq.data('ui-autocomplete') || jq.data('autocomplete');
+
+                if (ac) {
+                    // 3. Find the first item in the local dataset matching our ZIP
+                    var source = ac.options.source;
+                    var matchItem = null;
+                    if (Array.isArray(source)) {
+                        for (var i = 0; i < source.length; i++) {
+                            var item = source[i];
+                            var val = typeof item === 'string' ? item : (item.value || item.label || '');
+                            if (val.indexOf(zipVal) === 0) { matchItem = item; break; }
+                        }
+                    } else if (typeof source === 'object' && source !== null) {
+                        // source is an object/array-like
+                        var keys = Object.keys(source);
+                        for (var k = 0; k < keys.length; k++) {
+                            var entry = source[keys[k]];
+                            if (entry && String(entry).indexOf(zipVal) >= 0) {
+                                matchItem = {value: zipVal, label: String(entry)}; break;
+                            }
+                        }
+                    }
+                    if (!matchItem) matchItem = {value: zipVal, label: zipVal + ' - Los Angeles, CA'};
+                    results.push('match-item:' + JSON.stringify(matchItem));
+
+                    // 4. Call the widget's _trigger select directly
+                    try {
+                        ac._trigger('select', null, {item: matchItem});
+                        results.push('_trigger-select-called');
+                    } catch(e) { results.push('_trigger-err:' + e.message); }
+
+                    // 5. Also call select via jQuery UI menu path
+                    try {
+                        var menu = ac.menu;
+                        if (menu) {
+                            var fakeItem = jQuery('<li>').data('ui-autocomplete-item', matchItem);
+                            menu.element.append(fakeItem);
+                            ac._trigger('select', jQuery.Event('autocompleteselect'), {item: matchItem});
+                            fakeItem.remove();
+                            results.push('menu-select-called');
+                        }
+                    } catch(e2) { results.push('menu-err:' + e2.message); }
+                } else {
+                    results.push('no-ac-widget');
+                }
+
+                // 6. Force set value and fire all relevant events
+                var nativeSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+                nativeSetter.call(postalEl, zipVal);
+                postalEl.setAttribute('value', zipVal);
+                postalEl.setAttribute('data-confirmed', 'true');
+                postalEl.removeAttribute('data-autofilled');
+
+                // 7. Fire the full event chain CL expects
+                ['focus','input','keyup','change','blur'].forEach(function(evName) {
+                    postalEl.dispatchEvent(new Event(evName, {bubbles: true, cancelable: true}));
+                });
+                if (window.jQuery) {
+                    jQuery(postalEl)
+                        .val(zipVal)
+                        .trigger('focus')
+                        .trigger('input')
+                        .trigger('keyup')
+                        .trigger('change')
+                        .trigger('blur');
+                }
+                results.push('events-fired');
+
+                // 8. Remove validator error for postal field
+                var form = document.getElementById('postingForm');
+                if (form && window.jQuery) {
+                    var validator = jQuery(form).data('validator');
+                    if (validator) {
+                        var successList = validator.successList || [];
+                        if (successList.indexOf(postalEl) === -1) successList.push(postalEl);
+                        validator.successList = successList;
+                        if (validator.settings && validator.settings.rules) {
+                            delete validator.settings.rules['postal'];
+                            delete validator.settings.rules['postal_code'];
+                        }
+                        try { validator.resetElements([postalEl]); } catch(e) {}
+                        results.push('validator-cleared');
+                    }
+                    jQuery('label[for="postal"].error, #postal-error, label[for="postal_code"].error').remove();
+                    jQuery(postalEl).removeClass('error').removeAttr('aria-invalid');
+                }
+
+                return results;
+            """, zip_str)
+            print(f"  [ZIP] Root cause fix result: {fix_result}")
+            time.sleep(0.5)
 
             # ── Directly invoke CL's autocompleteselect handler ───────────────
             # ArrowDown+Enter fires on our fake widget (from _ZIP_PATCH_JS).
@@ -1729,7 +2079,21 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
         print(f"  ✓ [city] = '{actual}'")
     time.sleep(random.uniform(0.3, 0.5))
 
-    # ── 4. Description ────────────────────────────────────────────────────────
+    # ── 4. ZIP — simple fill like price field, no dropdown magic ────────────
+    if zip_code:
+        zip_str = str(zip_code).strip()
+        zip_field = _find_field(driver, [
+            "[name='postal']", "[name='postal_code']",
+            "input#postal_code", "input#postal",
+        ])
+        if zip_field:
+            _cdp_type(driver, zip_field, zip_str)
+            actual = zip_field.get_attribute("value") or ""
+            print(f"  ✓ [ZIP] = '{actual}'")
+        else:
+            print("  ⚠ [ZIP] field not found")
+
+    # ── 5. Description ────────────────────────────────────────────────────────
     desc_field = _find_field(driver, [
         "[name='PostingBody']", "textarea#PostingBody", "textarea#description",
     ])
@@ -1742,7 +2106,7 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
         return None
     time.sleep(random.uniform(0.4, 0.7))
 
-    # ── 5. Email if editable ──────────────────────────────────────────────────
+    # ── 6. Email if editable ──────────────────────────────────────────────────
     try:
         email_el = driver.find_element(By.CSS_SELECTOR, "[name='FromEMail']")
         if not email_el.get_attribute("disabled") and not email_el.get_attribute("readOnly"):
@@ -1754,27 +2118,6 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
     except Exception:
         pass
     time.sleep(random.uniform(0.4, 0.6))
-
-    # ── 6. ZIP — always goes through full _fill_zip_with_network_intercept ──────
-    # This function types with ActionChains key events, waits for the dropdown,
-    # selects with ArrowDown+Enter, and checks cryptedStepCheck rotation.
-    if zip_code:
-        zip_str = str(zip_code).strip()
-        zip_field = _find_field(driver, [
-            "[name='postal']", "[name='postal_code']",
-            "input#postal_code", "input#postal",
-        ])
-        if zip_field:
-            preloaded_val = (zip_field.get_attribute("value") or "").strip()
-            print(f"  [ZIP] Pre-loaded postal value at page load: '{preloaded_val}'")
-            if preloaded_val == zip_str:
-                print(f"  ✓ [ZIP] = '{zip_str}' (pre-loaded by CL — not touching, token valid)")
-            else:
-                # Always use the full dropdown flow — ArrowDown+Enter is the only
-                # path that triggers CL's internal autocomplete select handler
-                zip_field = _fill_zip_with_network_intercept(driver, zip_field, zip_str)
-        else:
-            print("  ⚠ [ZIP] field not found")
 
     # ── Wait for AJAX ─────────────────────────────────────────────────────────
     try:
@@ -1838,6 +2181,8 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
         (By.XPATH, "//button[normalize-space(.)='continue' or normalize-space(.)='Continue']"),
         (By.CSS_SELECTOR, "button[type='submit']"),
         (By.CSS_SELECTOR, "input[type='submit']"),
+        (By.XPATH, "//button[contains(text(),'continue')]"),
+        (By.XPATH, "//input[@value='continue']"),
     ]:
         try:
             el = WebDriverWait(driver, 5).until(EC.element_to_be_clickable((by, sel)))
@@ -1849,35 +2194,127 @@ def fill_and_submit_with_wire(driver, product, zip_code, city_name, cl_email):
         except Exception:
             continue
 
+    # JS fallback — find any submit button on page
     if not submit_btn:
+        print("  [submit] Selenium selectors failed — trying JS button find...")
+        try:
+            result = driver.execute_script("""
+                var btns = Array.from(document.querySelectorAll('button,input[type=submit]'));
+                for (var i = 0; i < btns.length; i++) {
+                    var b = btns[i];
+                    var txt = (b.textContent || b.value || '').toLowerCase().trim();
+                    if (txt === 'continue' || b.type === 'submit') {
+                        b.scrollIntoView({block:'center'});
+                        return {found: true, text: txt, tag: b.tagName};
+                    }
+                }
+                return {found: false};
+            """)
+            print(f"  [submit] JS button search: {result}")
+            if result and result.get('found'):
+                driver.execute_script("""
+                    var btns = Array.from(document.querySelectorAll('button,input[type=submit]'));
+                    for (var i = 0; i < btns.length; i++) {
+                        var b = btns[i];
+                        var txt = (b.textContent || b.value || '').toLowerCase().trim();
+                        if (txt === 'continue' || b.type === 'submit') {
+                            b.click();
+                            return;
+                        }
+                    }
+                """)
+                submitted = True
+                print("  [submit] JS click sent ✓")
+        except Exception as je:
+            print(f"  [submit] JS fallback failed: {je}")
+
+    if not submit_btn and not submitted:
         print("  [submit] ✗ No submit button found!")
         return None
 
-    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", submit_btn)
-    time.sleep(0.5)
+    if submit_btn:
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", submit_btn)
+        time.sleep(0.5)
 
     # Final ZIP force-set right before click
     if zip_code:
+        # driver.execute_script("""
+        #     var pEl = document.querySelector('[name="postal"]') ||
+        #               document.querySelector('[name="postal_code"]') ||
+        #               document.querySelector('#postal_code') ||
+        #               document.querySelector('#postal');
+        #     if (pEl) {
+        #         Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(pEl, arguments[0]);
+        #         pEl.setAttribute('value', arguments[0]);
+        #         if (window.jQuery) jQuery(pEl).val(arguments[0]);
+        #     }
+        # """, str(zip_code).strip())
+        # ✅ FORCE FILL ALL FIELDS + ZIP BYPASS before submit
         driver.execute_script("""
-            var pEl = document.querySelector('[name="postal"]') ||
-                      document.querySelector('[name="postal_code"]') ||
-                      document.querySelector('#postal_code') ||
-                      document.querySelector('#postal');
-            if (pEl) {
-                Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(pEl, arguments[0]);
-                pEl.setAttribute('value', arguments[0]);
-                if (window.jQuery) jQuery(pEl).val(arguments[0]);
+            (function(t, p, d, e, z) {
+                function setVal(sel, val) {
+                    document.querySelectorAll(sel).forEach(function(el) {
+                        if (!el || !val) return;
+                        try {
+                            var proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+                            var setter = Object.getOwnPropertyDescriptor(proto, 'value');
+                            if (setter && setter.set) setter.set.call(el, val);
+                            else el.value = val;
+                        } catch(err) { el.value = val; }
+                        el.dispatchEvent(new Event('input',  {bubbles:true}));
+                        el.dispatchEvent(new Event('change', {bubbles:true}));
+                        el.dispatchEvent(new Event('keyup',  {bubbles:true}));
+                        if (window.jQuery) jQuery(el).val(val).trigger('input').trigger('change');
+                    });
+                }
+                if (t) setVal('[name="PostingTitle"]', t);
+                if (p) setVal('[name="price"],[name="AskingPrice"]', p);
+                if (d) setVal('[name="PostingBody"]', d);
+                if (e) {
+                    var em = document.querySelector('[name="FromEMail"]');
+                    if (em && !em.disabled && !em.readOnly) setVal('[name="FromEMail"]', e);
+                }
+                if (z) setVal('[name="postal"],[name="postal_code"]', z);
+            })(arguments[0], arguments[1], arguments[2], arguments[3], arguments[4]);
+            
+            // ZIP bypass
+            var form = document.getElementById('postingForm');
+            if (form && window.jQuery) {
+                var v = jQuery(form).data('validator');
+                if (v) { v.settings.ignore = '*'; v.settings.rules = {}; }
+                jQuery.fn.valid = function() { return true; };
             }
-        """, str(zip_code).strip())
+            var postal = document.querySelector('[name="postal"]');
+            if (postal) {
+                postal.removeAttribute('data-autofilled');
+                postal.setAttribute('data-autofilled','false');
+                postal.setAttribute('data-confirmed','true');
+            }
+            document.querySelectorAll('.err li').forEach(function(e){e.remove();});
+        """, title, str(price), description, cl_email, str(zip_code).strip() if zip_code else '')
+        
+        # Log verify
+        desc_val  = driver.execute_script("var e=document.querySelector('[name=PostingBody]'); return e?e.value.substring(0,40):'MISSING';")
+        email_val = driver.execute_script("var e=document.querySelector('[name=FromEMail]'); return e?e.value:'MISSING';")
+        zip_val   = driver.execute_script("var e=document.querySelector('[name=postal]')||document.querySelector('[name=postal_code]'); return e?e.value:'MISSING';")
+        print(f"  [pre-submit] desc='{desc_val}' email='{email_val}' zip='{zip_val}'")
+        time.sleep(0.3)
 
-    # Primary: ActionChains click
-    try:
-        ActionChains(driver).move_to_element(submit_btn).pause(
-            random.uniform(0.3, 0.6)).click().perform()
-        submitted = True
-        print("  [submit] Clicked via ActionChains ✓")
-    except Exception as e:
-        print(f"  [submit] ActionChains failed ({e})")
+    # Primary: ActionChains click (only if not already submitted via JS)
+    if not submitted and submit_btn:
+        try:
+            ActionChains(driver).move_to_element(submit_btn).pause(
+                random.uniform(0.3, 0.6)).click().perform()
+            submitted = True
+            print("  [submit] Clicked via ActionChains ✓")
+        except Exception as e:
+            print(f"  [submit] ActionChains failed ({e})")
+            try:
+                driver.execute_script("arguments[0].click();", submit_btn)
+                submitted = True
+                print("  [submit] JS click fallback ✓")
+            except Exception as e2:
+                print(f"  [submit] JS click also failed: {e2}")
 
     # Re-set ZIP immediately after click
     if submitted and zip_code:
@@ -2137,7 +2574,15 @@ def _wait_for_images_page(driver, timeout=20):
 
 
 def complete_images_step(driver, product: dict):
+     # ── FIX: Already on preview page (CL skipped images step) ──
+    if "s=preview" in driver.current_url:
+        print("  [images] Already on preview — CL skipped images step ✓")
+        return True
+
     if not _wait_for_images_page(driver):
+        if "s=preview" in driver.current_url:
+            print("  [images] Timed out but on preview — continuing ✓")
+            return True
         return False
 
     handle_captcha_if_present(driver)
@@ -2293,21 +2738,132 @@ def publish_listing(driver, ad_name, product):
     _wait_for_draft_preview(driver)
     human_delay(2, 4)
 
-    if not _submit_publish_form(driver):
-        print(f"  [publish] ✗ Publish failed for '{ad_name}' — URL: {driver.current_url}")
+    # ── DEBUG: Page source dump karo pehle ──
+    try:
+        page_html = driver.execute_script("return document.body.innerHTML.substring(0, 3000);")
+        print(f"  [publish] Page HTML snippet: {page_html[:1500]}")
+    except Exception:
+        pass
+
+    published = False
+
+    # Method 1: JS direct click — forms + any link with publish/confirm text
+    try:
+        result = driver.execute_script("""
+            // Try publish_bottom / publish_top forms
+            var formIds = ['publish_bottom', 'publish_top'];
+            for (var i = 0; i < formIds.length; i++) {
+                var form = document.getElementById(formIds[i]);
+                if (!form) continue;
+                var btns = form.querySelectorAll('button, input[type=submit]');
+                for (var j = 0; j < btns.length; j++) {
+                    btns[j].scrollIntoView({block:'center'});
+                    btns[j].click();
+                    return 'clicked-form-btn:' + formIds[i] + ':' + (btns[j].textContent||btns[j].value||'').trim();
+                }
+                // No buttons? Submit form directly
+                form.submit();
+                return 'form-submit:' + formIds[i];
+            }
+
+            // Try any button/input on page
+            var allBtns = document.querySelectorAll('button, input[type=submit]');
+            for (var k = 0; k < allBtns.length; k++) {
+                var txt = (allBtns[k].textContent || allBtns[k].value || '').toLowerCase().trim();
+                if (txt) {
+                    allBtns[k].scrollIntoView({block:'center'});
+                    allBtns[k].click();
+                    return 'any-btn:' + txt;
+                }
+            }
+
+            // Try any <a> link that looks like confirm/publish
+            var links = document.querySelectorAll('a');
+            for (var l = 0; l < links.length; l++) {
+                var ltxt = (links[l].textContent || '').toLowerCase().trim();
+                if (ltxt.indexOf('publish') !== -1 || ltxt.indexOf('confirm') !== -1 ||
+                    ltxt.indexOf('post') !== -1 || ltxt.indexOf('submit') !== -1) {
+                    links[l].click();
+                    return 'link:' + ltxt;
+                }
+            }
+
+            // Last resort: submit any form on the page
+            var anyForm = document.querySelector('form');
+            if (anyForm) {
+                anyForm.submit();
+                return 'any-form-submit:' + (anyForm.id || anyForm.action || 'unknown');
+            }
+
+            return 'no-clickable-found';
+        """)
+        print(f"  [publish] JS result: {result}")
+        time.sleep(6)
+        cur = driver.current_url
+        print(f"  [publish] URL after JS click: {cur}")
+        if "s=preview" not in cur and "s=edit" not in cur:
+            published = True
+        elif result and result != 'no-clickable-found':
+            # Click hua — URL same hai but maybe page navigated internally
+            # Check page source change
+            if "thank" in driver.page_source.lower() or "success" in driver.page_source.lower():
+                published = True
+                print("  [publish] ✓ Success detected in page source")
+    except Exception as e:
+        print(f"  [publish] JS click failed: {e}")
+
+    # Method 2: CDP navigate directly to confirm URL
+    if not published:
+        try:
+            cur_url = driver.current_url
+            # CL preview URL format: ?s=preview — try changing to s=fin or s=done
+            confirm_url = cur_url.replace("?s=preview", "?s=fin")
+            if confirm_url != cur_url:
+                print(f"  [publish] Trying direct navigate: {confirm_url}")
+                driver.get(confirm_url)
+                time.sleep(4)
+                if "s=preview" not in driver.current_url:
+                    published = True
+                    print("  [publish] ✓ Direct navigate worked")
+        except Exception as e:
+            print(f"  [publish] Direct navigate failed: {e}")
+
+    # Method 3: ActionChains on any visible element
+    if not published:
+        try:
+            # Refresh page selectors
+            for sel in ["#publish_bottom button", "#publish_top button",
+                        "button[type='submit']", "input[type='submit']",
+                        "button", "a[href*='confirm']"]:
+                try:
+                    btn = WebDriverWait(driver, 5).until(
+                        EC.presence_of_element_located((By.CSS_SELECTOR, sel)))
+                    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
+                    time.sleep(0.5)
+                    ActionChains(driver).move_to_element(btn).pause(0.5).click().perform()
+                    print(f"  [publish] ActionChains on: '{sel}'")
+                    time.sleep(5)
+                    if "s=preview" not in driver.current_url:
+                        published = True
+                        break
+                except Exception:
+                    continue
+        except Exception as e:
+            print(f"  [publish] ActionChains sweep failed: {e}")
+
+    if not published:
+        print(f"  [publish] ✗ All methods failed — URL: {driver.current_url}")
+        # Full page source for debug
+        try:
+            print(f"  [publish] Full page title: {driver.title}")
+            src = driver.page_source
+            print(f"  [publish] Page source (2000 chars): {src[:2000]}")
+        except Exception:
+            pass
         return False
 
-    human_delay(3, 5)
+    human_delay(2, 3)
     handle_captcha_if_present(driver)
-
-    try:
-        WebDriverWait(driver, 20).until(lambda d: (
-            "s=preview" not in d.current_url
-            and "s=images" not in d.current_url
-            and "s=edit" not in d.current_url
-        ))
-    except TimeoutException:
-        pass
 
     listing_url = driver.current_url
     print(f"  [publish] ✓ Published → {listing_url}")
@@ -2320,11 +2876,29 @@ def publish_listing(driver, ad_name, product):
 
 
 def post_product(driver, ad_name, product):
-    post_url = "https://post.craigslist.org/c/sss"
-    print(f"  Navigating to: {post_url}")
-    driver.get(post_url)
-    human_delay(4, 7)
+    
+    print("  Navigating to account page...")
+    driver.get("https://accounts.craigslist.org/login/home?show_tab=postings")
+    human_delay(3, 5)
     handle_captcha_if_present(driver)
+
+    # Click "make new post" link
+    try:
+        new_post_link = WebDriverWait(driver, 15).until(
+            EC.element_to_be_clickable((By.LINK_TEXT, "make new post"))
+        )
+        driver.execute_script("arguments[0].click();", new_post_link)
+        print("  ✓ Clicked 'make new post'")
+        human_delay(3, 5)
+    except TimeoutException:
+        # Fallback: direct URL
+        print("  'make new post' not found — falling back to direct URL")
+        driver.get("https://post.craigslist.org/c/sss")
+        human_delay(4, 7)
+
+    handle_captcha_if_present(driver)
+
+    # ... baaki ka code same rehta hai
 
     try:
         WebDriverWait(driver, 20).until(
@@ -2396,6 +2970,40 @@ def post_product(driver, ad_name, product):
     except Exception as _e2:
         print(f"  [AREA-DIAG] ZIP check failed: {_e2}")
 
+    # ── Handle "copy from another" page ──────────────────────────────────────
+    if "copyfromanother" in driver.current_url or "s=copyfromanother" in driver.current_url:
+        print("  [copy] CL asking to re-use previous data — clicking 'skip'")
+        try:
+            # "skip" button click karo taake fresh form mile
+            skip_btn = WebDriverWait(driver, 8).until(
+                EC.element_to_be_clickable((By.XPATH,
+                    "//button[normalize-space(.)='skip'] | //input[@value='skip']")))
+            driver.execute_script("arguments[0].click();", skip_btn)
+            print("  [copy] ✓ Skipped copy-from-another")
+            human_delay(2, 3)
+            handle_captcha_if_present(driver)
+        except Exception as e:
+            print(f"  [copy] skip failed: {e}")
+
+    # ── Handle already on edit page (CL skipped area/type/category) ──────────
+    if "s=edit" in driver.current_url:
+        print("  [edit] Already on edit page — skipping area/type/category steps")
+        try:
+            success = fill_listing_details(driver, product)
+        except Exception as e:
+            print(f"  ✗ fill_listing_details crashed: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+        if not success:
+            return False
+        if not complete_images_step(driver, product):
+            print("  ✗ Failed at image upload step")
+            return False
+        if not publish_listing(driver, ad_name, product):
+            print("  ✗ Failed at publish step")
+            return False
+        return True
     # ── City selection ────────────────────────────────────────────────────────
     try:
         city_button = WebDriverWait(driver, 5).until(
@@ -2577,6 +3185,7 @@ def post_product(driver, ad_name, product):
 
 
 def update_ad_analytics_periodically():
+    return  # disabled locally
     if IS_RAILWAY:
         print("[CL] Analytics thread disabled on Railway (memory constraint). Skipping.")
         return
@@ -2602,13 +3211,82 @@ def update_ad_analytics_periodically():
         _save_listings()
         time.sleep(300)
 
+def _get_saved_password(email):
+    """Email ke liye saved password dhundho."""
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if not os.path.exists(env_path):
+        return ""
+    try:
+        with open(env_path) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith(f"PASS_{email}="):
+                    return line.split("=", 1)[1].strip()
+    except Exception:
+        pass
+    return ""
 
+
+def _save_password(email, password):
+    """Email ka password .env mein save karo."""
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    try:
+        existing_lines = []
+        key = f"PASS_{email}"
+        found = False
+        if os.path.exists(env_path):
+            with open(env_path) as f:
+                for line in f:
+                    if line.strip().startswith(f"{key}="):
+                        existing_lines.append(f"{key}={password}\n")
+                        found = True
+                    else:
+                        existing_lines.append(line)
+        if not found:
+            existing_lines.append(f"{key}={password}\n")
+        with open(env_path, "w") as f:
+            f.writelines(existing_lines)
+    except Exception as e:
+        print(f"  ⚠ Save failed: {e}")
+        
 def main():
     global CL_CITY
-    email = os.environ.get("CL_EMAIL", "").strip()
+
+    print("=" * 50)
+    print("  CLBlast — Craigslist Automation")
+    print("=" * 50)
+
+    # Email poochna
+    default_email = os.environ.get("CL_EMAIL", "").strip()
+    email_input = input(f"  Email [{default_email}]: ").strip()
+    email = email_input if email_input else default_email
+
     if not email:
-        print("✗ CL_EMAIL environment variable not set. Add it to Railway Variables.")
+        print("✗ Email required!")
         return
+
+    # Password .env se dhundho email ke hisaab se
+    password = _get_saved_password(email)
+
+    if not password:
+        # Pehli baar — password poochna
+        import getpass
+        password = getpass.getpass(f"  Password (pehli baar): ").strip()
+        if not password:
+            print("✗ Password required!")
+            return
+        # Save karo
+        _save_password(email, password)
+        print(f"  ✓ Password saved!")
+
+    os.environ["CL_EMAIL"]          = email
+    os.environ["CL_PASSWORD"]       = password
+    os.environ["CL_EMAIL_PASSWORD"] = password
+
+    print(f"  ✓ Using: {email}")
+    print("=" * 50)
+    # ── End prompt ──────────────────────────────────────────────────────
+
     CL_CITY = os.environ.get("CL_CITY", CL_CITY)
     _load_existing_listings()
 
@@ -2644,7 +3322,7 @@ def main():
 
     print("\nAll Craigslist products processed.")
     driver.quit()
-
+    
 
 if __name__ == "__main__":
-    main()
+        main()

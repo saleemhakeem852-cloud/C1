@@ -7,3 +7,5 @@ undetected-chromedriver
 pyperclip
 packaging
 setuptools
+webdriver-manager
+pyautogui
